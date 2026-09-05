@@ -353,7 +353,16 @@ pkgs.writeShellApplication {
 
     BWRAP_ARGS+=(--setenv PATH "$JAIL_PATH")
 
-    [ -d "$HOME/.claude/skills" ] && BWRAP_ARGS+=(--ro-bind "$HOME/.claude/skills" /home/user/.agents/skills)
+    # Bind each skill's *resolved* target rather than the ~/.claude/skills
+    # dir itself - external skill managers (e.g. skillissue) place symlinks
+    # there, and a symlink bound as-is just dangles inside the sandbox since
+    # its target lives outside anything else mounted.
+    if [ -d "$HOME/.claude/skills" ]; then
+      for entry in "$HOME/.claude/skills"/*; do
+        [ -e "$entry" ] || continue
+        BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "/home/user/.agents/skills/$(basename "$entry")")
+      done
+    fi
     [ -f /etc/nsswitch.conf ] && BWRAP_ARGS+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
     [ -d /etc/ssl ] && BWRAP_ARGS+=(--ro-bind /etc/ssl /etc/ssl)
     # NixOS: /etc/ssl/certs/ca-certificates.crt symlinks through
