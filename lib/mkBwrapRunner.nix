@@ -51,6 +51,7 @@ pkgs.writeShellApplication {
     LLMCUSTODY_TMPDIR="''${TMPDIR:-/tmp}"
     EXTRA_DOMAINS=()
     EXTRA_MOUNTS=()
+    MASK_PATTERNS=()
     ENV_PAIRS=()
     TOOL_ARGS=()
     OVERLAY=0
@@ -96,6 +97,8 @@ pkgs.writeShellApplication {
       --rw-skills           Mount skills read-write (default: read-only). Only
                              for deliberate in-jail skill maintenance - an
                              agent can edit files the host then reads
+      --mask GLOB           Hide files/dirs matching GLOB inside the workspace
+                             (binds empty file/dir over each match, repeatable)
       --no-net-filter       Disable network filtering (unrestricted access)
       -h, --help            Show this help
     USAGE
@@ -115,6 +118,7 @@ pkgs.writeShellApplication {
         --overlay-workspace) OVERLAY=1; shift ;;
         --selftest)      SELFTEST=1; shift ;;
         --rw-skills)     RW_SKILLS=1; shift ;;
+        --mask)          MASK_PATTERNS+=("$2"); shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
         -c|--continue)   RESUME_MODE="continue"; shift ;;
         -r|--resume)     RESUME_MODE="picker"; shift
@@ -657,6 +661,34 @@ pkgs.writeShellApplication {
         BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
       fi
     done
+
+    # --mask GLOB: hide paths inside the workspace by binding an empty
+    # file/dir over each match (read-only). Globs are bash-style, expanded
+    # relative to the workspace root (cwd is still the workspace here);
+    # '**' recurses via globstar. Empty bind sources live under $RUNDIR
+    # (host-visible) and shadow the workspace/user mounts because this runs
+    # after them.
+    if [ "''${#MASK_PATTERNS[@]}" -gt 0 ]; then
+      mkdir -p "$RUNDIR/masks"
+      MASK_INDEX=0
+      # nullglob: unmatched globs vanish instead of staying literal;
+      # globstar: ** recurses. Nothing later in the script expands globs,
+      # so leaving both on is harmless.
+      shopt -s nullglob globstar
+      for m in "''${MASK_PATTERNS[@]}"; do
+        # shellcheck disable=SC2086
+        for entry in $m; do
+          [ -e "$entry" ] || [ -L "$entry" ] || continue
+          MASK_INDEX=$((MASK_INDEX+1))
+          if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+            mkdir -p "$RUNDIR/masks/$MASK_INDEX"
+          else
+            : > "$RUNDIR/masks/$MASK_INDEX"
+          fi
+          BWRAP_ARGS+=(--ro-bind "$RUNDIR/masks/$MASK_INDEX" "$WORKSPACE_GUEST/$entry")
+        done
+      done
+    fi
 
     if [ "$SELFTEST" = "1" ]; then
       # Run the *entire* runtime chain (netns holder, slirp4netns, dnsmasq,

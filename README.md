@@ -91,6 +91,7 @@ llm-custody-pi [options] [-- pi-args...]
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
+| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace (binds empty file/dir over each match, repeatable) | - |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
 | `-h`, `--help` | Show help | - |
 
@@ -99,8 +100,7 @@ so the quick-start style `nix run .#pi -- -p "..."` works as written - the
 runner only intercepts its own flags.
 
 Not yet ported from the old QEMU jail: `--dangerous` (pi has no
-dangerous-mode flag - see below), `--mask`, `--immutable`, `--nix-env`,
-`--devenv`.
+dangerous-mode flag - see below), `--immutable`, `--nix-env`, `--devenv`.
 
 ### Examples
 
@@ -339,7 +339,7 @@ unreleased build.
 3. Wire the tool's package into `flake.nix`'s `defaultArgs`.
 4. `nix run .#your-tool` - the flake generates a runner automatically.
 
-CLI flags like `--dangerous`, `--mask`, `--immutable`, `--nix-env`, and
+CLI flags like `--dangerous`, `--immutable`, `--nix-env`, and
 `--devenv` existed in the old QEMU jail and haven't been ported to the bwrap
 runner yet; a new tool that needs one of these needs that support added to
 `lib/mkBwrapRunner.nix` too.
