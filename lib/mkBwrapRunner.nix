@@ -41,7 +41,19 @@ pkgs.writeShellApplication {
     LLMCUSTODY_TMPDIR="''${TMPDIR:-/tmp}"
     EXTRA_DOMAINS=()
     EXTRA_MOUNTS=()
+    ENV_PAIRS=()
     TOOL_ARGS=()
+    OVERLAY=0
+    SELFTEST=0
+    RESUME_MODE=""
+    RESUME_ARG=""
+    RW_SKILLS=0
+    # Per-tool session-resume translation (tools.nix resumeFlags):
+    # -c/--continue -> CONTINUE_FLAG, -r/--resume -> RESUME_FLAG (picker),
+    # and --resume <id> -> RESUME_WITH_ID_FLAG.
+    CONTINUE_FLAG="${toolDefaults.resumeFlags.continue}"
+    RESUME_FLAG="${toolDefaults.resumeFlags.resume}"
+    RESUME_WITH_ID_FLAG="${toolDefaults.resumeFlags.resumeWithId}"
 
     usage() {
       cat <<'USAGE'
@@ -60,7 +72,20 @@ pkgs.writeShellApplication {
       --ro-mount HOSTPATH[:GUESTPATH]
                              Extra read-only mount (repeatable). GUESTPATH
                              defaults to HOSTPATH if omitted.
-      --allow-domain DOMAIN Add domain to network whitelist (repeatable)
+      --allow-domain DOMAIN Add domain to network whitelist (repeatable;
+                             persistent ones can live in --state-dir/domains)
+      --env KEY=VAL         Pass environment variable into the sandbox (repeatable)
+      --overlay-workspace   Mount the workspace copy-on-write; edits are shown
+                             for review and synced back to the real tree on exit
+      --selftest            Run a sandbox self-check (full chain incl. netns +
+                             seccomp + git wrapper) and exit without launching
+                             the tool; no in-jail /login needed
+      -c, --continue, -r, --resume [ID]
+                             Resume a session; translated to the tool's own
+                             resume flags (see tools.nix resumeFlags)
+      --rw-skills           Mount skills read-write (default: read-only). Only
+                             for deliberate in-jail skill maintenance - an
+                             agent can edit files the host then reads
       --no-net-filter       Disable network filtering (unrestricted access)
       -h, --help            Show this help
     USAGE
@@ -76,10 +101,24 @@ pkgs.writeShellApplication {
         --mount)         EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
         --ro-mount)      EXTRA_MOUNTS+=("$2:ro"); shift 2 ;;
         --allow-domain)  EXTRA_DOMAINS+=("$2"); shift 2 ;;
+        --env)           ENV_PAIRS+=("$2"); shift 2 ;;
+        --overlay-workspace) OVERLAY=1; shift ;;
+        --selftest)      SELFTEST=1; shift ;;
+        --rw-skills)     RW_SKILLS=1; shift ;;
         --no-net-filter) NET_FILTER=0; shift ;;
+        -c|--continue)   RESUME_MODE="continue"; shift ;;
+        -r|--resume)     RESUME_MODE="picker"; shift
+          # Optional session id: --resume <id> targets a specific session
+          # directly instead of opening the picker. Ids never start with '-'.
+          if [ $# -gt 0 ] && [[ "$1" != -* ]]; then RESUME_ARG="$1"; shift; fi ;;
         -h|--help)       usage ;;
         --)              shift; TOOL_ARGS=("$@"); break ;;
-        *)               echo "Unknown option: $1" >&2; usage ;;
+        *)               # Anything we don't recognize isn't necessarily
+                         # wrong - it may be a tool argument (e.g. pi's -p)
+                         # nix run left after consuming its own `--`. Pass it
+                         # through; the tool's own parser rejects what it
+                         # doesn't know.
+                         TOOL_ARGS+=("$1"); shift ;;
       esac
     done
 
@@ -122,6 +161,17 @@ pkgs.writeShellApplication {
     STATE_DIR="$STATE_ROOT/${name}/$PROFILE"
     mkdir -p "$STATE_DIR"
 
+    # Persistent per-run additions to the network whitelist: a plain file
+    # next to the state dirs (one domain per line, '#' comments allowed).
+    # Same effect as --allow-domain, for hosts with their own API endpoints
+    # that shouldn't need re-passing on every launch.
+    if [ -f "$STATE_ROOT/domains" ]; then
+      while IFS= read -r d; do
+        case "$d" in ""|\#*) continue ;; esac
+        EXTRA_DOMAINS+=("$d")
+      done < "$STATE_ROOT/domains"
+    fi
+
     ${launcherOut.bootstrapScript}
 
     if [ ! -d "$LLMCUSTODY_TMPDIR" ]; then
@@ -145,6 +195,62 @@ pkgs.writeShellApplication {
       # reach directly (they're rooted in the holder's PID namespace, not
       # this shell's process group)
       pkill -f "$RUNDIR" 2>/dev/null || true
+
+      # Copy-on-write workspace: fold the overlay upper layer back into the
+      # real tree, but only on explicit confirmation, and only when stdin is
+      # a terminal (automated/background runs never mutate the host tree
+      # silently). Walk the upper dir on the host: regular files/symlinks
+      # copy over, whiteouts (overlayfs deletion markers = char device 0:0)
+      # remove the corresponding host path. Best-effort - overlay quirks like
+      # opaque dirs are not fully mirrored, so a git/rsync review afterwards
+      # is still worthwhile. Must run before `rm -rf $RUNDIR` below, which
+      # would otherwise take the upper layer (and every un-synced change)
+      # with it.
+      if [ "$OVERLAY" = "1" ] && [ -d "$RUNDIR/workspace-upper" ]; then
+        UPPER="$RUNDIR/workspace-upper"
+        if [ -n "$(ls -A "$UPPER" 2>/dev/null)" ]; then
+          SYNC=0
+          if [ -t 0 ]; then
+            printf 'llm-custody: overlay workspace has changes. Sync back to %s? [y/N] ' "$WORKSPACE_HOST" >&2
+            read -r ans
+            case "$ans" in [yY]|[yY][eE][sS]) SYNC=1 ;; esac
+          fi
+          if [ "$SYNC" = "1" ]; then
+            APPLIED=0
+            sync_dir() {
+              local upper="$1" host="$2"
+              local entry base
+              for entry in "$upper"/* "$upper"/.[!.]* "$upper"/..?*; do
+                [ -e "$entry" ] || continue
+                base=''${entry##*/}
+                if [ -c "$entry" ]; then
+                  if [ "$(stat -c '%t:%T' "$entry")" = "0:0" ]; then
+                    rm -rf -- "$host/$base" 2>/dev/null; APPLIED=$((APPLIED+1))
+                  fi
+                  continue
+                fi
+                if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+                  mkdir -p -- "$host/$base"
+                  sync_dir "$entry" "$host/$base"
+                  continue
+                fi
+                if [ -L "$entry" ]; then
+                  if [ ! -e "$host/$base" ] || [ "$(readlink "$entry")" != "$(readlink "$host/$base" 2>/dev/null || true)" ]; then
+                    cp -a -- "$entry" "$host/$base" 2>/dev/null && APPLIED=$((APPLIED+1))
+                  fi
+                elif [ ! -e "$host/$base" ] || ! cmp -s "$entry" "$host/$base"; then
+                  cp -a -- "$entry" "$host/$base" 2>/dev/null && APPLIED=$((APPLIED+1))
+                fi
+              done
+            }
+            sync_dir "$UPPER" "$WORKSPACE_HOST"
+            echo "llm-custody: synced $APPLIED changed path(s) back to $WORKSPACE_HOST (review with git status/diff)" >&2
+          else
+            echo "llm-custody: NOT syncing - overlay changes stay in the sandbox runtime dir and are discarded" >&2
+          fi
+        fi
+      fi
+
       rm -rf "$RUNDIR"
 
       if [ "$GIT_SAFETY" = "1" ]; then
@@ -292,6 +398,33 @@ pkgs.writeShellApplication {
         done &
       WATCH_PID=$!
 
+      # First-connect race mitigation: the whitelist only learns an IP from
+      # dnsmasq's post-reply log line, so the first connect after a lookup
+      # can arrive before the set is armed. Pre-arm the sets with a
+      # host-side resolution of every allowed domain before the sandbox
+      # starts (resolved through the holder ns, inside the private netns, so
+      # the queries go out the same slirp link the sandbox will use and the
+      # answers match its resolver). The log watcher still tracks CDN record
+      # drift during the run.
+      if command -v getent >/dev/null 2>&1; then
+        for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
+          while read -r line; do
+            ip="''${line%% *}"
+            case "$ip" in
+              ""|0.0.0.0|*:*|*[!0-9.]*) continue ;;
+            esac
+            nsenter_holder nft add element inet filter allowed "{ $ip }" 2>/dev/null || true
+          done < <(nsenter_holder getent ahostsv4 "$d" 2>/dev/null)
+          while read -r line; do
+            ip="''${line%% *}"
+            case "$ip" in
+              ""|*[!0-9a-fA-F:]*) continue ;;
+            esac
+            nsenter_holder nft add element inet filter allowed6 "{ $ip }" 2>/dev/null || true
+          done < <(nsenter_holder getent ahostsv6 "$d" 2>/dev/null)
+        done
+      fi
+
       echo "nameserver 127.0.0.1" > "$RUNDIR/resolv.conf"
     fi
 
@@ -303,6 +436,20 @@ pkgs.writeShellApplication {
 
     # WORKSPACE_HOST/WORKSPACE_GUEST were already resolved above, right
     # after arg parsing (needed there for the git safety checks).
+
+    # Workspace mount: plain rw bind by default, or an opt-in copy-on-write
+    # overlay. --overlay-src uses $RUNDIR/workspace-upper (a host path under
+    # the sandbox runtime dir - the later --tmpfs /tmp hides it from the
+    # sandbox's own view) as the writable upper layer, with the real
+    # workspace as the overlay lower layer. Every write lands in the upper
+    # dir and touches nothing on the host until cleanup()'s sync-back. Needs
+    # a kernel with unprivileged overlayfs support (>= 5.11).
+    if [ "$OVERLAY" = "1" ]; then
+      mkdir -p "$RUNDIR/workspace-upper"
+      WS_SPEC=(--overlay-src "$RUNDIR/workspace-upper" "$WORKSPACE_GUEST")
+    else
+      WS_SPEC=(--bind "$WORKSPACE_HOST" "$WORKSPACE_GUEST")
+    fi
 
     BWRAP_ARGS=(
       --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
@@ -316,7 +463,7 @@ pkgs.writeShellApplication {
       --setenv ${toolDefaults.configEnvVar} /home/user/${toolDefaults.configDirName}
       --chdir "$WORKSPACE_GUEST"
       --ro-bind /nix/store /nix/store
-      --bind "$WORKSPACE_HOST" "$WORKSPACE_GUEST"
+      "''${WS_SPEC[@]}"
       --bind "$STATE_DIR" /home/user/${toolDefaults.configDirName}
     )
 
@@ -350,6 +497,21 @@ pkgs.writeShellApplication {
       NIX_PROFILE_REAL=$(readlink -f "$HOME/.nix-profile")
       JAIL_PATH="$NIX_PROFILE_REAL/bin:$JAIL_PATH"
     fi
+    # Non-NixOS hosts: bind the real /usr/bin and /bin (ro) so the jailed
+    # tool's subprocesses can use system-installed binaries (git, make, cc,
+    # ...). NixOS has no FHS /usr/bin (/run/current-system/sw is already
+    # bound at /host-sw); a /usr/bin symlink (merged-usr, or the /usr/bin/env
+    # compat shim some NixOS configs ship) means the real dir lives
+    # elsewhere, so skip symlinks as well. Also makes in-jail `command -v
+    # git` resolve to /usr/bin/git on such hosts - see the git wrapper below.
+    HOST_USR_BIN=0
+    if [ -d /usr/bin ] && [ ! -L /usr/bin ]; then
+      HOST_USR_BIN=1
+      BWRAP_ARGS+=(--ro-bind /usr/bin /usr/bin)
+    fi
+    if [ -d /bin ] && [ ! -L /bin ]; then
+      BWRAP_ARGS+=(--ro-bind /bin /bin)
+    fi
 
     # Shadow `git` ahead of everything else on PATH with a wrapper that
     # always forces -c core.hooksPath at the real, read-only-bound hooks
@@ -367,13 +529,19 @@ pkgs.writeShellApplication {
       # /etc/profiles/per-user/$USER, neither of which is bound in the
       # sandbox - but /nix/store is bound wholesale, so a store path
       # always resolves. Same reasoning for the interpreter: no /bin/sh
-      # exists inside the jail (or on a NixOS host at all), so the shebang
-      # must point at bash's store path instead of /bin/sh or
-      # /usr/bin/env sh (env and /usr/bin are not bound either).
-      REAL_GIT=$(readlink -f "$REAL_GIT" 2>/dev/null || true)
-      if [[ "$REAL_GIT" != /nix/store/* ]]; then
-        echo "warning: git resolves to $REAL_GIT, outside /nix/store - skipping in-jail git hooks shadow" >&2
-        REAL_GIT=""
+      # exists inside the jail on NixOS hosts, and even where the host
+      # provides one it would only work if /bin or /usr/bin happened to be
+      # bound - a bash store path always exists (store is bound wholesale)
+      # and is deterministic across every host type.
+      REAL_GIT_RESOLVED=$(readlink -f "$REAL_GIT" 2>/dev/null || true)
+      case "$REAL_GIT_RESOLVED" in
+        /nix/store/*) REAL_GIT="$REAL_GIT_RESOLVED" ;;
+        /usr/bin/*)
+          if [ "$HOST_USR_BIN" = "1" ]; then REAL_GIT="$REAL_GIT_RESOLVED"; else REAL_GIT=""; fi ;;
+        *) REAL_GIT="" ;;
+      esac
+      if [ -z "$REAL_GIT" ]; then
+        echo "warning: git resolves to $REAL_GIT_RESOLVED, not visible inside the jail (needs /nix/store or a bound /usr/bin) - skipping in-jail git hooks shadow" >&2
       fi
       if [ -n "$REAL_GIT" ]; then
         GIT_WRAPPER_DIR="$RUNDIR/bin"
@@ -393,11 +561,25 @@ pkgs.writeShellApplication {
     # dir itself - external skill managers (e.g. skillissue) place symlinks
     # there, and a symlink bound as-is just dangles inside the sandbox since
     # its target lives outside anything else mounted.
+    #
+    # Read-only by default: the bind source is the real host checkout the
+    # host's own agents read via ~/.claude/skills, so a writable bind would
+    # let a jailed agent edit the instructions it (and other agents) run,
+    # and those changes persist on the host and get pushed on the next
+    # skillissue sync. --rw-skills opts into exactly that, only when the
+    # in-jail work is deliberately skill maintenance.
     if [ -d "$HOME/.claude/skills" ]; then
       for entry in "$HOME/.claude/skills"/*; do
         [ -e "$entry" ] || continue
-        BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "/home/user/.agents/skills/$(basename "$entry")")
+        if [ "$RW_SKILLS" = "1" ]; then
+          BWRAP_ARGS+=(--bind "$(readlink -f "$entry")" "/home/user/.agents/skills/$(basename "$entry")")
+        else
+          BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "/home/user/.agents/skills/$(basename "$entry")")
+        fi
       done
+      if [ "$RW_SKILLS" = "1" ]; then
+        echo "llm-custody: WARNING - skills are read-write; an in-jail agent can modify ~/.claude/skills content that the host reads (and skillissue may push). Only continue if in-jail skill maintenance is intended." >&2
+      fi
     fi
     [ -f /etc/nsswitch.conf ] && BWRAP_ARGS+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
     [ -d /etc/ssl ] && BWRAP_ARGS+=(--ro-bind /etc/ssl /etc/ssl)
@@ -417,12 +599,25 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
     fi
 
-    for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL OPENAI_API_KEY OPENAI_BASE_URL TERM COLORTERM; do
+    # Explicit list of vars every session needs (credentials, terminal)
+    # plus the locale vars tool subprocesses (rg/git/compilers) depend on
+    # for sane UTF-8 handling. --env covers anything else, e.g. proxy or
+    # custom-endpoint settings.
+    for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL OPENAI_API_KEY OPENAI_BASE_URL TERM COLORTERM LANG LC_ALL LC_CTYPE; do
       [ -n "''${!var:-}" ] && BWRAP_ARGS+=(--setenv "$var" "''${!var}")
     done
     while IFS='=' read -r awsvar awsval; do
       [ -n "$awsvar" ] && BWRAP_ARGS+=(--setenv "$awsvar" "$awsval")
     done < <(env | grep '^AWS_' || true)
+    for spec in "''${ENV_PAIRS[@]+"''${ENV_PAIRS[@]}"}"; do
+      key="''${spec%%=*}"
+      val="''${spec#*=}"
+      if [ -z "$key" ] || [ "$key" = "$spec" ]; then
+        echo "ERROR: --env expects KEY=VAL, got: $spec" >&2
+        exit 1
+      fi
+      BWRAP_ARGS+=(--setenv "$key" "$val")
+    done
     if STTY_SIZE=$(stty size 2>/dev/null); then
       BWRAP_ARGS+=(--setenv LINES "''${STTY_SIZE%% *}" --setenv COLUMNS "''${STTY_SIZE##* }")
     fi
@@ -445,6 +640,81 @@ pkgs.writeShellApplication {
         BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
       fi
     done
+
+    if [ "$SELFTEST" = "1" ]; then
+      # Run the *entire* runtime chain (netns holder, slirp4netns, dnsmasq,
+      # nftables, bwrap arg assembly, git wrapper, seccomp) but exec a probe
+      # script instead of the tool - exercises everything a real session
+      # would, without needing an in-jail /login. The probe only uses shell
+      # builtins plus whatever the jail PATH provides, so missing tools
+      # degrade to "SKIP" lines rather than failing the check.
+      if [ ! -x "${toolExe}" ]; then
+        echo "ERROR (selftest): tool binary not found: ${toolExe}" >&2
+        exit 1
+      fi
+      if [ "$NET_FILTER" = "1" ]; then
+        NET_LINES=(
+          'if command -v getent >/dev/null 2>&1; then'
+          '  echo "  allow pi.dev -> $(getent ahostsv4 pi.dev 2>&1 | { IFS= read -r l; printf "%s" "$l"; })"'
+          '  echo "  block example.com -> $(getent ahostsv4 example.com 2>&1 | { IFS= read -r l; printf "%s" "$l"; })"'
+          'else'
+          '  echo "SKIP: getent not in jail PATH, network tests skipped"'
+          'fi'
+        )
+      else
+        NET_LINES=('echo "SKIP: network tests (--no-net-filter given)"')
+      fi
+      printf '%s\n' \
+        'set -e' \
+        'echo "llm-custody selftest: sandbox running"' \
+        'echo "  uid=$(id -u) gid=$(id -g) home=$HOME cwd=$(pwd)"' \
+        '[ -d /nix/store ] || { echo "FAIL: /nix/store not visible"; exit 1; }' \
+        '[ -w /home/user ] || { echo "FAIL: /home/user not writable"; exit 1; }' \
+        '[ -d /home/user/${toolDefaults.configDirName} ] || { echo "FAIL: state dir not mounted"; exit 1; }' \
+        'if command -v git >/dev/null 2>&1; then' \
+        '  echo "  git: $(git --version 2>&1)"' \
+        '  hp=$(git config --get core.hooksPath 2>/dev/null || true)' \
+        '  echo "  forced core.hooksPath: $hp"' \
+        'else' \
+        '  echo "SKIP: git not in jail PATH"' \
+        'fi' \
+        'if [ -x ${pkgs.util-linux}/bin/unshare ]; then' \
+        '  if ${pkgs.util-linux}/bin/unshare -r true 2>/dev/null; then' \
+        '    echo "FAIL: unshare allowed - seccomp denylist not active"' \
+        '    exit 1' \
+        '  else' \
+        '    echo "OK: denied syscall (unshare) blocked by seccomp"' \
+        '  fi' \
+        'else' \
+        '  echo "SKIP: unshare not found in store"' \
+        'fi' \
+        "''${NET_LINES[@]}" \
+        'echo "selftest PASS"' > "$RUNDIR/selftest.sh"
+      echo "llm-custody selftest: toolExe=${toolExe}" >&2
+      BWRAP_ARGS+=(--ro-bind "$RUNDIR/selftest.sh" /selftest.sh)
+      if [ "$NET_FILTER" = "1" ]; then
+        nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
+      else
+        bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
+      fi
+      exit $?
+    fi
+
+    # Session resume: translate the generic -c/--continue (resume most
+    # recent session without prompting) and -r/--resume (picker, or a
+    # specific session id) aliases into the flags this tool actually
+    # accepts (tools.nix resumeFlags), so the same muscle memory works for
+    # every tool. Prepended to TOOL_ARGS - anything the user passes after
+    # `--` still applies on top.
+    if [ "$RESUME_MODE" = "continue" ]; then
+      TOOL_ARGS=("$CONTINUE_FLAG" "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}")
+    elif [ "$RESUME_MODE" = "picker" ]; then
+      if [ -n "$RESUME_ARG" ]; then
+        TOOL_ARGS=("$RESUME_WITH_ID_FLAG" "$RESUME_ARG" "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}")
+      else
+        TOOL_ARGS=("$RESUME_FLAG" "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}")
+      fi
+    fi
 
     if [ "$NET_FILTER" = "1" ]; then
       nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"

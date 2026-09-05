@@ -4,6 +4,19 @@
     defaults = {
       configDirName = ".pi/agent";
       configEnvVar = "PI_CODING_AGENT_DIR";
+      # Per-tool translation table for the runner's generic session-resume
+      # flags. The runner accepts -c/--continue/-r/--resume and maps them to
+      # whatever this tool actually accepts: `continue` = resume the most
+      # recent session without prompting, `resume` = interactive session
+      # picker, `resumeWithId` = target a specific session id directly.
+      # (pi's real CLI, verified in pi's cli/args.js: --continue/-c,
+      # --resume/-r picker with no id arg, --session <path|id> for a
+      # specific one.)
+      resumeFlags = {
+        continue = "--continue";
+        resume = "--resume";
+        resumeWithId = "--session";
+      };
       allowedDomains = [
         "pi.dev"
         "api.anthropic.com"

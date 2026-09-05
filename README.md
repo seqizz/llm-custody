@@ -85,8 +85,18 @@ llm-custody-pi [options] [-- pi-args...]
 | `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable) | - |
 | `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | - |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
+| `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
+| `--overlay-workspace` | Mount the workspace copy-on-write; edits sync back to the real tree only on explicit confirmation at exit | off |
+| `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
+| `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
+| `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
+| `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
 | `-h`, `--help` | Show help | - |
+
+Any other argument (e.g. pi's `-p`) is passed straight through to the tool,
+so the quick-start style `nix run .#pi -- -p "..."` works as written - the
+runner only intercepts its own flags.
 
 Not yet ported from the old QEMU jail: `--dangerous` (pi has no
 dangerous-mode flag - see below), `--mask`, `--immutable`, `--nix-env`,
@@ -112,6 +122,54 @@ Allow access to additional domains (e.g. for package installs or git cloning):
 nix run .#pi -- --allow-domain github.com --allow-domain registry.npmjs.org
 ```
 
+Domains you want on every run for a given state root go into
+`~/.config/llm-custody/domains` (one per line, `#` comments allowed) instead
+of being re-passed each time.
+
+Pass extra environment (e.g. a proxy or a custom endpoint):
+
+```bash
+nix run .#pi -- --env HTTPS_PROXY=http://127.0.0.1:8080 --env MIRROR=…
+```
+
+Verify the sandbox wiring (netns holder, dnsmasq/nft whitelist, seccomp
+denylist, git wrapper) without starting a session:
+
+```bash
+nix run .#pi -- --selftest
+```
+
+Resume a previous session (the aliases are translated to the tool's own
+flags; pi accepts `--continue`/`-c` and `--resume`/`-r`):
+
+```bash
+# resume the most recent session without prompting
+nix run .#pi -- --continue
+# pick a session from the interactive picker
+nix run .#pi -- --resume
+# resume a specific session by id (pi: --session <id>)
+nix run .#pi -- --resume 01a07268-cf99-73e8
+```
+
+Sessions live in the jail-private state dir, so by design you can only
+resume sessions started inside the sandbox (host pi state stays untouched).
+The per-tool translation table lives in `tools.nix` (`resumeFlags`), so a
+future tool with different flag names just declares its own there.
+
+Work on a repo without letting the agent's edits touch the real tree until
+you confirm - every write goes to a copy-on-write overlay, and on exit you
+are asked whether to sync (a subset of) the changes back:
+
+```bash
+cd ~/devel/some-project && nix run .#pi -- --overlay-workspace
+```
+
+This is the safest workspace mode: a destructive agent run (`rm -rf`, bad
+rebase) can be declined at the sync prompt and the host tree stays
+untouched. Two caveats: only *confirmation* is interactive, and overlayfs
+quirks (e.g. opaque directories) are not fully mirrored by the sync-back,
+so review with `git status`/`git diff` afterwards.
+
 Disable network filtering entirely:
 
 ```bash
@@ -130,9 +188,14 @@ bound paths are visible inside it:
   an agent redirect in-jail git to a hooks dir it controls)
 - The jail-private state dir `~/.config/llm-custody/pi/<profile>` ->
   `/home/user/.pi/agent` (read-write)
-- `~/.gitconfig` and `~/.claude/skills` (read-only), if present
+- `~/.gitconfig` and `~/.claude/skills` (read-only by default - skills are
+  the instructions a jailed agent executes, and their real host checkout is
+  what the host's own agents and skillsync read, so writes would persist;
+  `--rw-skills` mounts them read-write instead, opt-in only)
 - Host system and user packages -> `/host-sw`, `/host-user-sw` (read-only,
-  NixOS hosts only)
+  NixOS hosts only; on non-NixOS hosts the real `/usr/bin` and `/bin` are
+  bound read-only instead, so system-installed tools are available there
+  too)
 - `/nix/store` (read-only)
 - Any directories added via `--mount` / `--ro-mount`
 
@@ -151,7 +214,9 @@ neither a full substitute for backups: if the workspace is a git repo, a
 doesn't touch the working tree or `git stash list` - just prints a recovery
 hash), and `core.hooksPath` is diffed before/after the run with a loud
 warning on exit if it changed (catches the case where a plain `git` run on
-the host *outside* the jail later would honor a hooks dir the agent planted).
+the host *outside* the jail later would honor a hooks dir the agent
+planted). With `--overlay-workspace` (see above) the tree is instead
+copy-on-write and nothing reaches the host until you confirm a sync-back.
 
 **Processes.** bwrap unshares mount, PID, IPC, and UTS namespaces - the
 sandboxed process has its own PID 1 and no visibility into host processes.
@@ -163,7 +228,8 @@ holder process (not the host's), so the sandbox gets a private network too.
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`
 - `OPENAI_API_KEY`, `OPENAI_BASE_URL`
 - `AWS_*`
-- `TERM`, `COLORTERM`, `LINES`, `COLUMNS`
+- `TERM`, `COLORTERM`, `LINES`, `COLUMNS`, `LANG`, `LC_ALL`, `LC_CTYPE`
+- Anything passed via `--env KEY=VAL`
 
 All other host environment variables are stripped.
 
@@ -179,7 +245,11 @@ filtering and a port-level firewall inside a private network namespace:
 - Custom API endpoints (via `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) are
   automatically whitelisted
 - Additional domains can be added with `--allow-domain` (suffix/subdomain
-  matched, no wildcard/glob support yet)
+  matched, no wildcard/glob support yet), or persistently via
+  `~/.config/llm-custody/domains`
+- Whitelisted domains are pre-resolved into the nftables sets before the
+  sandbox starts (first-connect race mitigation); later DNS answers keep
+  the sets fresh
 - Use `--no-net-filter` to disable all network restrictions
 
 Default allowed domains: `pi.dev`, `api.anthropic.com`, `api.openai.com`,

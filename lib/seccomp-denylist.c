@@ -23,6 +23,22 @@ static const int denied[] = {
   SCMP_SYS(acct), SCMP_SYS(clock_settime), SCMP_SYS(mount), SCMP_SYS(umount2),
   SCMP_SYS(pivot_root), SCMP_SYS(chroot), SCMP_SYS(reboot),
   SCMP_SYS(swapoff), SCMP_SYS(swapon), SCMP_SYS(ptrace), SCMP_SYS(unshare),
+  /* Namespace-escape and privileged-boundary probes. Each of these fails
+   * with EPERM anyway for an unprivileged process, so blocking them costs
+   * nothing at runtime - they only matter when a jailed process somehow got
+   * a host-namespace fd (setns/pidfd_getfd) or an elevated capability
+   * (process_vm_*, perf_event_open, open_by_handle_at, the fsopen mount
+   * API), which is exactly the escape/privilege-gain case to stop.
+   *
+   * io_uring_* is deliberately NOT on the list: pi runs on the bun runtime,
+   * which uses io_uring for filesystem I/O, and an EPERM there could break
+   * the tool's normal operation instead of only an exploit. Re-test before
+   * ever adding it. */
+  SCMP_SYS(setns), SCMP_SYS(perf_event_open),
+  SCMP_SYS(process_vm_readv), SCMP_SYS(process_vm_writev),
+  SCMP_SYS(pidfd_getfd), SCMP_SYS(open_by_handle_at),
+  SCMP_SYS(fsopen), SCMP_SYS(fsconfig), SCMP_SYS(fsmount), SCMP_SYS(fspick),
+  SCMP_SYS(userfaultfd),
 };
 
 int main(void) {
