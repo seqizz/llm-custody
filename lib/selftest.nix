@@ -35,8 +35,20 @@ pkgs.writeText "llm-custody-selftest.sh" ''
   fi
   if [ "$SELFTEST_NET" = "1" ]; then
     if command -v getent >/dev/null 2>&1; then
-      echo "  allow $SELFTEST_DOMAIN -> $(getent ahostsv4 "$SELFTEST_DOMAIN" 2>&1 | { IFS= read -r l; printf '%s' "$l"; })"
-      echo "  block example.com -> $(getent ahostsv4 example.com 2>&1 | { IFS= read -r l; printf '%s' "$l"; })"
+      # getent ahostsv4 is broken/empty in this glibc (rc=2 even for names
+      # that clearly resolve), so use `getent hosts` and take the first
+      # whitespace field (the address).
+      allow_ip=$(getent hosts "$SELFTEST_DOMAIN" 2>/dev/null | { IFS=' ' read -r ip _; printf '%s' "$ip"; })
+      if [ -z "$allow_ip" ] || [ "$allow_ip" = "0.0.0.0" ] || [ "$allow_ip" = "::" ]; then
+        echo "FAIL: allowed domain $SELFTEST_DOMAIN did not resolve to a real IP"
+        exit 1
+      fi
+      echo "  allow $SELFTEST_DOMAIN -> $allow_ip"
+      block_ip=$(getent hosts example.com 2>/dev/null | { IFS=' ' read -r ip _; printf '%s' "$ip"; })
+      case "$block_ip" in
+        0.0.0.0|::) echo "  block example.com -> $block_ip" ;;
+        *) echo "FAIL: example.com not blackholed (resolved to $block_ip)"; exit 1 ;;
+      esac
     else
       echo "SKIP: getent not in jail PATH, network tests skipped"
     fi
