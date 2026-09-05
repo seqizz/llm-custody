@@ -38,6 +38,13 @@ static const int denied[] = {
   SCMP_SYS(process_vm_readv), SCMP_SYS(process_vm_writev),
   SCMP_SYS(pidfd_getfd), SCMP_SYS(open_by_handle_at),
   SCMP_SYS(fsopen), SCMP_SYS(fsconfig), SCMP_SYS(fsmount), SCMP_SYS(fspick),
+  /* The modern mount API calls that util-linux's `mount` actually uses
+   * (open_tree + move_mount; mount_setattr for attr changes) - without
+   * these, `mount --bind` silently bypasses the mount(2) deny above. The
+   * real gate is bwrap's --cap-drop CAP_SYS_ADMIN (all mount syscalls
+   * need it); this list is the belt for when that cap isn't dropped (e.g.
+   * --no-net-filter paths or future --cap-add use). */
+  SCMP_SYS(open_tree), SCMP_SYS(move_mount), SCMP_SYS(mount_setattr),
   SCMP_SYS(userfaultfd),
 };
 

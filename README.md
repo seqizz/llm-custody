@@ -199,6 +199,17 @@ bound paths are visible inside it:
 - `/nix/store` (read-only)
 - Any directories added via `--mount` / `--ro-mount`
 
+The sandboxed process runs without `CAP_SYS_ADMIN` (bwrap
+`--cap-drop CAP_SYS_ADMIN`), so it cannot create bind mounts or remount
+anything regardless of syscall flavor. That matters because `mount --bind`
+that an agent runs via the jail's own `mount` binary uses the mount API
+(`open_tree`/`move_mount`), not `mount(2)` - a seccomp list of the classic
+mount syscall alone wouldn't block it. The seccomp denylist additionally
+blocks `open_tree`/`move_mount`/`mount_setattr` (and the fsopen family) as
+a second layer. So a masked file cannot be recovered by bind-mounting the
+workspace elsewhere and reading the original. Only the jail-private state
+file and workspace, which are writable by design, are exposed.
+
 All other host paths are invisible inside the sandbox.
 
 On NixOS hosts, system packages (`/run/current-system/sw`) and user packages

@@ -475,6 +475,15 @@ pkgs.writeShellApplication {
     BWRAP_ARGS=(
       --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
       --die-with-parent --new-session
+      # Drop CAP_SYS_ADMIN from the sandboxed process. Every mount-creation
+      # syscall (mount(2), open_tree/move_mount, mount_setattr, umount2,
+      # pivot_root, ...) requires it, so this closes the whole class at once
+      # - and it's the one that matters most: modern util-linux `mount` uses
+      # the mount API (open_tree+move_mount), which a seccomp list of the
+      # mount syscall alone misses (the FHS bwrap is denied but the mount
+      # API copy is not). bwrap applies --cap-drop after its own sandbox
+      # setup, so bwrap itself keeps what it needs for unshare/mount.
+      --cap-drop CAP_SYS_ADMIN
       --seccomp "$SECCOMP_FD"
       --proc /proc
       --dev /dev
