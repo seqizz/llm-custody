@@ -14,11 +14,15 @@ let
   seccompDenylist = import ./seccomp-denylist.nix { inherit pkgs; };
   toolExe = pkgs.lib.getExe launcherOut.toolPackage;
   # Selftest probe derivation (lib/selftest.nix): a standalone store file
-  # that the --selftest branch binds as /selftest.sh and runs with bash.
-  # Kept out of this runner's text because its $()/$var fragments would
-  # trip the writeShellApplication shellcheck pass (SC2016) as quoted
-  # literals - the previous inline version failed the build on exactly that.
-  selftestProbe = import ./selftest.nix { inherit pkgs toolDefaults; };
+  # the --selftest branch binds as /selftest.sh. Kept out of this runner's
+  # text because its $()/$var fragments would trip the
+  # writeShellApplication's shellcheck pass (SC2016) as quoted literals -
+  # the previous inline version failed the build on exactly that. The probe
+  # itself contains no Nix interpolation; everything it needs arrives as
+  # SELFTEST_* env vars set in the selftest branch.
+  selftestProbe = import ./selftest.nix { inherit pkgs; };
+  selftestDomain = builtins.head toolDefaults.allowedDomains;
+  selftestUnshare = "${pkgs.util-linux}/bin/unshare";
 in
 pkgs.writeShellApplication {
   name = "llm-custody-${name}";
@@ -666,6 +670,9 @@ pkgs.writeShellApplication {
       fi
       echo "llm-custody selftest: toolExe=${toolExe}" >&2
       BWRAP_ARGS+=(--setenv SELFTEST_NET "$NET_FILTER")
+      BWRAP_ARGS+=(--setenv SELFTEST_CONFIGDIR "/home/user/${toolDefaults.configDirName}")
+      BWRAP_ARGS+=(--setenv SELFTEST_UNSHARE "${selftestUnshare}")
+      BWRAP_ARGS+=(--setenv SELFTEST_DOMAIN "${selftestDomain}")
       BWRAP_ARGS+=(--ro-bind "${selftestProbe}" /selftest.sh)
       if [ "$NET_FILTER" = "1" ]; then
         nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
