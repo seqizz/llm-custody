@@ -5,11 +5,10 @@
 > fork replaced that with bubblewrap + a private network namespace (real
 > Linux namespaces on the host kernel instead of a VM boundary, no guest
 > kernel to boot) and cut every tool except [Pi](https://pi.dev) in the
-> process. Not a PR-back candidate - upstream stays QEMU-only and
-> multi-tool.
+> process (maybe will re-add some later). Not a PR-back candidate.
 
 Sandbox for running the Pi coding agent via bubblewrap + a private network
-namespace. No VM, no disk image - the tool runs directly on the host kernel,
+namespace. No VM, no disk image; the tool runs directly on the host kernel,
 isolated by Linux namespaces and a seccomp denylist, with DNS+nftables-based
 domain whitelisting for outbound network access.
 
@@ -142,7 +141,7 @@ All other host paths are invisible inside the sandbox.
 On NixOS hosts, system packages (`/run/current-system/sw`) and user packages
 (`/etc/profiles/per-user/$USER`) are automatically mounted and added to
 `PATH`, so tools like `rg`, `git`, `jq`, etc. are available without
-hardcoding them.
+hardcoding them, as long as the host has them installed.
 
 `/workspace` is a direct read-write bind of the host directory, not a
 copy-on-write layer - a destructive command run by the agent (`rm -rf`, a
@@ -190,16 +189,19 @@ Default allowed domains: `pi.dev`, `api.anthropic.com`, `api.openai.com`,
 `api.novita.ai`.
 
 > [!NOTE]
-> IPv4 only for now - IPv6 outbound traffic isn't specifically filtered
-> because slirp4netns's IPv6 path (`-6`) isn't wired up yet.
+> Dual-stack: slirp4netns's IPv6 path (`-6`, marked experimental upstream)
+> is enabled, with a matching IPv6 nftables set/rule and dnsmasq AAAA
+> catch-all alongside the IPv4 ones. Not yet battle-tested against a
+> real IPv6-only endpoint.
 
 ## Dangerous mode
 
 Pi has no dangerous-mode CLI flag of its own; project trust is instead set
 to `trusted` in the jail-private `settings.json` on every launch, so pi
-doesn't prompt for it. The agent can still execute arbitrary commands, write
-to any mounted directory, and make network requests to whitelisted domains
-without asking, exactly as it would run outside the jail.
+doesn't prompt for it. A.k.a. YOLO forever. The agent can still execute
+arbitrary commands, write to any mounted directory, and make network
+requests to whitelisted domains without asking, exactly as it would
+run outside the jail.
 
 Network filtering remains active regardless - the agent can only reach
 whitelisted domains unless you pass `--no-net-filter`.

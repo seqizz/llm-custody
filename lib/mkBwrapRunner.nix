@@ -202,8 +202,11 @@ pkgs.writeShellApplication {
       # PID is positional, not a --pid flag (slirp4netns's own usage: `slirp4netns
       # [OPTION]... PID|PATH|FD [TAPNAME]`) - passing it as --pid silently falls
       # through to the "unrecognized option" usage message instead of erroring.
+      # -6/--enable-ipv6 is marked experimental by slirp4netns itself, but
+      # --configure applies to whatever families are enabled, so no extra
+      # manual route/address setup is needed for v6 beyond this flag.
       slirp4netns --configure --mtu=65520 --disable-host-loopback --disable-dns \
-        "$HOLDER_PID" tap0 >"$RUNDIR/slirp4netns.log" 2>&1 &
+        --enable-ipv6 "$HOLDER_PID" tap0 >"$RUNDIR/slirp4netns.log" 2>&1 &
       SLIRP_PID=$!
       sleep 0.3 # let slirp4netns finish configuring tap0/routes before dnsmasq binds
 
@@ -233,7 +236,11 @@ pkgs.writeShellApplication {
         for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
           echo "server=/$d/9.9.9.9"
         done
+        # server= above forwards both A and AAAA lookups for allowed domains
+        # to the same (dual-stack) upstream - only the catch-all needs a
+        # separate line per family.
         echo "address=/#/0.0.0.0"
+        echo "address=/#/::"
       } > "$RUNDIR/dnsmasq.conf"
 
       nsenter_holder dnsmasq --conf-file="$RUNDIR/dnsmasq.conf" \
@@ -241,10 +248,20 @@ pkgs.writeShellApplication {
       DNSMASQ_PID=$!
       sleep 0.2
 
+      # ip daddr only ever matches IPv4 packets, even inside a dual-stack
+      # inet-family table - it's simply not-applicable (not "false") for an
+      # IPv6 packet, so a v6-unaware ruleset here wouldn't just fail to
+      # filter v6 traffic, it would silently let it all through under the
+      # chain's default accept policy. Hence the separate ipv6_addr set and
+      # ip6 daddr rule below, not just one shared set.
       nsenter_holder nft -f - <<'NFT'
     table inet filter {
       set allowed {
         type ipv4_addr
+        flags interval
+      }
+      set allowed6 {
+        type ipv6_addr
         flags interval
       }
       chain output {
@@ -252,6 +269,7 @@ pkgs.writeShellApplication {
         udp dport 53 accept
         tcp dport 53 accept
         tcp dport { 80, 443 } ip daddr != @allowed drop
+        tcp dport { 80, 443 } ip6 daddr != @allowed6 drop
       }
     }
     NFT
@@ -262,10 +280,13 @@ pkgs.writeShellApplication {
       nsenter_holder tail -F -n0 "$RUNDIR/dnsmasq.log" 2>/dev/null | \
         while read -r line; do
           case "$line" in
-            *" is "[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+            *" is "*)
               ip="''${line##* is }"
-              [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-              nsenter_holder nft add element inet filter allowed "{ $ip }" 2>/dev/null || true
+              if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                nsenter_holder nft add element inet filter allowed "{ $ip }" 2>/dev/null || true
+              elif [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+                nsenter_holder nft add element inet filter allowed6 "{ $ip }" 2>/dev/null || true
+              fi
               ;;
           esac
         done &
