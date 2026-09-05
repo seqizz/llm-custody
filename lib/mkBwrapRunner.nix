@@ -361,15 +361,30 @@ pkgs.writeShellApplication {
     # if config was rewritten - that's what the hooksPath diff-warn in
     # cleanup() above is for.)
     if REAL_GIT=$(command -v git 2>/dev/null); then
-      GIT_WRAPPER_DIR="$RUNDIR/bin"
-      mkdir -p "$GIT_WRAPPER_DIR"
-      printf '%s\n' \
-        '#!/bin/sh' \
-        "exec \"$REAL_GIT\" -c core.hooksPath=\"$WORKSPACE_GUEST/.git/hooks\" \"\$@\"" \
-        > "$GIT_WRAPPER_DIR/git"
-      chmod +x "$GIT_WRAPPER_DIR/git"
-      BWRAP_ARGS+=(--ro-bind "$GIT_WRAPPER_DIR" /run/llmcustody-bin)
-      JAIL_PATH="/run/llmcustody-bin:$JAIL_PATH"
+      # The wrapper must exec paths that exist inside the jail. Resolve
+      # through their store path (readlink -f): on the host, `command -v`
+      # commonly returns a symlink under ~/.nix-profile (home-manager) or
+      # /etc/profiles/per-user/$USER, neither of which is bound in the
+      # sandbox - but /nix/store is bound wholesale, so a store path
+      # always resolves. Same reasoning for the interpreter: no /bin/sh
+      # exists inside the jail (or on a NixOS host at all), so the shebang
+      # must point at bash's store path instead of /bin/sh or
+      # /usr/bin/env sh (env and /usr/bin are not bound either).
+      REAL_GIT=$(readlink -f "$REAL_GIT" 2>/dev/null || true)
+      if [[ "$REAL_GIT" != /nix/store/* ]]; then
+        echo "warning: git resolves to $REAL_GIT, outside /nix/store - skipping in-jail git hooks shadow" >&2
+        REAL_GIT=""
+      fi
+      if [ -n "$REAL_GIT" ]; then
+        GIT_WRAPPER_DIR="$RUNDIR/bin"
+        mkdir -p "$GIT_WRAPPER_DIR"
+        printf '#!%s\nexec "%s" -c core.hooksPath="%s/.git/hooks" "$@"\n' \
+          "${pkgs.bash}/bin/sh" "$REAL_GIT" "$WORKSPACE_GUEST" \
+          > "$GIT_WRAPPER_DIR/git"
+        chmod +x "$GIT_WRAPPER_DIR/git"
+        BWRAP_ARGS+=(--ro-bind "$GIT_WRAPPER_DIR" /run/llmcustody-bin)
+        JAIL_PATH="/run/llmcustody-bin:$JAIL_PATH"
+      fi
     fi
 
     BWRAP_ARGS+=(--setenv PATH "$JAIL_PATH")
