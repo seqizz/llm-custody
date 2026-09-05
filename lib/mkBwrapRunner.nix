@@ -13,6 +13,12 @@
 let
   seccompDenylist = import ./seccomp-denylist.nix { inherit pkgs; };
   toolExe = pkgs.lib.getExe launcherOut.toolPackage;
+  # Selftest probe derivation (lib/selftest.nix): a standalone store file
+  # that the --selftest branch binds as /selftest.sh and runs with bash.
+  # Kept out of this runner's text because its $()/$var fragments would
+  # trip the writeShellApplication shellcheck pass (SC2016) as quoted
+  # literals - the previous inline version failed the build on exactly that.
+  selftestProbe = import ./selftest.nix { inherit pkgs toolDefaults; };
 in
 pkgs.writeShellApplication {
   name = "llm-custody-${name}";
@@ -225,7 +231,14 @@ pkgs.writeShellApplication {
                 base=''${entry##*/}
                 if [ -c "$entry" ]; then
                   if [ "$(stat -c '%t:%T' "$entry")" = "0:0" ]; then
-                    rm -rf -- "$host/$base" 2>/dev/null; APPLIED=$((APPLIED+1))
+                    # ''${host:?}/''${base:?}: host is always set and base
+                    # is a real dir entry (never empty) - the :? form just
+                    # keeps the SC2115 lint (rm -rf against an unguarded
+                    # path) satisfied, so a deletion can never target
+                    # something empty by accident. Dollar doubled because
+                    # this is a Nix indented string: a bare dollar-brace
+                    # would interpolate at eval time.
+                    rm -rf -- "''${host:?remove target host unset}" "''${base:?remove target name unset}" 2>/dev/null; APPLIED=$((APPLIED+1))
                   fi
                   continue
                 fi
@@ -643,55 +656,17 @@ pkgs.writeShellApplication {
 
     if [ "$SELFTEST" = "1" ]; then
       # Run the *entire* runtime chain (netns holder, slirp4netns, dnsmasq,
-      # nftables, bwrap arg assembly, git wrapper, seccomp) but exec a probe
-      # script instead of the tool - exercises everything a real session
-      # would, without needing an in-jail /login. The probe only uses shell
-      # builtins plus whatever the jail PATH provides, so missing tools
-      # degrade to "SKIP" lines rather than failing the check.
+      # nftables, bwrap arg assembly, git wrapper, seccomp) but exec the
+      # probe from selftest.nix (see let above) instead of the tool -
+      # exercises everything a real session would, without needing an
+      # in-jail /login.
       if [ ! -x "${toolExe}" ]; then
         echo "ERROR (selftest): tool binary not found: ${toolExe}" >&2
         exit 1
       fi
-      if [ "$NET_FILTER" = "1" ]; then
-        NET_LINES=(
-          'if command -v getent >/dev/null 2>&1; then'
-          '  echo "  allow pi.dev -> $(getent ahostsv4 pi.dev 2>&1 | { IFS= read -r l; printf "%s" "$l"; })"'
-          '  echo "  block example.com -> $(getent ahostsv4 example.com 2>&1 | { IFS= read -r l; printf "%s" "$l"; })"'
-          'else'
-          '  echo "SKIP: getent not in jail PATH, network tests skipped"'
-          'fi'
-        )
-      else
-        NET_LINES=('echo "SKIP: network tests (--no-net-filter given)"')
-      fi
-      printf '%s\n' \
-        'set -e' \
-        'echo "llm-custody selftest: sandbox running"' \
-        'echo "  uid=$(id -u) gid=$(id -g) home=$HOME cwd=$(pwd)"' \
-        '[ -d /nix/store ] || { echo "FAIL: /nix/store not visible"; exit 1; }' \
-        '[ -w /home/user ] || { echo "FAIL: /home/user not writable"; exit 1; }' \
-        '[ -d /home/user/${toolDefaults.configDirName} ] || { echo "FAIL: state dir not mounted"; exit 1; }' \
-        'if command -v git >/dev/null 2>&1; then' \
-        '  echo "  git: $(git --version 2>&1)"' \
-        '  hp=$(git config --get core.hooksPath 2>/dev/null || true)' \
-        '  echo "  forced core.hooksPath: $hp"' \
-        'else' \
-        '  echo "SKIP: git not in jail PATH"' \
-        'fi' \
-        'if [ -x ${pkgs.util-linux}/bin/unshare ]; then' \
-        '  if ${pkgs.util-linux}/bin/unshare -r true 2>/dev/null; then' \
-        '    echo "FAIL: unshare allowed - seccomp denylist not active"' \
-        '    exit 1' \
-        '  else' \
-        '    echo "OK: denied syscall (unshare) blocked by seccomp"' \
-        '  fi' \
-        'else' \
-        '  echo "SKIP: unshare not found in store"' \
-        'fi' \
-        "''${NET_LINES[@]}" \
-        'echo "selftest PASS"' > "$RUNDIR/selftest.sh"
       echo "llm-custody selftest: toolExe=${toolExe}" >&2
-      BWRAP_ARGS+=(--ro-bind "$RUNDIR/selftest.sh" /selftest.sh)
+      BWRAP_ARGS+=(--setenv SELFTEST_NET "$NET_FILTER")
+      BWRAP_ARGS+=(--ro-bind "${selftestProbe}" /selftest.sh)
       if [ "$NET_FILTER" = "1" ]; then
         nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
       else
