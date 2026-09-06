@@ -93,6 +93,8 @@ llm-custody-pi [options] [-- pi-args...]
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
 | `--mask GLOB` | Hide files/dirs matching GLOB in the workspace (binds empty file/dir over each match, repeatable) | - |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
+| `--merge-config` | Interactively merge root-level keys from the host tool's settings.json into the jail-private one; each differing key prompts y/N individually ('a' accepts the rest) | off |
+| `--merge-config-from PATH` | Same as `--merge-config` with an explicit source file instead of the default host tool settings.json | - |
 | `-h`, `--help` | Show help | - |
 
 Any other argument (e.g. pi's `-p`) is passed straight through to the tool,

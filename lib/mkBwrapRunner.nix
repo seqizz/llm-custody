@@ -56,6 +56,8 @@ pkgs.writeShellApplication {
     TOOL_ARGS=()
     OVERLAY=0
     SELFTEST=0
+    MERGE_CONFIG=0
+    MERGE_CONFIG_SRC=""
     RESUME_MODE=""
     RESUME_ARG=""
     RW_SKILLS=0
@@ -100,6 +102,13 @@ pkgs.writeShellApplication {
       --mask GLOB           Hide files/dirs matching GLOB inside the workspace
                              (binds empty file/dir over each match, repeatable)
       --no-net-filter       Disable network filtering (unrestricted access)
+      --merge-config        Interactively merge root-level keys from the host
+                             tool's settings.json into the jail-private
+                             settings.json; each differing key prompts y/N
+                             individually ('a' accepts the rest)
+      --merge-config-from PATH
+                             Same as --merge-config with an explicit source
+                             file instead of the default host settings.json
       -h, --help            Show this help
     USAGE
       exit 0
@@ -120,6 +129,8 @@ pkgs.writeShellApplication {
         --rw-skills)     RW_SKILLS=1; shift ;;
         --mask)          MASK_PATTERNS+=("$2"); shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
+        --merge-config)      MERGE_CONFIG=1; shift ;;
+        --merge-config-from) MERGE_CONFIG=1; MERGE_CONFIG_SRC="$2"; shift 2 ;;
         -c|--continue)   RESUME_MODE="continue"; shift ;;
         -r|--resume)     RESUME_MODE="picker"; shift
           # Optional session id: --resume <id> targets a specific session
@@ -194,6 +205,89 @@ pkgs.writeShellApplication {
     fi
 
     RUNDIR=$(mktemp -d --tmpdir="$LLMCUSTODY_TMPDIR")
+
+    # --merge-config: one-time interactive adoption of host tool config into
+    # the jail-private state dir. The bootstrap owns `extensions` and
+    # `defaultProjectTrust` (re-injected every launch), so those are skipped;
+    # every other root-level key is offered one by one, host value overwriting
+    # the jail's. Keys whose jail value already matches are skipped silently,
+    # so repeated runs stay quiet unless the host config actually changed -
+    # merge once, then only changed keys prompt again.
+    if [ "$MERGE_CONFIG" = "1" ]; then
+      SRC="''${MERGE_CONFIG_SRC:-$HOME/${toolDefaults.configDirName}/settings.json}"
+      TARGET="$STATE_DIR/settings.json"
+      if [ ! -r "$SRC" ]; then
+        echo "ERROR: --merge-config source not readable: $SRC" >&2
+        exit 1
+      fi
+      if ! jq -e . "$SRC" >/dev/null 2>&1; then
+        echo "ERROR: --merge-config source is not valid JSON: $SRC" >&2
+        exit 1
+      fi
+      if [ ! -t 0 ]; then
+        echo "ERROR: --merge-config prompts per key on stdin; needs a tty" >&2
+        exit 1
+      fi
+      MERGE_DOC="$RUNDIR/merge.json"
+      if [ -f "$TARGET" ]; then
+        cp "$TARGET" "$MERGE_DOC"
+      else
+        echo '{}' > "$MERGE_DOC"
+      fi
+      MERGE_ALL=0
+      MERGED=0
+      # ANSI colors for the interactive prompt. NO_COLOR opts out; the
+      # prompt already required a tty above, so no further guard is needed.
+      C_RESET=$'\033[0m'
+      C_KEY=$'\033[1;36m'
+      C_BOLD=$'\033[1m'
+      [ -n "''${NO_COLOR:-}" ] && { C_RESET=""; C_KEY=""; C_BOLD=""; }
+      # Keys arrive on fd 3, not stdin: the loop-level redirect would
+      # otherwise hijack fd 0 for the whole loop body, stealing the terminal
+      # from the `read -r ans` below (prompts would fire back-to-back with no
+      # waiting and key lines consumed as answers). fd 0 stays on the tty.
+      while IFS= read -r key <&3; do
+        [ -n "$key" ] || continue
+        case "$key" in
+          extensions|defaultProjectTrust) continue ;;
+        esac
+        # CUR empty when the jail lacks the key entirely (`// empty`); NEW is
+        # always JSON since the key came from $SRC's keys[]. Both sides are
+        # key-sorted (-S) so semantically equal objects in different key order
+        # don't re-prompt: the host file's hand-written order would otherwise
+        # diff against the canonical order the target is written in.
+        CUR=$(jq -Sc --arg k "$key" '.[$k] // empty' "$MERGE_DOC")
+        NEW=$(jq -Sc --arg k "$key" '.[$k] // empty' "$SRC")
+        [ "$CUR" = "$NEW" ] && continue
+        if [ "$MERGE_ALL" != "1" ]; then
+          # Show the value being offered, not just the key name - it is the
+          # actual approval target. -r keeps objects/arrays multi-line and
+          # prints strings/bools as literal text; each line indented for
+          # readability under the prompt header.
+          printf 'llm-custody: merge key %s%s%s from %s:\n' "$C_KEY" "$key" "$C_RESET" "$(basename "$SRC")" >&2
+          printf '%s\n' "$(jq -r --arg k "$key" '.[$k]' "$SRC")" | while IFS= read -r line; do printf '    %s\n' "$line"; done >&2
+          printf '%sAccept this value?%s [y/N/a] ' "$C_BOLD" "$C_RESET" >&2
+          # EOF on the tty (Ctrl-D) aborts the whole merge - and the launch -
+          # rather than answering 'no' silently; target stays unmodified.
+          read -r ans || { echo "llm-custody: --merge-config aborted (no answer)" >&2; exit 1; }
+          case "$ans" in
+            [yY]|[yY][eE][sS]) ;;
+            [aA]|[aA][lL][lL]) MERGE_ALL=1 ;;
+            *) continue ;;
+          esac
+        fi
+        VAL=$(jq -c --arg k "$key" '.[$k]' "$SRC")
+        jq --arg k "$key" --argjson v "$VAL" '.[$k] = $v' "$MERGE_DOC" > "$MERGE_DOC.tmp"
+        mv "$MERGE_DOC.tmp" "$MERGE_DOC"
+        MERGED=$((MERGED+1))
+      done 3< <(jq -r 'keys[]' "$SRC")
+      if [ "$MERGED" -gt 0 ]; then
+        jq -S . "$MERGE_DOC" > "$TARGET.tmp" && mv "$TARGET.tmp" "$TARGET"
+        echo "llm-custody: --merge-config: merged $MERGED key(s) into $TARGET" >&2
+      else
+        echo "llm-custody: --merge-config: nothing changed (jail settings already match)" >&2
+      fi
+    fi
     HOLDER_PID=""
     SLIRP_PID=""
     DNSMASQ_PID=""
