@@ -5,12 +5,20 @@
 > fork replaced that with bubblewrap + a private network namespace (real
 > Linux namespaces on the host kernel instead of a VM boundary, no guest
 > kernel to boot) and cut every tool except [Pi](https://pi.dev) in the
-> process (maybe will re-add some later). Not a PR-back candidate.
+> process ([Claude Code](https://code.claude.com) has since been re-added).
+> Not a PR-back candidate.
 
-Sandbox for running the Pi coding agent via bubblewrap + a private network
+Sandbox for running a coding agent via bubblewrap + a private network
 namespace. No VM, no disk image; the tool runs directly on the host kernel,
 isolated by Linux namespaces and a seccomp denylist, with DNS+nftables-based
 domain whitelisting for outbound network access.
+
+Supported tools (one runner package each, `nix run .#<tool>`):
+
+| Tool | Config dir in sandbox | Relocated via | Dangerous mode |
+|------|-----------------------|----------------|----------------|
+| `pi` | `/home/user/.pi/agent` | `PI_CODING_AGENT_DIR` | no flag (trust is pre-set instead) |
+| `claude` | `/home/user/.claude` | `CLAUDE_CONFIG_DIR` | `--dangerous` |
 
 ## Requirements
 
@@ -22,9 +30,9 @@ domain whitelisting for outbound network access.
   these; otherwise install `shadow`'s setuid helpers and add subuid/subgid
   ranges yourself.
 
-No host-side `pi` credentials are needed: you log in once inside the jail on
-first run (pi's own `/login` flow), and its state persists in a jail-private
-directory under `~/.config/llm-custody/pi/` (see
+No host-side tool credentials are needed: you log in once inside the jail on
+first run (the tool's own `/login` flow), and that state persists in a
+jail-private directory under `~/.config/llm-custody/<tool>/` (see
 [First run & authentication](#first-run--authentication)).
 
 ## Quick start
@@ -32,6 +40,9 @@ directory under `~/.config/llm-custody/pi/` (see
 ```bash
 # Run Pi
 nix run "git+ssh://gitea@git.gurkan.in/gurkan/llm-custody.git#pi"
+
+# Run Claude Code
+nix run "git+ssh://gitea@git.gurkan.in/gurkan/llm-custody.git#claude"
 
 # Pass tool arguments after --
 nix run "git+ssh://gitea@git.gurkan.in/gurkan/llm-custody.git#pi" -- -p "Refactor the auth module"
@@ -41,18 +52,27 @@ Or, from a local checkout:
 
 ```bash
 nix run .#pi -- -p "Refactor the auth module"
+nix run .#claude -- --dangerous -- -p "Refactor the auth module"
 ```
 
 ## First run & authentication
 
-Pi's state lives in a jail-private directory on the host -
-`~/.config/llm-custody/pi/<profile>` (profile `default` unless `--profile` is
-given) - bound read-write into the sandbox at `/home/user/.pi/agent`
-(`PI_CODING_AGENT_DIR`). Your real `~/.pi` is never mounted or read.
+Tool state lives in a jail-private directory on the host -
+`~/.config/llm-custody/<tool>/<profile>` (profile `default` unless
+`--profile` is given) - bound read-write into the sandbox at the tool's own
+config location (see the table above). Your real `~/.pi` / `~/.claude` is
+never mounted or read.
 
-On first run the directory is empty, so pi walks you through its own
+On first run the directory is empty, so the tool walks you through its own
 `/login` flow in the terminal. Credentials and settings then persist across
 runs.
+
+For claude, that login is the paste-a-code variant of the OAuth flow: there
+is no browser inside the sandbox, so claude prints the authorize URL, you
+open it on the host and paste the code back. `platform.claude.com` and
+`claude.ai` are whitelisted for exactly this. Alternatively,
+export `ANTHROPIC_API_KEY` on the host - it is forwarded into the sandbox and
+skips the login entirely.
 
 Work for multiple clients by giving each its own profile, each with its own
 one-time login:
@@ -64,21 +84,22 @@ nix run .#pi -- --profile client2
 
 If you want to reuse an existing host login rather than logging in fresh,
 you can point `--state-dir` at a directory that itself contains a
-`pi/<profile>` symlink onto your real `~/.pi/agent` - at your own risk (host
-and jail will then refresh the same credentials independently). Do not point
-it directly at a directory the host `pi` also writes to.
+`<tool>/<profile>` symlink onto your real config dir (`~/.pi/agent`,
+`~/.claude`) - at your own risk (host and jail will then refresh the same
+credentials independently). Do not point it directly at a directory the host
+tool also writes to.
 
 ## Usage
 
 ```
-llm-custody-pi [options] [-- pi-args...]
+llm-custody-<tool> [options] [-- tool-args...]
 ```
 
 ### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--profile NAME` | State profile, a subdir of `--state-dir/pi` | `default` |
+| `--profile NAME` | State profile, a subdir of `--state-dir/<tool>` | `default` |
 | `--state-dir PATH` | Jail state root dir, mounted read-write | `~/.config/llm-custody` |
 | `--same-path` | Mount workspace at its host path instead of `/workspace` | off |
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
@@ -90,6 +111,7 @@ llm-custody-pi [options] [-- pi-args...]
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
+| `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
 | `--mask GLOB` | Hide files/dirs matching GLOB in the workspace (binds empty file/dir over each match, repeatable) | - |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
@@ -101,8 +123,8 @@ Any other argument (e.g. pi's `-p`) is passed straight through to the tool,
 so the quick-start style `nix run .#pi -- -p "..."` works as written - the
 runner only intercepts its own flags.
 
-Not yet ported from the old QEMU jail: `--dangerous` (pi has no
-dangerous-mode flag - see below), `--immutable`, `--nix-env`, `--devenv`.
+Not yet ported from the old QEMU jail: `--immutable`, `--nix-env`,
+`--devenv`.
 
 ### Examples
 
@@ -188,12 +210,14 @@ bound paths are visible inside it:
   in-jail to always force `-c core.hooksPath` at that read-only dir, so
   rewriting `core.hooksPath` in the still-writable `.git/config` doesn't let
   an agent redirect in-jail git to a hooks dir it controls)
-- The jail-private state dir `~/.config/llm-custody/pi/<profile>` ->
-  `/home/user/.pi/agent` (read-write)
-- `~/.gitconfig` and `~/.claude/skills` (read-only by default - skills are
-  the instructions a jailed agent executes, and their real host checkout is
-  what the host's own agents and skillsync read, so writes would persist;
-  `--rw-skills` mounts them read-write instead, opt-in only)
+- The jail-private state dir `~/.config/llm-custody/<tool>/<profile>` ->
+  the tool's config dir inside the sandbox (read-write)
+- `~/.gitconfig` and `~/.claude/skills` (the latter one entry at a time,
+  into whatever dir the tool reads skills from - `tools.nix` `skillsDir`;
+  read-only by default, because skills are the instructions a jailed agent
+  executes and their real host checkout is what the host's own agents and
+  skillissue read, so writes would persist; `--rw-skills` mounts them
+  read-write instead, opt-in only)
 - Host system and user packages -> `/host-sw`, `/host-user-sw` (read-only,
   NixOS hosts only; on non-NixOS hosts the real `/usr/bin` and `/bin` are
   bound read-only instead, so system-installed tools are available there
@@ -246,10 +270,20 @@ holder process (not the host's), so the sandbox gets a private network too.
 
 All other host environment variables are stripped.
 
+On top of those, each tool's launcher sets a fixed set of its own
+(`launchers/<tool>.nix` `extraEnv`), applied before the `--env` pairs so
+yours override them. For claude that is `DISABLE_AUTOUPDATER`,
+`DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (the store is read-only, and this
+is what keeps statsig/sentry off the whitelist) and `IS_SANDBOX` (the
+in-jail uid is 0, since the netns holder maps inner uid 0 to your host uid
+so workspace writes stay owned by you - claude otherwise refuses
+`--dangerously-skip-permissions` for a uid-0 process).
+
 **Network.** By default, outbound access is restricted via DNS-based domain
 filtering and a port-level firewall inside a private network namespace:
 
-- DNS resolution (via a per-run dnsmasq instance) is limited to pi's
+- DNS resolution (via a per-run dnsmasq instance) is limited to the tool's
   whitelisted API/service domains
 - Only HTTP/HTTPS traffic (ports 80/443) is allowed outbound to IPs that a
   whitelisted domain actually resolved to (nftables set populated from
@@ -265,11 +299,19 @@ filtering and a port-level firewall inside a private network namespace:
   the sets fresh
 - Use `--no-net-filter` to disable all network restrictions
 
-Default allowed domains: `pi.dev`, `api.anthropic.com`, `api.openai.com`,
-`auth.openai.com`, `chatgpt.com`, `generativelanguage.googleapis.com`,
-`github.com`, `api.github.com`, `openrouter.ai`, `api.deepseek.com`,
-`api.mistral.ai`, `api.x.ai`, `api.groq.com`, `api.cerebras.ai`,
-`api.novita.ai`.
+Default allowed domains are per tool (`tools.nix` `allowedDomains`).
+
+- `pi`: `pi.dev`, `api.anthropic.com`, `api.openai.com`, `auth.openai.com`,
+  `chatgpt.com`, `generativelanguage.googleapis.com`, `github.com`,
+  `api.github.com`, `openrouter.ai`, `api.deepseek.com`, `api.mistral.ai`,
+  `api.x.ai`, `api.groq.com`, `api.cerebras.ai`, `api.novita.ai`
+- `claude`: `api.anthropic.com`, `platform.claude.com`, `claude.ai` (the
+  last two only matter for the in-jail login - authorize page, code
+  callback and token exchange live on `platform.claude.com`, which is where
+  the old `console.anthropic.com` endpoints moved), `github.com`,
+  `api.github.com`. Plugin/marketplace installs need
+  `--allow-domain registry.npmjs.org` (and possibly
+  `raw.githubusercontent.com`) on top.
 
 > [!NOTE]
 > Dual-stack: slirp4netns's IPv6 path (`-6`, marked experimental upstream)
@@ -279,12 +321,22 @@ Default allowed domains: `pi.dev`, `api.anthropic.com`, `api.openai.com`,
 
 ## Dangerous mode
 
-Pi has no dangerous-mode CLI flag of its own; project trust is instead set
-to `trusted` in the jail-private `settings.json` on every launch, so pi
-doesn't prompt for it. A.k.a. YOLO forever. The agent can still execute
-arbitrary commands, write to any mounted directory, and make network
-requests to whitelisted domains without asking, exactly as it would
-run outside the jail.
+`--dangerous` passes the tool's own skip-all-permission-prompts flag
+(`tools.nix` `dangerousFlag`); for claude that is
+`--dangerously-skip-permissions`. Pi has no such flag, so `--dangerous`
+errors out for it - there, project trust is set to `trusted` in the
+jail-private `settings.json` on every launch instead, which is effectively
+the same thing (A.k.a. YOLO forever).
+
+Either way the agent can execute arbitrary commands, write to any mounted
+directory, and make network requests to whitelisted domains without asking,
+exactly as it would run outside the jail.
+
+Independently of the flag, both tools start with their one-time trust and
+onboarding prompts pre-accepted in the jail-private state dir (claude:
+`.claude.json` keyed by the workspace mount path; pi:
+`defaultProjectTrust`). Without that, a non-interactive `-p` run would hang
+on the trust dialog on every fresh profile.
 
 Network filtering remains active regardless - the agent can only reach
 whitelisted domains unless you pass `--no-net-filter`.
@@ -300,12 +352,12 @@ whitelisted domains unless you pass `--no-net-filter`.
 
 ```
 +-- Host -------------------------------------------------+
-|  nix run .#pi                                           |
+|  nix run .#<tool>                                       |
 |    v                                                     |
 |  writeShellApplication (lib/mkBwrapRunner.nix)          |
 |    - parses CLI args                                     |
-|    - runs launchers/pi.nix's bootstrapScript directly    |
-|      against the real host state dir                     |
+|    - runs launchers/<tool>.nix's bootstrapScript         |
+|      directly against the real host state dir            |
 |    - unshare --user --net (+ newuidmap/newgidmap) holder  |
 |    - slirp4netns for outbound connectivity                |
 |    - dnsmasq (domain whitelist) + nftables (IP gate)      |
@@ -313,11 +365,11 @@ whitelisted domains unless you pass `--no-net-filter`.
 |    - nsenter's into the netns holder, execs bwrap ...     |
 |                                                            |
 |  +-- bwrap sandbox (mount/pid/ipc/uts/user ns) --------+ |
-|  |  /nix/store        <- ro-bind                        | |
+|  |  /nix/store         <- ro-bind                        | |
 |  |  /workspace         <- bind (rw)                      | |
-|  |  /home/user/.pi/agent <- bind (rw, jail-private state)| |
+|  |  /home/user/<cfg>   <- bind (rw, jail-private state)  | |
 |  |  seccomp denylist applied at the final execve         | |
-|  |  exec pi                                              | |
+|  |  exec the tool                                        | |
 |  +-------------------------------------------------------+ |
 +-----------------------------------------------------------+
 ```
@@ -327,16 +379,16 @@ and Linux namespaces on the host kernel.
 
 ## Overriding the tool package
 
-The runner is built with `lib.makeOverridable`, so `pi-coding-agent` can be
-swapped without forking the flake:
+The runner is built with `lib.makeOverridable`, so `pi-coding-agent` /
+`claude-code` can be swapped without forking the flake:
 
 ```nix
 # flake.nix (consumer)
 let
   llm-custody = inputs.llm-custody.packages.${system};
 in
-  llm-custody.pi.override {
-    pi-coding-agent = my-pinned-pi;
+  llm-custody.claude.override {
+    claude-code = my-pinned-claude-code;
   }
 ```
 
@@ -346,16 +398,16 @@ unreleased build.
 ## Adding a new tool
 
 1. Add `launchers/<tool>.nix`: a plain function
-   `{ pkgs, <tool-package>, ... }: { toolPackage; bootstrapScript ? ""; }`.
+   `{ pkgs, <tool-package>, ... }: { toolPackage; extraEnv ? {}; bootstrapScript ? ""; }`.
 2. Add an entry to `tools.nix` (`launcherModule`, `configDirName`,
-   `configEnvVar`, `allowedDomains`).
+   `configEnvVar`, `skillsDir`, `allowedDomains`, `resumeFlags`, plus
+   optional `dangerousFlag` and `mergeSkipKeys`).
 3. Wire the tool's package into `flake.nix`'s `defaultArgs`.
 4. `nix run .#your-tool` - the flake generates a runner automatically.
 
-CLI flags like `--dangerous`, `--immutable`, `--nix-env`, and
-`--devenv` existed in the old QEMU jail and haven't been ported to the bwrap
-runner yet; a new tool that needs one of these needs that support added to
-`lib/mkBwrapRunner.nix` too.
+CLI flags like `--immutable`, `--nix-env`, and `--devenv` existed in the old
+QEMU jail and haven't been ported to the bwrap runner yet; a new tool that
+needs one of these needs that support added to `lib/mkBwrapRunner.nix` too.
 
 ## License
 

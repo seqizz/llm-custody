@@ -20,17 +20,23 @@
       mkTool = system: toolName: toolDef:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          # Default tool packages - overridable via `.override { pi-coding-agent = ...; }`
-          # on the resulting runner derivation. Consumers can swap it without
-          # forking the flake.
+          # Default tool packages - overridable via
+          # `.override { claude-code = ...; }` on the resulting runner
+          # derivation. Consumers can swap one without forking the flake.
+          # Every entry is handed to every launcher; a launcher's `...`
+          # signature ignores the packages it doesn't need, so only the one it
+          # actually references ends up as a store dependency of its runner.
           defaultArgs = {
             pi-coding-agent = llm-agents.packages.${system}.pi;
+            claude-code = llm-agents.packages.${system}.claude-code;
           };
         in
         pkgs.lib.makeOverridable (
-          { pi-coding-agent }:
+          # Named explicitly (rather than a bare `toolPackages:`) so an
+          # `.override` typo fails at eval instead of silently doing nothing.
+          toolPackages@{ pi-coding-agent, claude-code }:
           let
-            launcherOut = import toolDef.launcherModule { inherit pkgs pi-coding-agent; };
+            launcherOut = import toolDef.launcherModule (toolPackages // { inherit pkgs; });
           in
           import ./lib/mkBwrapRunner.nix {
             inherit pkgs launcherOut;

@@ -23,6 +23,18 @@ let
   selftestProbe = import ./selftest.nix { inherit pkgs; };
   selftestDomain = builtins.head toolDefaults.allowedDomains;
   selftestUnshare = "${pkgs.util-linux}/bin/unshare";
+  # Optional per-tool data: a tool with no dangerous-mode CLI flag (pi) just
+  # omits it and --dangerous then errors out instead of passing something
+  # the tool would reject.
+  dangerousFlag = toolDefaults.dangerousFlag or "";
+  # Fixed env the tool itself needs (launchers/<tool>.nix extraEnv), e.g.
+  # telemetry/autoupdate switches. Emitted as bwrap --setenv args ahead of
+  # the user's --env pairs so those still take precedence.
+  extraEnvArgs = pkgs.lib.concatStringsSep "\n      " (
+    pkgs.lib.mapAttrsToList
+      (k: v: "--setenv ${k} ${pkgs.lib.escapeShellArg v}")
+      (launcherOut.extraEnv or { })
+  );
 in
 pkgs.writeShellApplication {
   name = "llm-custody-${name}";
@@ -61,6 +73,13 @@ pkgs.writeShellApplication {
     RESUME_MODE=""
     RESUME_ARG=""
     RW_SKILLS=0
+    DANGEROUS=0
+    DANGEROUS_FLAG="${dangerousFlag}"
+    # Root-level settings.json keys --merge-config never offers, because the
+    # bootstrapScript owns them (tools.nix mergeSkipKeys).
+    MERGE_SKIP_KEYS=(
+      ${builtins.concatStringsSep "\n      " (map (k: "\"${k}\"") (toolDefaults.mergeSkipKeys or [ ]))}
+    )
     # Per-tool session-resume translation (tools.nix resumeFlags):
     # -c/--continue -> CONTINUE_FLAG, -r/--resume -> RESUME_FLAG (picker),
     # and --resume <id> -> RESUME_WITH_ID_FLAG.
@@ -96,6 +115,8 @@ pkgs.writeShellApplication {
       -c, --continue, -r, --resume [ID]
                              Resume a session; translated to the tool's own
                              resume flags (see tools.nix resumeFlags)
+      --dangerous           Skip the tool's own permission prompts (passes its
+                             dangerous-mode flag, if it has one)
       --rw-skills           Mount skills read-write (default: read-only). Only
                              for deliberate in-jail skill maintenance - an
                              agent can edit files the host then reads
@@ -126,6 +147,12 @@ pkgs.writeShellApplication {
         --env)           ENV_PAIRS+=("$2"); shift 2 ;;
         --overlay-workspace) OVERLAY=1; shift ;;
         --selftest)      SELFTEST=1; shift ;;
+        --dangerous)
+          if [ -z "$DANGEROUS_FLAG" ]; then
+            echo "ERROR: ${name} has no dangerous-mode flag (tools.nix dangerousFlag unset)" >&2
+            exit 1
+          fi
+          DANGEROUS=1; shift ;;
         --rw-skills)     RW_SKILLS=1; shift ;;
         --mask)          MASK_PATTERNS+=("$2"); shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
@@ -248,9 +275,11 @@ pkgs.writeShellApplication {
       # waiting and key lines consumed as answers). fd 0 stays on the tty.
       while IFS= read -r key <&3; do
         [ -n "$key" ] || continue
-        case "$key" in
-          extensions|defaultProjectTrust) continue ;;
-        esac
+        SKIP_KEY=0
+        for sk in "''${MERGE_SKIP_KEYS[@]+"''${MERGE_SKIP_KEYS[@]}"}"; do
+          [ "$key" = "$sk" ] && SKIP_KEY=1
+        done
+        [ "$SKIP_KEY" = "1" ] && continue
         # CUR empty when the jail lacks the key entirely (`// empty`); NEW is
         # always JSON since the key came from $SRC's keys[]. Both sides are
         # key-sorted (-S) so semantically equal objects in different key order
@@ -585,6 +614,9 @@ pkgs.writeShellApplication {
       --tmpfs /home/user
       --setenv HOME /home/user
       --setenv ${toolDefaults.configEnvVar} /home/user/${toolDefaults.configDirName}
+      # Fixed per-tool env (launchers/<tool>.nix extraEnv). bwrap applies
+      # --setenv in order, so the --env pairs added further down still win.
+      ${extraEnvArgs}
       --chdir "$WORKSPACE_GUEST"
       --ro-bind /nix/store /nix/store
       "''${WS_SPEC[@]}"
@@ -686,6 +718,12 @@ pkgs.writeShellApplication {
     # there, and a symlink bound as-is just dangles inside the sandbox since
     # its target lives outside anything else mounted.
     #
+    # Target dir is per-tool (tools.nix skillsDir) because each tool looks in
+    # its own place. When that path sits under the tool's config dir (claude:
+    # CLAUDE_CONFIG_DIR/skills) these binds stack on top of the state mount
+    # added above, which also means a skill the tool installs itself lands in
+    # a masked directory and stays invisible for the rest of the run.
+    #
     # Read-only by default: the bind source is the real host checkout the
     # host's own agents read via ~/.claude/skills, so a writable bind would
     # let a jailed agent edit the instructions it (and other agents) run,
@@ -696,9 +734,9 @@ pkgs.writeShellApplication {
       for entry in "$HOME/.claude/skills"/*; do
         [ -e "$entry" ] || continue
         if [ "$RW_SKILLS" = "1" ]; then
-          BWRAP_ARGS+=(--bind "$(readlink -f "$entry")" "/home/user/.agents/skills/$(basename "$entry")")
+          BWRAP_ARGS+=(--bind "$(readlink -f "$entry")" "/home/user/${toolDefaults.skillsDir}/$(basename "$entry")")
         else
-          BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "/home/user/.agents/skills/$(basename "$entry")")
+          BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "/home/user/${toolDefaults.skillsDir}/$(basename "$entry")")
         fi
       done
       if [ "$RW_SKILLS" = "1" ]; then
@@ -831,6 +869,13 @@ pkgs.writeShellApplication {
       else
         TOOL_ARGS=("$RESUME_FLAG" "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}")
       fi
+    fi
+
+    # --dangerous: the tool's own skip-all-permission-prompts flag
+    # (tools.nix dangerousFlag). Prepended, so a session flag the user passes
+    # after `--` can still follow it.
+    if [ "$DANGEROUS" = "1" ]; then
+      TOOL_ARGS=("$DANGEROUS_FLAG" "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}")
     fi
 
     if [ "$NET_FILTER" = "1" ]; then
