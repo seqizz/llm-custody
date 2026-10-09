@@ -3,11 +3,11 @@
 # netns/slirp4netns/dnsmasq/nftables/bwrap/seccomp chain, interactively
 # tested with a live TUI session) so it's data-driven from tools.nix instead
 # of hardcoding one tool's values.
-{ pkgs
-, name
-, toolDefaults
-, launcherOut
-,
+{
+  pkgs,
+  name,
+  toolDefaults,
+  launcherOut,
 }:
 
 let
@@ -31,9 +31,9 @@ let
   # telemetry/autoupdate switches. Emitted as bwrap --setenv args ahead of
   # the user's --env pairs so those still take precedence.
   extraEnvArgs = pkgs.lib.concatStringsSep "\n      " (
-    pkgs.lib.mapAttrsToList
-      (k: v: "--setenv ${k} ${pkgs.lib.escapeShellArg v}")
-      (launcherOut.extraEnv or { })
+    pkgs.lib.mapAttrsToList (k: v: "--setenv ${k} ${pkgs.lib.escapeShellArg v}") (
+      launcherOut.extraEnv or { }
+    )
   );
 in
 pkgs.writeShellApplication {
@@ -74,6 +74,7 @@ pkgs.writeShellApplication {
     RESUME_ARG=""
     RW_SKILLS=0
     DANGEROUS=0
+    X11=0
     DANGEROUS_FLAG="${dangerousFlag}"
     # Root-level settings.json keys --merge-config never offers, because the
     # bootstrapScript owns them (tools.nix mergeSkipKeys).
@@ -107,6 +108,10 @@ pkgs.writeShellApplication {
       --allow-domain DOMAIN Add domain to network whitelist (repeatable;
                              persistent ones can live in --state-dir/domains)
       --env KEY=VAL         Pass environment variable into the sandbox (repeatable)
+      --x11                 Allow X11/Wayland clipboard access by passing
+                             DISPLAY/XAUTHORITY/WAYLAND_DISPLAY and binding
+                             the display sockets. Without this, those vars
+                             are stripped so the terminal uses OSC 52 instead
       --overlay-workspace   Mount the workspace copy-on-write; edits are shown
                              for review and synced back to the real tree on exit
       --selftest            Run a sandbox self-check (full chain incl. netns +
@@ -154,6 +159,7 @@ pkgs.writeShellApplication {
           fi
           DANGEROUS=1; shift ;;
         --rw-skills)     RW_SKILLS=1; shift ;;
+        --x11)           X11=1; shift ;;
         --mask)          MASK_PATTERNS+=("$2"); shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
         --merge-config)      MERGE_CONFIG=1; shift ;;
@@ -780,6 +786,25 @@ pkgs.writeShellApplication {
       fi
       BWRAP_ARGS+=(--setenv "$key" "$val")
     done
+    # Display variables are stripped by default so terminals fall back to OSC 52
+    # for clipboard. Passing them in without real display access just makes
+    # clipboard tools fail. --x11 opts into real X11/Wayland passthrough.
+    BWRAP_ARGS+=(--unsetenv DISPLAY --unsetenv XAUTHORITY --unsetenv WAYLAND_DISPLAY)
+    if [ "$X11" = "1" ]; then
+      for var in DISPLAY XAUTHORITY WAYLAND_DISPLAY; do
+        [ -n "''${!var:-}" ] && BWRAP_ARGS+=(--setenv "$var" "''${!var}")
+      done
+      [ -d /tmp/.X11-unix ] && BWRAP_ARGS+=(--ro-bind /tmp/.X11-unix /tmp/.X11-unix)
+      if [ -n "''${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+        BWRAP_ARGS+=(--ro-bind "$XAUTHORITY" "$XAUTHORITY")
+      elif [ -f "$HOME/.Xauthority" ]; then
+        BWRAP_ARGS+=(--ro-bind "$HOME/.Xauthority" "$HOME/.Xauthority")
+      fi
+      if [ -n "''${WAYLAND_DISPLAY:-}" ]; then
+        WAYLAND_SOCK="/run/user/$(id -u)/$WAYLAND_DISPLAY"
+        [ -S "$WAYLAND_SOCK" ] && BWRAP_ARGS+=(--ro-bind "$WAYLAND_SOCK" "$WAYLAND_SOCK")
+      fi
+    fi
     if STTY_SIZE=$(stty size 2>/dev/null); then
       BWRAP_ARGS+=(--setenv LINES "''${STTY_SIZE%% *}" --setenv COLUMNS "''${STTY_SIZE##* }")
     fi

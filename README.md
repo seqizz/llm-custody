@@ -107,6 +107,7 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | - |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
+| `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
 | `--overlay-workspace` | Mount the workspace copy-on-write; edits sync back to the real tree only on explicit confirmation at exit | off |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
@@ -267,6 +268,18 @@ holder process (not the host's), so the sandbox gets a private network too.
 - `AWS_*`
 - `TERM`, `COLORTERM`, `LINES`, `COLUMNS`, `LANG`, `LC_ALL`, `LC_CTYPE`
 - Anything passed via `--env KEY=VAL`
+
+`DISPLAY`, `XAUTHORITY`, and `WAYLAND_DISPLAY` are explicitly stripped by
+default. This prevents tools like `pi` from trying (and failing) to use X11
+clipboard helpers inside a sandboxed session with no real display access; a
+terminal that supports OSC 52 (e.g. WezTerm, kitty, Alacritty) then handles
+copy-on-select through the terminal stream instead. To actually pass through a
+local X11 or Wayland session, run with `--x11`.
+
+Warning: `--x11` weakens the sandbox. X11 does not isolate clients from each
+other, so a sandboxed process can sniff keystrokes and screenshots of any
+other X11 client on the same server. Prefer OSC 52 unless you really need
+native clipboard helpers.
 
 All other host environment variables are stripped.
 
