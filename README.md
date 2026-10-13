@@ -101,10 +101,10 @@ llm-custody-<tool> [options] [-- tool-args...]
 |------|-------------|---------|
 | `--profile NAME` | State profile, a subdir of `--state-dir/<tool>` | `default` |
 | `--state-dir PATH` | Jail state root dir, mounted read-write | `~/.config/llm-custody` |
-| `--same-path` | Mount workspace at its host path instead of `/workspace` | off |
+| `--same-path` | Mount the workspace and every `--mount` at their host paths instead of under `/workspace` | off |
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
-| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable) | - |
-| `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | - |
+| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable) | `/workspace/<basename HOSTPATH>` |
+| `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | `/workspace/<basename HOSTPATH>` |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
@@ -130,16 +130,25 @@ Not yet ported from the old QEMU jail: `--immutable`, `--nix-env`,
 
 ### Examples
 
-Mount an extra directory:
+Mount an extra directory - it lands next to the workspace, as
+`/workspace/data`:
 
 ```bash
 nix run .#pi -- --mount /tmp/data -- -p "Process the dataset"
 ```
 
-Enable git-over-SSH by mounting your SSH directory (read-only):
+Two sources with the same basename collide, so name one of them explicitly:
 
 ```bash
-nix run .#pi -- --ro-mount ~/.ssh -- -p "Push the changes"
+nix run .#pi -- --mount /srv/a/config --mount /srv/b/config:/workspace/b-config
+```
+
+Mount somewhere other than `/workspace` by giving an absolute target - e.g.
+git-over-SSH needs the keys where ssh looks for them, in the sandbox's own
+`$HOME`:
+
+```bash
+nix run .#pi -- --ro-mount ~/.ssh:/home/user/.ssh -- -p "Push the changes"
 ```
 
 Allow access to additional domains (e.g. for package installs or git cloning):
@@ -227,14 +236,19 @@ you confirm - every write goes to a copy-on-write overlay, and on exit you
 are asked whether to sync (a subset of) the changes back:
 
 ```bash
-cd ~/devel/some-project && nix run .#pi -- --overlay-workspace
+cd ~/devel/some-project && nix run .#pi -- --git full --overlay-workspace
 ```
 
-This is the safest workspace mode: a destructive agent run (`rm -rf`, bad
-rebase) can be declined at the sync prompt and the host tree stays
-untouched. Two caveats: only *confirmation* is interactive, and overlayfs
-quirks (e.g. opaque directories) are not fully mirrored by the sync-back,
-so review with `git status`/`git diff` afterwards.
+This is the safest way to work on the real tree with its history: a
+destructive agent run (`rm -rf`, bad rebase) can be declined at the sync
+prompt and the host tree stays untouched. Three caveats: only
+*confirmation* is interactive, overlayfs quirks (e.g. opaque directories)
+are not fully mirrored by the sync-back, so review with `git status`/`git
+diff` afterwards, and the host needs unprivileged overlayfs support -
+kernel >= 5.11, plus an upper layer on a filesystem with user xattrs. The
+upper layer lives under `--tmpdir`, which defaults to `/tmp`, so on a host
+where that is tmpfs this needs kernel >= 6.6 or a `--tmpdir` pointed at
+disk. Checked before launch, with that hint in the error.
 
 Disable network filtering entirely:
 
@@ -247,7 +261,10 @@ nix run .#pi -- --no-net-filter
 **Filesystem.** The sandbox has its own mount namespace; only explicitly
 bound paths are visible inside it:
 
-- The current working directory -> `/workspace` (read-write). With the
+- The current working directory -> `/workspace/<its basename>` (read-write),
+  which is also the sandbox cwd. `/workspace` itself is just the root the
+  workspace and every extra mount hang under, so the in-jail layout mirrors
+  a project plus its siblings instead of scattered host paths. With the
   default `--git limited`/`none` this is a *copy* of the working tree
   without `.git`; with `--git full` it is the real directory, and then
   `.git/hooks` underneath is re-bound read-only. Either way `git` is
@@ -268,7 +285,8 @@ bound paths are visible inside it:
   bound read-only instead, so system-installed tools are available there
   too)
 - `/nix/store` (read-only)
-- Any directories added via `--mount` / `--ro-mount`
+- Any directories added via `--mount` / `--ro-mount`, by default under
+  `/workspace` next to the workspace itself
 
 The sandboxed process runs without `CAP_SYS_ADMIN` (bwrap
 `--cap-drop CAP_SYS_ADMIN`), so it cannot create bind mounts or remount
@@ -288,7 +306,7 @@ On NixOS hosts, system packages (`/run/current-system/sw`) and user packages
 `PATH`, so tools like `rg`, `git`, `jq`, etc. are available without
 hardcoding them, as long as the host has them installed.
 
-With `--git full`, `/workspace` is a direct read-write bind of the host
+With `--git full`, the workspace is a direct read-write bind of the host
 directory, not a copy-on-write layer - a destructive command run by the
 agent (`rm -rf`, a bad rebase, force-push, ...) mutates the real working
 tree immediately. The default `--git limited` avoids that by construction
@@ -426,7 +444,7 @@ whitelisted domains unless you pass `--no-net-filter`.
 |                                                            |
 |  +-- bwrap sandbox (mount/pid/ipc/uts/user ns) --------+ |
 |  |  /nix/store         <- ro-bind                        | |
-|  |  /workspace         <- bind (rw)                      | |
+|  |  /workspace/<name>  <- bind (rw, cwd)                 | |
 |  |  /home/user/<cfg>   <- bind (rw, jail-private state)  | |
 |  |  seccomp denylist applied at the final execve         | |
 |  |  exec the tool                                        | |

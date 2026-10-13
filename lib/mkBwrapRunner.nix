@@ -96,16 +96,20 @@ pkgs.writeShellApplication {
     Options:
       --profile NAME        State profile, a subdir of --state-dir/${name} (default: default)
       --state-dir PATH      Jail state root dir (default: ~/.config/llm-custody)
-      --same-path           Mount workspace at its host path instead of /workspace
-                             (lets tools like 'claude --resume' match sessions
-                             started outside the sandbox)
+      --same-path           Mount workspace and every --mount at their host
+                             paths instead of under /workspace (lets tools
+                             like 'claude --resume' match sessions started
+                             outside the sandbox)
       --tmpdir PATH         Directory to use for runtime data (default: ''${TMPDIR:-/tmp})
       --mount HOSTPATH[:GUESTPATH]
                              Extra read-write mount (repeatable). GUESTPATH
-                             defaults to HOSTPATH if omitted.
+                             defaults to /workspace/<basename HOSTPATH>; a
+                             relative GUESTPATH is resolved under /workspace.
+                             Colliding targets are an error - give one of them
+                             an explicit GUESTPATH.
       --ro-mount HOSTPATH[:GUESTPATH]
-                             Extra read-only mount (repeatable). GUESTPATH
-                             defaults to HOSTPATH if omitted.
+                             Extra read-only mount (repeatable). Same GUESTPATH
+                             rules as --mount.
       --allow-domain DOMAIN Add domain to network whitelist (repeatable;
                              persistent ones can live in --state-dir/domains)
       --env KEY=VAL         Pass environment variable into the sandbox (repeatable)
@@ -197,8 +201,21 @@ pkgs.writeShellApplication {
       esac
     done
 
+    # /workspace is a container, not the workspace itself: the cwd lands at
+    # /workspace/<its basename> and every --mount without an explicit target
+    # becomes a sibling under the same root. That keeps the in-jail layout
+    # recognizable (a project and its dependencies side by side, each under
+    # its own name) instead of scattering extra mounts across host paths
+    # that otherwise don't exist inside the sandbox.
+    WORKSPACE_ROOT="/workspace"
     WORKSPACE_HOST="$(pwd)"
-    WORKSPACE_GUEST="/workspace"
+    WORKSPACE_NAME=$(basename -- "$WORKSPACE_HOST")
+    # pwd is / (basename "/" is "/"): no name to nest under, so fall back to
+    # the bare root.
+    case "$WORKSPACE_NAME" in
+      /|.|..) WORKSPACE_GUEST="$WORKSPACE_ROOT" ;;
+      *)      WORKSPACE_GUEST="$WORKSPACE_ROOT/$WORKSPACE_NAME" ;;
+    esac
     [ "$SAME_PATH" = "1" ] && WORKSPACE_GUEST="$WORKSPACE_HOST"
 
     # --overlay-workspace only means something for the real tree: --git
@@ -400,7 +417,10 @@ pkgs.writeShellApplication {
               local upper="$1" host="$2"
               local entry base
               for entry in "$upper"/* "$upper"/.[!.]* "$upper"/..?*; do
-                [ -e "$entry" ] || continue
+                # -L as well as -e: a symlink the agent created pointing at
+                # something that only exists inside the sandbox is dangling
+                # on the host, and -e alone would drop it from the sync.
+                [ -e "$entry" ] || [ -L "$entry" ] || continue
                 base=''${entry##*/}
                 if [ -c "$entry" ]; then
                   if [ "$(stat -c '%t:%T' "$entry")" = "0:0" ]; then
@@ -411,7 +431,7 @@ pkgs.writeShellApplication {
                     # something empty by accident. Dollar doubled because
                     # this is a Nix indented string: a bare dollar-brace
                     # would interpolate at eval time.
-                    rm -rf -- "''${host:?remove target host unset}" "''${base:?remove target name unset}" 2>/dev/null; APPLIED=$((APPLIED+1))
+                    rm -rf -- "''${host:?remove target host unset}/''${base:?remove target name unset}" 2>/dev/null; APPLIED=$((APPLIED+1))
                   fi
                   continue
                 fi
@@ -506,6 +526,33 @@ pkgs.writeShellApplication {
       exit "$status"
     }
     trap cleanup EXIT
+
+    # --overlay-workspace preflight. Unprivileged overlayfs needs kernel
+    # >= 5.11, and the upper layer's filesystem must support user xattrs
+    # (overlay mounted inside a userns runs with `userxattr`) - tmpfs only
+    # gained those in 6.6, and --tmpdir defaults to /tmp, which is tmpfs on
+    # NixOS. Probe dirs live under $RUNDIR, i.e. on the same filesystem as
+    # the real upper/workdir, so the verdict applies to what the run will
+    # actually use. Done here rather than at mount-assembly time so the
+    # whole netns/slirp/dnsmasq chain isn't brought up just to fail, and
+    # after the trap so a failed probe still cleans $RUNDIR up.
+    if [ "$OVERLAY" = "1" ]; then
+      mkdir -p "$RUNDIR"/overlay-probe/{lower,upper,work} "$RUNDIR/workspace-upper" "$RUNDIR/workspace-work"
+      if ! bwrap --unshare-user --unshare-pid --ro-bind /nix/store /nix/store \
+             --overlay-src "$RUNDIR/overlay-probe/lower" \
+             --overlay "$RUNDIR/overlay-probe/upper" "$RUNDIR/overlay-probe/work" /mnt \
+             -- "${pkgs.coreutils}/bin/true" 2>"$RUNDIR/overlay-probe.log"; then
+        echo "ERROR: --overlay-workspace is not usable on this host:" >&2
+        # Indented read loop rather than sed: everything else in this script
+        # sticks to coreutils/bash builtins that runtimeInputs guarantees.
+        while IFS= read -r line; do printf '       %s\n' "$line" >&2; done < "$RUNDIR/overlay-probe.log"
+        echo "       Unprivileged overlayfs needs kernel >= 5.11, and the upper layer must sit" >&2
+        echo "       on a filesystem with user xattr support (tmpfs: kernel >= 6.6)." >&2
+        echo "       Point --tmpdir at a disk-backed directory, or drop --overlay-workspace." >&2
+        exit 1
+      fi
+      rm -rf "$RUNDIR/overlay-probe" "$RUNDIR/overlay-probe.log"
+    fi
 
     # --git limited|none: hand the sandbox a copy of the working tree instead
     # of the real one, with .git left behind on the host. Without this, --mask
@@ -754,15 +801,26 @@ pkgs.writeShellApplication {
     # after arg parsing (needed there for the git safety checks).
 
     # Workspace mount: plain rw bind by default, or an opt-in copy-on-write
-    # overlay. --overlay-src uses $RUNDIR/workspace-upper (a host path under
-    # the sandbox runtime dir - the later --tmpfs /tmp hides it from the
-    # sandbox's own view) as the writable upper layer, with the real
-    # workspace as the overlay lower layer. Every write lands in the upper
-    # dir and touches nothing on the host until cleanup()'s sync-back. Needs
-    # a kernel with unprivileged overlayfs support (>= 5.11).
+    # overlay.
+    #
+    # bwrap's overlay takes three distinct pieces: --overlay-src declares a
+    # *lower* (read-only) layer, and --overlay RWSRC WORKDIR DEST does the
+    # actual mount with RWSRC as the writable upper layer. WORKDIR must be an
+    # empty directory on the same filesystem as RWSRC - that's an overlayfs
+    # requirement, not a bwrap one - hence both live under $RUNDIR. Every
+    # write lands in the upper dir and touches nothing on the host until
+    # cleanup()'s sync-back. Both host paths sit under the sandbox runtime
+    # dir, which the later --tmpfs /tmp hides from the sandbox's own view.
     if [ "$OVERLAY" = "1" ]; then
-      mkdir -p "$RUNDIR/workspace-upper"
-      WS_SPEC=(--overlay-src "$RUNDIR/workspace-upper" "$WORKSPACE_GUEST")
+      # Dirs and host support were both settled by the preflight right after
+      # the cleanup trap was installed.
+      # WORKSPACE_BIND is the real tree here: --overlay-workspace is rejected
+      # for --git limited/none further up, since those already hand the
+      # sandbox a copy.
+      WS_SPEC=(
+        --overlay-src "$WORKSPACE_BIND"
+        --overlay "$RUNDIR/workspace-upper" "$RUNDIR/workspace-work" "$WORKSPACE_GUEST"
+      )
     else
       # WORKSPACE_BIND is the real tree with --git full, the RUNDIR copy
       # otherwise.
@@ -992,18 +1050,58 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv LINES "''${STTY_SIZE%% *}" --setenv COLUMNS "''${STTY_SIZE##* }")
     fi
 
+    # Extra binds land under /workspace by default (see WORKSPACE_ROOT
+    # above), named after the host path's last component. Targets are
+    # tracked so two sources can never silently end up on the same path -
+    # the second bind would shadow the first, and the agent would see one
+    # tree where two were asked for. --same-path keeps host paths verbatim,
+    # since that mode exists specifically to make in-jail paths match the
+    # host's.
+    MOUNT_TARGETS=("$WORKSPACE_GUEST")
+    MOUNT_SOURCES=("$WORKSPACE_HOST")
     for spec in "''${EXTRA_MOUNTS[@]+"''${EXTRA_MOUNTS[@]}"}"; do
       mode="''${spec##*:}"
       paths="''${spec%:*}"
       if [[ "$paths" == *:* ]]; then
         hostpath="''${paths%%:*}"; guestpath="''${paths#*:}"
       else
-        hostpath="$paths"; guestpath="$paths"
+        hostpath="$paths"; guestpath=""
       fi
       if [ ! -e "$hostpath" ]; then
         echo "ERROR: mount path does not exist: $hostpath" >&2
         exit 1
       fi
+      if [ -z "$guestpath" ]; then
+        if [ "$SAME_PATH" = "1" ]; then
+          guestpath="$hostpath"
+        else
+          # basename handles trailing slashes ('/devel/test/' -> 'test');
+          # what it can't name (/, ., ..) has to be spelled out by hand.
+          mountname=$(basename -- "$hostpath")
+          case "$mountname" in
+            /|.|..)
+              echo "ERROR: cannot derive a mount target from '$hostpath'" >&2
+              echo "       pass one explicitly: --mount $hostpath:$WORKSPACE_ROOT/<name>" >&2
+              exit 1 ;;
+          esac
+          guestpath="$WORKSPACE_ROOT/$mountname"
+        fi
+      elif [[ "$guestpath" != /* ]]; then
+        # A relative target is a name inside the workspace root, not a path
+        # relative to the sandbox cwd - bwrap would reject the latter anyway.
+        guestpath="$WORKSPACE_ROOT/$guestpath"
+      fi
+      for i in "''${!MOUNT_TARGETS[@]}"; do
+        if [ "''${MOUNT_TARGETS[$i]}" = "$guestpath" ]; then
+          echo "ERROR: two mounts resolve to the same jail path: $guestpath" >&2
+          echo "       already taken by: ''${MOUNT_SOURCES[$i]}" >&2
+          echo "       conflicting with: $hostpath" >&2
+          echo "       give one an explicit target, e.g. --mount $hostpath:$WORKSPACE_ROOT/<other-name>" >&2
+          exit 1
+        fi
+      done
+      MOUNT_TARGETS+=("$guestpath")
+      MOUNT_SOURCES+=("$hostpath")
       if [ "$mode" = "ro" ]; then
         BWRAP_ARGS+=(--ro-bind "$hostpath" "$guestpath")
       else
