@@ -108,13 +108,14 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
-| `--overlay-workspace` | Mount the workspace copy-on-write; edits sync back to the real tree only on explicit confirmation at exit | off |
+| `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh single-commit repo (no host history), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
+| `--overlay-workspace` | Mount the workspace copy-on-write; edits sync back to the real tree only on explicit confirmation at exit (needs `--git full`) | off |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
-| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace (binds empty file/dir over each match, repeatable) | - |
+| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace (deleted from the jail copy; with `--git full`, shadowed by an empty file/dir instead; repeatable) | - |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
 | `--merge-config` | Interactively merge root-level keys from the host tool's settings.json into the jail-private one; each differing key prompts y/N individually ('a' accepts the rest) | off |
 | `--merge-config-from PATH` | Same as `--merge-config` with an explicit source file instead of the default host tool settings.json | - |
@@ -181,6 +182,46 @@ resume sessions started inside the sandbox (host pi state stays untouched).
 The per-tool translation table lives in `tools.nix` (`resumeFlags`), so a
 future tool with different flag names just declares its own there.
 
+### Repo history exposure (`--git`)
+
+By default (`--git limited`) the sandbox does **not** see your `.git`. The
+working tree is copied into the runtime dir, masked paths are deleted from
+the copy, and the copy is re-initialized as a fresh repo with a single
+baseline commit (same branch name as the host checkout, tagged
+`jail-baseline`). In-jail `git status`/`diff`/`commit`/`branch` all work -
+there is simply no history to mine.
+
+That is the point: with the real `.git` bound, `--mask` only hides the
+*working copy* of a file. `git show HEAD:secrets/hiera.yaml` still prints it
+straight out of the packfile. Partial or sparse clones do not fix this
+(`--filter=blob:none` is lazy-fetch, sparse-checkout only controls checkout
+- the objects are still there or still fetchable).
+
+```bash
+nix run .#pi -- --git limited --mask '**/*[Hh]iera*'   # default mode, masks really gone
+nix run .#pi -- --git none                              # copy, no repo at all
+nix run .#pi -- --git full                              # old behaviour: real tree + real .git
+```
+
+Changes made in the copy are synced back to the real tree at exit: on a tty
+you get the change list and a y/N prompt, without one (e.g. `-p "..."`) the
+sync happens automatically, which is what a direct workspace bind did
+anyway. Change detection uses a separate git dir under the runtime dir that
+is never mounted into the sandbox, so an agent cannot rewrite the baseline
+to smuggle an edit past the review.
+
+Trade-offs:
+
+- The copy costs disk and time proportional to the working tree. It lands
+  under `--tmpdir` (default `/tmp`, which is tmpfs on NixOS - point
+  `--tmpdir` at real disk for big repos). `cp --reflink=auto` makes it near
+  free on btrfs/xfs.
+- Gitignored paths are copied into the jail but not tracked, so changes to
+  them never sync back.
+- No history in the jail means no `git log`, `git blame`, rebase or
+  branch-comparison work. Use `--git full` for those.
+- `--overlay-workspace` only applies to `--git full`.
+
 Work on a repo without letting the agent's edits touch the real tree until
 you confirm - every write goes to a copy-on-write overlay, and on exit you
 are asked whether to sync (a subset of) the changes back:
@@ -206,11 +247,14 @@ nix run .#pi -- --no-net-filter
 **Filesystem.** The sandbox has its own mount namespace; only explicitly
 bound paths are visible inside it:
 
-- The current working directory -> `/workspace` (read-write; `.git/hooks`
-  underneath is re-bound read-only even so, and `git` itself is shadowed
-  in-jail to always force `-c core.hooksPath` at that read-only dir, so
-  rewriting `core.hooksPath` in the still-writable `.git/config` doesn't let
-  an agent redirect in-jail git to a hooks dir it controls)
+- The current working directory -> `/workspace` (read-write). With the
+  default `--git limited`/`none` this is a *copy* of the working tree
+  without `.git`; with `--git full` it is the real directory, and then
+  `.git/hooks` underneath is re-bound read-only. Either way `git` is
+  shadowed in-jail to always force `-c core.hooksPath` at a read-only dir
+  (the host hooks with `full`, an empty dir otherwise), so rewriting
+  `core.hooksPath` in a writable `.git/config` doesn't let an agent redirect
+  in-jail git to a hooks dir it controls
 - The jail-private state dir `~/.config/llm-custody/<tool>/<profile>` ->
   the tool's config dir inside the sandbox (read-write)
 - `~/.gitconfig` and `~/.claude/skills` (the latter one entry at a time,
@@ -244,9 +288,12 @@ On NixOS hosts, system packages (`/run/current-system/sw`) and user packages
 `PATH`, so tools like `rg`, `git`, `jq`, etc. are available without
 hardcoding them, as long as the host has them installed.
 
-`/workspace` is a direct read-write bind of the host directory, not a
-copy-on-write layer - a destructive command run by the agent (`rm -rf`, a
-bad rebase, force-push, ...) mutates the real working tree. Two safety nets,
+With `--git full`, `/workspace` is a direct read-write bind of the host
+directory, not a copy-on-write layer - a destructive command run by the
+agent (`rm -rf`, a bad rebase, force-push, ...) mutates the real working
+tree immediately. The default `--git limited` avoids that by construction
+(the agent works on a copy and the damage shows up in the sync-back change
+list first). In every mode two safety nets run on the host repo,
 neither a full substitute for backups: if the workspace is a git repo, a
 `git stash create` snapshot is taken before launch (tracked changes only,
 doesn't touch the working tree or `git stash list` - just prints a recovery

@@ -67,6 +67,7 @@ pkgs.writeShellApplication {
     ENV_PAIRS=()
     TOOL_ARGS=()
     OVERLAY=0
+    GIT_MODE="limited"
     SELFTEST=0
     MERGE_CONFIG=0
     MERGE_CONFIG_SRC=""
@@ -112,8 +113,18 @@ pkgs.writeShellApplication {
                              DISPLAY/XAUTHORITY/WAYLAND_DISPLAY and binding
                              the display sockets. Without this, those vars
                              are stripped so the terminal uses OSC 52 instead
+      --git MODE            How much of the repo the jail sees (default: limited)
+                             limited: copy of the working tree as a fresh repo
+                                      with a single baseline commit - no host
+                                      history, so masked files can't be read
+                                      back out of .git
+                             none:    same copy, no repo at all
+                             full:    bind the real tree including its .git
+                             limited/none sync changes back to the real tree on
+                             exit (prompted on a tty, automatic otherwise)
       --overlay-workspace   Mount the workspace copy-on-write; edits are shown
                              for review and synced back to the real tree on exit
+                             (needs --git full)
       --selftest            Run a sandbox self-check (full chain incl. netns +
                              seccomp + git wrapper) and exit without launching
                              the tool; no in-jail /login needed
@@ -151,6 +162,12 @@ pkgs.writeShellApplication {
         --allow-domain)  EXTRA_DOMAINS+=("$2"); shift 2 ;;
         --env)           ENV_PAIRS+=("$2"); shift 2 ;;
         --overlay-workspace) OVERLAY=1; shift ;;
+        --git)
+          case "$2" in
+            full|limited|none) GIT_MODE="$2" ;;
+            *) echo "ERROR: --git expects full|limited|none, got: $2" >&2; exit 1 ;;
+          esac
+          shift 2 ;;
         --selftest)      SELFTEST=1; shift ;;
         --dangerous)
           if [ -z "$DANGEROUS_FLAG" ]; then
@@ -183,6 +200,14 @@ pkgs.writeShellApplication {
     WORKSPACE_HOST="$(pwd)"
     WORKSPACE_GUEST="/workspace"
     [ "$SAME_PATH" = "1" ] && WORKSPACE_GUEST="$WORKSPACE_HOST"
+
+    # --overlay-workspace only means something for the real tree: --git
+    # limited/none already hand the sandbox a copy, with their own
+    # review-and-sync-back step at exit.
+    if [ "$OVERLAY" = "1" ] && [ "$GIT_MODE" != "full" ]; then
+      echo "ERROR: --overlay-workspace needs --git full (limited/none already isolate the host tree)" >&2
+      exit 1
+    fi
 
     # Safety net for two ways a jailed agent's git usage could bite the host
     # later: (1) it rewrites core.hooksPath in the still-writable
@@ -323,6 +348,17 @@ pkgs.writeShellApplication {
         echo "llm-custody: --merge-config: nothing changed (jail settings already match)" >&2
       fi
     fi
+    # Workspace exposure, filled in by the --git limited/none copy step below.
+    # Declared ahead of cleanup() so the trap can run before that step with
+    # `set -u` active.
+    WORKSPACE_BIND="$WORKSPACE_HOST"
+    WORKSPACE_COPY=""
+    TRACK_GIT=""
+    # Identity for the commits this runner makes itself (jail baseline, change
+    # tracking). The host .gitconfig may have none, or a signing key whose
+    # agent isn't reachable here.
+    JAIL_GIT_IDENT=(-c user.name=llm-custody -c user.email=llm-custody@localhost -c commit.gpgsign=false)
+
     HOLDER_PID=""
     SLIRP_PID=""
     DNSMASQ_PID=""
@@ -401,6 +437,61 @@ pkgs.writeShellApplication {
         fi
       fi
 
+      # --git limited/none: the sandbox worked on a copy, so the real tree is
+      # still untouched at this point. Compare the copy against the baseline
+      # recorded in the tracking git dir (never mounted into the sandbox, so
+      # the agent cannot rewrite the baseline to smuggle a change past this
+      # review) and copy the differences over. Interactive runs confirm
+      # first; non-tty runs sync automatically, which is what a direct
+      # workspace bind did anyway - a headless `-p "..."` run that silently
+      # threw its work away would be worse than the host mutation it avoids.
+      # Must precede the `rm -rf $RUNDIR` below, which holds the copy.
+      if [ -n "$WORKSPACE_COPY" ] && [ -d "$WORKSPACE_COPY" ] && [ -d "$TRACK_GIT" ]; then
+        WS_CHANGES=$(GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git status --porcelain --untracked-files=all 2>/dev/null || true)
+        if [ -n "$WS_CHANGES" ]; then
+          echo "llm-custody: jail workspace changed:" >&2
+          # `|| true` on both: this runs inside the EXIT trap, where errexit
+          # is still active and head closing the pipe early (EPIPE) would
+          # otherwise abort cleanup before the sync-back.
+          WS_CHANGE_COUNT=$(printf '%s\n' "$WS_CHANGES" | wc -l || true)
+          printf '%s\n' "$WS_CHANGES" | head -n 40 >&2 || true
+          if [ "$WS_CHANGE_COUNT" -gt 40 ]; then
+            echo "          ... ($WS_CHANGE_COUNT paths total)" >&2
+          fi
+          WS_SYNC=1
+          if [ -t 0 ]; then
+            WS_SYNC=0
+            printf 'llm-custody: sync these back to %s? [y/N] ' "$WORKSPACE_HOST" >&2
+            read -r ans || ans=""
+            case "$ans" in [yY]|[yY][eE][sS]) WS_SYNC=1 ;; esac
+          else
+            echo "llm-custody: no tty - syncing back automatically" >&2
+          fi
+          if [ "$WS_SYNC" = "1" ]; then
+            WS_APPLIED=0
+            # -z keeps paths literal (no quoting/escaping of odd names); the
+            # status code is the first two chars, the path starts at offset 3.
+            while IFS= read -r -d "" ws_entry; do
+              ws_code="''${ws_entry:0:2}"
+              ws_path="''${ws_entry:3}"
+              [ -n "$ws_path" ] || continue
+              case "$ws_code" in
+                *D*)
+                  rm -rf -- "$WORKSPACE_HOST/''${ws_path:?sync path empty}" 2>/dev/null || true ;;
+                *)
+                  mkdir -p -- "$(dirname -- "$WORKSPACE_HOST/$ws_path")" 2>/dev/null || true
+                  cp -a --reflink=auto -- "$WORKSPACE_COPY/$ws_path" "$WORKSPACE_HOST/$ws_path" 2>/dev/null || true ;;
+              esac
+              WS_APPLIED=$((WS_APPLIED+1))
+            done < <(GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git status --porcelain -z --untracked-files=all 2>/dev/null || true)
+            echo "llm-custody: synced $WS_APPLIED path(s) back to $WORKSPACE_HOST (review with git status/diff)" >&2
+            echo "          gitignored paths are not tracked and never sync back." >&2
+          else
+            echo "llm-custody: NOT syncing - the jail workspace copy is discarded" >&2
+          fi
+        fi
+      fi
+
       rm -rf "$RUNDIR"
 
       if [ "$GIT_SAFETY" = "1" ]; then
@@ -415,6 +506,81 @@ pkgs.writeShellApplication {
       exit "$status"
     }
     trap cleanup EXIT
+
+    # --git limited|none: hand the sandbox a copy of the working tree instead
+    # of the real one, with .git left behind on the host. Without this, --mask
+    # only shadows the working copy - every masked file is still readable as a
+    # blob (`git show HEAD:secrets/hiera.yaml`) because .git itself is bound
+    # read-write. Partial/sparse clones don't help: they are lazy-fetch, not
+    # deletion.
+    #   limited: the copy is re-initialized as a fresh repo with one baseline
+    #            commit, so in-jail git (status/diff/commit/branch) still
+    #            works, just with no history to mine.
+    #   none:    plain directory, no repo at all.
+    # Changes come back via cleanup()'s sync-back step.
+    if [ "$GIT_MODE" != "full" ]; then
+      if ! command -v git >/dev/null 2>&1; then
+        echo "ERROR: --git $GIT_MODE needs git on the host (it records the baseline used for sync-back)" >&2
+        exit 1
+      fi
+      WORKSPACE_COPY="$RUNDIR/workspace"
+      TRACK_GIT="$RUNDIR/track.git"
+      WORKSPACE_BIND="$WORKSPACE_COPY"
+      mkdir -p "$WORKSPACE_COPY"
+      echo "llm-custody: --git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)" >&2
+      # dotglob picks up hidden entries (.config, .envrc) but never . or ..;
+      # .git is skipped explicitly. --reflink=auto makes this a cheap CoW
+      # clone on btrfs/xfs and a normal copy elsewhere.
+      shopt -s dotglob nullglob
+      for entry in "$WORKSPACE_HOST"/*; do
+        [ "''${entry##*/}" = ".git" ] && continue
+        cp -a --reflink=auto -- "$entry" "$WORKSPACE_COPY/" || {
+          echo "ERROR: copying $entry into the jail workspace failed" >&2
+          exit 1
+        }
+      done
+      shopt -u dotglob nullglob
+
+      # Masked paths are deleted from the copy rather than shadowed by an
+      # empty bind: with no .git next to them there is nothing left to
+      # recover them from.
+      if [ "''${#MASK_PATTERNS[@]}" -gt 0 ]; then
+        (
+          cd "$WORKSPACE_COPY"
+          shopt -s nullglob globstar
+          for m in "''${MASK_PATTERNS[@]}"; do
+            # shellcheck disable=SC2086
+            for entry in $m; do
+              rm -rf -- "''${entry:?mask target empty}"
+            done
+          done
+        )
+      fi
+
+      if [ "$GIT_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
+        # Same branch name as the host checkout so prompts, status lines and
+        # the agent's own assumptions about the branch still line up.
+        BASE_BRANCH=$(git -C "$WORKSPACE_HOST" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
+        git -C "$WORKSPACE_COPY" init -q -b "$BASE_BRANCH"
+        git -C "$WORKSPACE_COPY" "''${JAIL_GIT_IDENT[@]}" add -A
+        git -C "$WORKSPACE_COPY" "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
+        git -C "$WORKSPACE_COPY" tag jail-baseline
+        echo "llm-custody: jail repo: branch $BASE_BRANCH, single commit tagged jail-baseline" >&2
+      elif [ "$GIT_MODE" = "limited" ]; then
+        echo "llm-custody: workspace is not a git repo - jail gets a plain copy" >&2
+      fi
+
+      # Change tracking for the sync-back, in its own git dir under RUNDIR
+      # that is never mounted into the sandbox. Deliberately not the jail repo
+      # above: that one is writable by the agent, which could amend its
+      # baseline away and have changes sync back unreviewed. /.git/ is
+      # excluded so the jail repo's own objects never count as changes.
+      GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git init -q
+      mkdir -p "$TRACK_GIT/info"
+      printf '/.git/\n' > "$TRACK_GIT/info/exclude"
+      GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git "''${JAIL_GIT_IDENT[@]}" add -A
+      GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody tracking baseline" --allow-empty
+    fi
 
     nsenter_holder() {
       nsenter -U -n -t "$HOLDER_PID" --preserve-credentials -- "$@"
@@ -598,7 +764,9 @@ pkgs.writeShellApplication {
       mkdir -p "$RUNDIR/workspace-upper"
       WS_SPEC=(--overlay-src "$RUNDIR/workspace-upper" "$WORKSPACE_GUEST")
     else
-      WS_SPEC=(--bind "$WORKSPACE_HOST" "$WORKSPACE_GUEST")
+      # WORKSPACE_BIND is the real tree with --git full, the RUNDIR copy
+      # otherwise.
+      WS_SPEC=(--bind "$WORKSPACE_BIND" "$WORKSPACE_GUEST")
     fi
 
     BWRAP_ARGS=(
@@ -629,10 +797,25 @@ pkgs.writeShellApplication {
       --bind "$STATE_DIR" /home/user/${toolDefaults.configDirName}
     )
 
-    # Read-only even though the workspace itself is rw - a jailed agent
-    # shouldn't be able to plant/modify git hooks that run on the host later.
-    if [ -d "$WORKSPACE_HOST/.git/hooks" ]; then
-      BWRAP_ARGS+=(--ro-bind "$WORKSPACE_HOST/.git/hooks" "$WORKSPACE_GUEST/.git/hooks")
+    # Hooks dir the in-jail git wrapper below pins core.hooksPath to.
+    #
+    # --git full: the host repo's own hooks, bound read-only even though the
+    # workspace is rw - a jailed agent shouldn't be able to plant or modify
+    # git hooks that run on the host later.
+    #
+    # limited/none: the host .git isn't mounted at all, and the jail repo's
+    # hooks dir lives in the discarded copy (it never syncs back, /.git/ is
+    # excluded from tracking). Pin to an empty read-only dir anyway so hooks
+    # the agent writes don't even fire inside the jail.
+    if [ "$GIT_MODE" = "full" ]; then
+      HOOKS_GUEST="$WORKSPACE_GUEST/.git/hooks"
+      if [ -d "$WORKSPACE_HOST/.git/hooks" ]; then
+        BWRAP_ARGS+=(--ro-bind "$WORKSPACE_HOST/.git/hooks" "$HOOKS_GUEST")
+      fi
+    else
+      mkdir -p "$RUNDIR/empty-hooks"
+      BWRAP_ARGS+=(--ro-bind "$RUNDIR/empty-hooks" /run/llmcustody-hooks)
+      HOOKS_GUEST=/run/llmcustody-hooks
     fi
 
     # Mirrors the old QEMU runner's host-sw/host-user-sw mounts: the tool
@@ -708,8 +891,8 @@ pkgs.writeShellApplication {
       if [ -n "$REAL_GIT" ]; then
         GIT_WRAPPER_DIR="$RUNDIR/bin"
         mkdir -p "$GIT_WRAPPER_DIR"
-        printf '#!%s\nexec "%s" -c core.hooksPath="%s/.git/hooks" "$@"\n' \
-          "${pkgs.bash}/bin/sh" "$REAL_GIT" "$WORKSPACE_GUEST" \
+        printf '#!%s\nexec "%s" -c core.hooksPath="%s" "$@"\n' \
+          "${pkgs.bash}/bin/sh" "$REAL_GIT" "$HOOKS_GUEST" \
           > "$GIT_WRAPPER_DIR/git"
         chmod +x "$GIT_WRAPPER_DIR/git"
         BWRAP_ARGS+=(--ro-bind "$GIT_WRAPPER_DIR" /run/llmcustody-bin)
@@ -834,7 +1017,10 @@ pkgs.writeShellApplication {
     # '**' recurses via globstar. Empty bind sources live under $RUNDIR
     # (host-visible) and shadow the workspace/user mounts because this runs
     # after them.
-    if [ "''${#MASK_PATTERNS[@]}" -gt 0 ]; then
+    # Only --git full needs this: limited/none already deleted the matches
+    # from the workspace copy, which is stronger (nothing underneath to
+    # unmask, no .git blobs either).
+    if [ "$GIT_MODE" = "full" ] && [ "''${#MASK_PATTERNS[@]}" -gt 0 ]; then
       mkdir -p "$RUNDIR/masks"
       MASK_INDEX=0
       # nullglob: unmatched globs vanish instead of staying literal;
@@ -871,6 +1057,7 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv SELFTEST_CONFIGDIR "/home/user/${toolDefaults.configDirName}")
       BWRAP_ARGS+=(--setenv SELFTEST_UNSHARE "${selftestUnshare}")
       BWRAP_ARGS+=(--setenv SELFTEST_DOMAIN "${selftestDomain}")
+      BWRAP_ARGS+=(--setenv SELFTEST_GITMODE "$GIT_MODE")
       BWRAP_ARGS+=(--ro-bind "${selftestProbe}" /selftest.sh)
       if [ "$NET_FILTER" = "1" ]; then
         nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
