@@ -4,8 +4,7 @@
 > Upstream sandboxes several coding-agent tools inside QEMU microVMs. This
 > fork replaced that with bubblewrap + a private network namespace (real
 > Linux namespaces on the host kernel instead of a VM boundary, no guest
-> kernel to boot) and cut every tool except [Pi](https://pi.dev) in the
-> process ([Claude Code](https://code.claude.com) has since been re-added).
+> kernel to boot) and cut every tool except [Pi](https://pi.dev)/[Claude Code](https://code.claude.com).
 > Not a PR-back candidate.
 
 Sandbox for running a coding agent via bubblewrap + a private network
