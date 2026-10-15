@@ -392,6 +392,10 @@ pkgs.writeShellApplication {
     SYNC_REG=""
     USERVAR_SET=0
     MOUNT_INDEX=0
+    # Names the empty bind sources under $RUNDIR/masks. Shared by every tree
+    # jail_mask_binds shadows (workspace and extra mounts alike), so it is
+    # declared here rather than next to one of its callers.
+    MASK_INDEX=0
     # Identity for the commits this runner makes itself (jail baseline, change
     # tracking). The host .gitconfig may have none, or a signing key whose
     # agent isn't reachable here.
@@ -527,6 +531,90 @@ pkgs.writeShellApplication {
       shopt -u dotglob nullglob
     }
 
+    # Delete every --mask match from a jail copy. Deleting beats shadowing
+    # with an empty bind: with no .git next to them there is nothing left to
+    # recover the contents from.
+    #
+    # Globs are relative to the root of the tree they are applied to, and
+    # they are applied to *every* copied tree, not just the workspace: a
+    # pattern written to keep credentials out of the jail is meant to keep
+    # them out of a second checkout too.
+    #
+    # Must run before jail_init_repo/jail_track_init so neither baseline
+    # ever contains the masked paths. That ordering is also what keeps the
+    # masks out of the sync-back diff - copy and tracking baseline agree,
+    # so the host tree's own copies are never reported as deletions.
+    jail_apply_masks() {
+      local dir="$1" label="$2" removed count
+      [ "''${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
+      # Subshell so the cd and the glob options stay local to the expansion.
+      removed=$(
+        cd "$dir" || exit 0
+        shopt -s nullglob globstar
+        for m in "''${MASK_PATTERNS[@]}"; do
+          # shellcheck disable=SC2086
+          for entry in $m; do
+            rm -rf -- "''${entry:?mask target empty}" && printf '%s\n' "$entry"
+          done
+        done
+        # A failed rm must not take the whole runner down through errexit:
+        # the subshell's status is the loop's, and the assignment below
+        # propagates it.
+        exit 0
+      )
+      [ -n "$removed" ] || return 0
+      count=$(printf '%s\n' "$removed" | wc -l)
+      echo "llm-custody: --mask: removed $count path(s) from $label" >&2
+      while IFS= read -r line; do printf '          %s\n' "$line" >&2; done <<< "$removed"
+    }
+
+    # Mask a tree the sandbox sees through a direct bind (--ro-mount, and
+    # everything under --git full): there is no copy to delete from, so each
+    # match is shadowed by an empty read-only file/dir instead. Appends to
+    # BWRAP_ARGS, so it has to be called after the bind it shadows - bwrap
+    # applies its mounts in argument order.
+    #
+    # Weaker than the deletion jail_apply_masks does, and deliberately so
+    # flagged below: an empty bind only covers the working copy, so a tree
+    # bound together with its .git still hands out the masked content as
+    # blobs (git show HEAD:<path>).
+    jail_mask_binds() {
+      local hostroot="$1" guestroot="$2" label="$3" entry
+      local -a matches
+      [ "''${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
+      # NUL-delimited: a path with a newline in it would otherwise split
+      # into two bogus mask targets.
+      mapfile -d "" -t matches < <(
+        cd "$hostroot" || exit 0
+        shopt -s nullglob globstar
+        for m in "''${MASK_PATTERNS[@]}"; do
+          # shellcheck disable=SC2086
+          for entry in $m; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            printf '%s\0' "$entry"
+          done
+        done
+        exit 0
+      )
+      [ "''${#matches[@]}" -gt 0 ] || return 0
+      mkdir -p "$RUNDIR/masks"
+      for entry in "''${matches[@]}"; do
+        MASK_INDEX=$((MASK_INDEX+1))
+        if [ -d "$hostroot/$entry" ] && [ ! -L "$hostroot/$entry" ]; then
+          mkdir -p "$RUNDIR/masks/$MASK_INDEX"
+        else
+          : > "$RUNDIR/masks/$MASK_INDEX"
+        fi
+        BWRAP_ARGS+=(--ro-bind "$RUNDIR/masks/$MASK_INDEX" "$guestroot/$entry")
+      done
+      echo "llm-custody: --mask: shadowed ''${#matches[@]} path(s) in $label with empty binds" >&2
+      if [ -d "$hostroot/.git" ]; then
+        echo "          NOTE: $label is bound along with its .git, so masked content is still" >&2
+        echo "          readable from history (git show HEAD:<path>). Only a copy (--mount" >&2
+        echo "          under --git limited|none) removes it outright." >&2
+      fi
+    }
+
     # Re-init a copy as a fresh repo with a single baseline commit, so in-jail
     # git (status/diff/commit/branch) still works with no history to mine.
     jail_init_repo() {
@@ -577,21 +665,7 @@ pkgs.writeShellApplication {
       echo "llm-custody: --git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)" >&2
       jail_copy_tree "$WORKSPACE_HOST" "$WORKSPACE_COPY"
 
-      # Masked paths are deleted from the copy rather than shadowed by an
-      # empty bind: with no .git next to them there is nothing left to
-      # recover them from.
-      if [ "''${#MASK_PATTERNS[@]}" -gt 0 ]; then
-        (
-          cd "$WORKSPACE_COPY"
-          shopt -s nullglob globstar
-          for m in "''${MASK_PATTERNS[@]}"; do
-            # shellcheck disable=SC2086
-            for entry in $m; do
-              rm -rf -- "''${entry:?mask target empty}"
-            done
-          done
-        )
-      fi
+      jail_apply_masks "$WORKSPACE_COPY" "the workspace copy"
 
       if [ "$GIT_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
         jail_init_repo "$WORKSPACE_COPY" "$WORKSPACE_HOST" "jail repo"
@@ -1078,6 +1152,8 @@ pkgs.writeShellApplication {
       MOUNT_SOURCES+=("$hostpath")
       if [ "$mode" = "ro" ]; then
         BWRAP_ARGS+=(--ro-bind "$hostpath" "$guestpath")
+        # Right after the bind it shadows: bwrap honours argument order.
+        jail_mask_binds "$hostpath" "$guestpath" "$guestpath"
         continue
       fi
 
@@ -1085,7 +1161,12 @@ pkgs.writeShellApplication {
       # chosen by the same flags - an agent let loose in a second checkout
       # can do exactly as much damage there as in the main one, so a direct
       # bind only when --git full explicitly asks for the real tree.
-      # --mask is not applied here: its globs are workspace-relative.
+      #
+      # --mask applies to every tree, not just the workspace: its globs are
+      # relative to whichever tree root they are expanded against, and a
+      # pattern written to keep credentials out of the jail is meant to keep
+      # them out of a second checkout too. Copies get the deletion, direct
+      # binds the weaker empty-bind shadow, same split as the workspace.
       MOUNT_INDEX=$((MOUNT_INDEX+1))
       if [ ! -d "$hostpath" ]; then
         # Single file: nothing to copy into a repo or diff against a
@@ -1101,6 +1182,7 @@ pkgs.writeShellApplication {
         mount_track="$RUNDIR/mounts/$MOUNT_INDEX.git"
         echo "llm-custody: --git $GIT_MODE - copying $hostpath into $RUNDIR (history stays on the host)" >&2
         jail_copy_tree "$hostpath" "$mount_copy"
+        jail_apply_masks "$mount_copy" "the copy of $hostpath"
         if [ "$GIT_MODE" = "limited" ] && [ -d "$hostpath/.git" ]; then
           jail_init_repo "$mount_copy" "$hostpath" "jail repo for $guestpath"
         fi
@@ -1117,40 +1199,20 @@ pkgs.writeShellApplication {
           --overlay-src "$hostpath"
           --overlay "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$RUNDIR/mounts/$MOUNT_INDEX-work" "$guestpath"
         )
+        jail_mask_binds "$hostpath" "$guestpath" "$guestpath"
       else
         BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
+        jail_mask_binds "$hostpath" "$guestpath" "$guestpath"
       fi
     done
 
-    # --mask GLOB: hide paths inside the workspace by binding an empty
-    # file/dir over each match (read-only). Globs are bash-style, expanded
-    # relative to the workspace root (cwd is still the workspace here);
-    # '**' recurses via globstar. Empty bind sources live under $RUNDIR
-    # (host-visible) and shadow the workspace/user mounts because this runs
-    # after them.
-    # Only --git full needs this: limited/none already deleted the matches
-    # from the workspace copy, which is stronger (nothing underneath to
-    # unmask, no .git blobs either).
-    if [ "$GIT_MODE" = "full" ] && [ "''${#MASK_PATTERNS[@]}" -gt 0 ]; then
-      mkdir -p "$RUNDIR/masks"
-      MASK_INDEX=0
-      # nullglob: unmatched globs vanish instead of staying literal;
-      # globstar: ** recurses. Nothing later in the script expands globs,
-      # so leaving both on is harmless.
-      shopt -s nullglob globstar
-      for m in "''${MASK_PATTERNS[@]}"; do
-        # shellcheck disable=SC2086
-        for entry in $m; do
-          [ -e "$entry" ] || [ -L "$entry" ] || continue
-          MASK_INDEX=$((MASK_INDEX+1))
-          if [ -d "$entry" ] && [ ! -L "$entry" ]; then
-            mkdir -p "$RUNDIR/masks/$MASK_INDEX"
-          else
-            : > "$RUNDIR/masks/$MASK_INDEX"
-          fi
-          BWRAP_ARGS+=(--ro-bind "$RUNDIR/masks/$MASK_INDEX" "$WORKSPACE_GUEST/$entry")
-        done
-      done
+    # --mask GLOB against the workspace. Only --git full needs the empty-bind
+    # treatment here: limited/none already deleted the matches from the
+    # workspace copy, which is stronger (nothing underneath to unmask, and no
+    # .git blobs either). Runs after the workspace and user mounts are in
+    # BWRAP_ARGS so the shadows land on top of them.
+    if [ "$GIT_MODE" = "full" ]; then
+      jail_mask_binds "$WORKSPACE_HOST" "$WORKSPACE_GUEST" "the workspace"
     fi
 
     if [ "$SELFTEST" = "1" ]; then

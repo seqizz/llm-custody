@@ -114,7 +114,7 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
-| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace (deleted from the jail copy; with `--git full`, shadowed by an empty file/dir instead; repeatable) | - |
+| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace **and in every extra mount** (deleted from a jail copy; shadowed by an empty read-only file/dir where the tree is bound directly, i.e. `--ro-mount` and `--git full`; repeatable) | - |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
 | `--merge-config` | Interactively merge root-level keys from the host tool's settings.json into the jail-private one; each differing key prompts y/N individually ('a' accepts the rest) | off |
 | `--merge-config-from PATH` | Same as `--merge-config` with an explicit source file instead of the default host tool settings.json | - |
@@ -276,8 +276,25 @@ checkout can do exactly as much damage there as in the main one:
 
 `--ro-mount` is always a plain read-only bind, and a `--mount` pointing at
 a single file is always bound directly (there is no tree to copy or diff) -
-both are reported at launch. `--mask` globs still apply to the workspace
-only.
+both are reported at launch.
+
+`--mask` globs apply to every mounted tree, not just the workspace: they are
+expanded against each tree's own root, on the assumption that a pattern
+written to keep credentials out of the jail is meant to keep them out of a
+second checkout too. How a match is hidden depends on how the jail sees the
+tree:
+
+| Tree | Masking |
+|------|---------|
+| copy (`--git limited\|none`) | deleted from the copy before its baseline commit, so it never reaches the jail and never syncs back |
+| direct bind (`--ro-mount`, `--git full`, overlay) | shadowed by an empty read-only file/dir |
+
+The shadow is the weaker of the two: it covers the working copy only, so a
+tree bound together with its `.git` still hands the content out as a blob
+(`git show HEAD:<path>`). The runner says so at launch when it shadows a
+tree that has a `.git`. Masked paths are never deleted on the host - with a
+copy, the deletion happens in the copy, and the tracking baseline is taken
+afterwards, so sync-back never sees them as removals.
 
 #### Mid-session sync
 
