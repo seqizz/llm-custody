@@ -21,6 +21,10 @@ let
   # itself contains no Nix interpolation; everything it needs arrives as
   # SELFTEST_* env vars set in the selftest branch.
   selftestProbe = import ./selftest.nix { inherit pkgs; };
+  # Sync-back (lib/sync-back.sh): one implementation for the exit trap and
+  # for the mid-session $RUNDIR/sync command the operator can run from
+  # another terminal.
+  syncBack = pkgs.lib.getExe (import ./sync-back.nix { inherit pkgs; });
   selftestDomain = builtins.head toolDefaults.allowedDomains;
   selftestUnshare = "${pkgs.util-linux}/bin/unshare";
   # Optional per-tool data: a tool with no dangerous-mode CLI flag (pi) just
@@ -107,6 +111,11 @@ pkgs.writeShellApplication {
                              relative GUESTPATH is resolved under /workspace.
                              Colliding targets are an error - give one of them
                              an explicit GUESTPATH.
+                             Isolated exactly like the workspace: --git
+                             limited/none give the jail a copy that syncs back
+                             on exit, --overlay-workspace makes it
+                             copy-on-write, --git full binds the real tree.
+                             A single file is always bound directly.
       --ro-mount HOSTPATH[:GUESTPATH]
                              Extra read-only mount (repeatable). Same GUESTPATH
                              rules as --mount.
@@ -125,10 +134,12 @@ pkgs.writeShellApplication {
                              none:    same copy, no repo at all
                              full:    bind the real tree including its .git
                              limited/none sync changes back to the real tree on
-                             exit (prompted on a tty, automatic otherwise)
-      --overlay-workspace   Mount the workspace copy-on-write; edits are shown
-                             for review and synced back to the real tree on exit
-                             (needs --git full)
+                             exit (prompted on a tty, automatic otherwise) -
+                             for the workspace and every rw --mount
+      --overlay-workspace   Mount the workspace and every rw --mount
+                             copy-on-write; edits are shown for review and
+                             synced back to the real trees on exit, never
+                             without confirmation (needs --git full)
       --selftest            Run a sandbox self-check (full chain incl. netns +
                              seccomp + git wrapper) and exit without launching
                              the tool; no in-jail /login needed
@@ -371,6 +382,16 @@ pkgs.writeShellApplication {
     WORKSPACE_BIND="$WORKSPACE_HOST"
     WORKSPACE_COPY=""
     TRACK_GIT=""
+    # Every tree the sandbox sees through a copy or an overlay instead of a
+    # direct bind, as manifest lines for the sync-back helper (see
+    # lib/sync-back.sh for the format). Filled in by the --git copy step and
+    # the extra-mount loop; written out to $SYNC_MANIFEST right before
+    # launch, which is also what $RUNDIR/sync and the exit trap consume.
+    SYNC_ENTRIES=()
+    SYNC_MANIFEST=""
+    SYNC_REG=""
+    USERVAR_SET=0
+    MOUNT_INDEX=0
     # Identity for the commits this runner makes itself (jail baseline, change
     # tracking). The host .gitconfig may have none, or a signing key whose
     # agent isn't reachable here.
@@ -380,6 +401,26 @@ pkgs.writeShellApplication {
     SLIRP_PID=""
     DNSMASQ_PID=""
     WATCH_PID=""
+
+    # Publish this run's mid-session sync command as a WezTerm user var, so a
+    # keybinding can fire it (pane:get_user_vars().llm_custody_sync) instead
+    # of the operator having to catch - and keep - the path printed at
+    # launch. Written straight to the terminal device so it never ends up in
+    # a redirected stdout, and wrapped in tmux's DCS passthrough when there
+    # is a tmux between us and the terminal. Empty value = session gone.
+    emit_sync_uservar() {
+      local value="$1" b64 seq
+      b64=$(printf '%s' "$value" | base64 -w0)
+      seq=$(printf '\033]1337;SetUserVar=llm_custody_sync=%s\007' "$b64")
+      if [ -n "''${TMUX:-}" ]; then
+        # DCS passthrough: ESC P tmux; <payload, every ESC doubled> ESC \.
+        # The payload's only ESC is its leading one, hence the single extra
+        # \033 ahead of %s. \134 is the closing backslash in octal - a
+        # literal one right before the quote reads as a quote escape.
+        seq=$(printf '\033Ptmux;\033%s\033\134' "$seq")
+      fi
+      printf '%s' "$seq" > /dev/tty 2>/dev/null || true
+    }
 
     cleanup() {
       local status=$?
@@ -392,123 +433,35 @@ pkgs.writeShellApplication {
       # this shell's process group)
       pkill -f "$RUNDIR" 2>/dev/null || true
 
-      # Copy-on-write workspace: fold the overlay upper layer back into the
-      # real tree, but only on explicit confirmation, and only when stdin is
-      # a terminal (automated/background runs never mutate the host tree
-      # silently). Walk the upper dir on the host: regular files/symlinks
-      # copy over, whiteouts (overlayfs deletion markers = char device 0:0)
-      # remove the corresponding host path. Best-effort - overlay quirks like
-      # opaque dirs are not fully mirrored, so a git/rsync review afterwards
-      # is still worthwhile. Must run before `rm -rf $RUNDIR` below, which
-      # would otherwise take the upper layer (and every un-synced change)
-      # with it.
-      if [ "$OVERLAY" = "1" ] && [ -d "$RUNDIR/workspace-upper" ]; then
-        UPPER="$RUNDIR/workspace-upper"
-        if [ -n "$(ls -A "$UPPER" 2>/dev/null)" ]; then
-          SYNC=0
-          if [ -t 0 ]; then
-            printf 'llm-custody: overlay workspace has changes. Sync back to %s? [y/N] ' "$WORKSPACE_HOST" >&2
-            read -r ans
-            case "$ans" in [yY]|[yY][eE][sS]) SYNC=1 ;; esac
-          fi
-          if [ "$SYNC" = "1" ]; then
-            APPLIED=0
-            sync_dir() {
-              local upper="$1" host="$2"
-              local entry base
-              for entry in "$upper"/* "$upper"/.[!.]* "$upper"/..?*; do
-                # -L as well as -e: a symlink the agent created pointing at
-                # something that only exists inside the sandbox is dangling
-                # on the host, and -e alone would drop it from the sync.
-                [ -e "$entry" ] || [ -L "$entry" ] || continue
-                base=''${entry##*/}
-                if [ -c "$entry" ]; then
-                  if [ "$(stat -c '%t:%T' "$entry")" = "0:0" ]; then
-                    # ''${host:?}/''${base:?}: host is always set and base
-                    # is a real dir entry (never empty) - the :? form just
-                    # keeps the SC2115 lint (rm -rf against an unguarded
-                    # path) satisfied, so a deletion can never target
-                    # something empty by accident. Dollar doubled because
-                    # this is a Nix indented string: a bare dollar-brace
-                    # would interpolate at eval time.
-                    rm -rf -- "''${host:?remove target host unset}/''${base:?remove target name unset}" 2>/dev/null; APPLIED=$((APPLIED+1))
-                  fi
-                  continue
-                fi
-                if [ -d "$entry" ] && [ ! -L "$entry" ]; then
-                  mkdir -p -- "$host/$base"
-                  sync_dir "$entry" "$host/$base"
-                  continue
-                fi
-                if [ -L "$entry" ]; then
-                  if [ ! -e "$host/$base" ] || [ "$(readlink "$entry")" != "$(readlink "$host/$base" 2>/dev/null || true)" ]; then
-                    cp -a -- "$entry" "$host/$base" 2>/dev/null && APPLIED=$((APPLIED+1))
-                  fi
-                elif [ ! -e "$host/$base" ] || ! cmp -s "$entry" "$host/$base"; then
-                  cp -a -- "$entry" "$host/$base" 2>/dev/null && APPLIED=$((APPLIED+1))
-                fi
-              done
-            }
-            sync_dir "$UPPER" "$WORKSPACE_HOST"
-            echo "llm-custody: synced $APPLIED changed path(s) back to $WORKSPACE_HOST (review with git status/diff)" >&2
-          else
-            echo "llm-custody: NOT syncing - overlay changes stay in the sandbox runtime dir and are discarded" >&2
-          fi
+      # Fold every isolated tree (the --git limited/none copies and the
+      # --overlay-workspace upper layers, workspace and extra rw mounts
+      # alike) back into the real host trees. Must run before the
+      # `rm -rf $RUNDIR` below, which would otherwise take the copies and
+      # upper layers - and every un-synced change - with them.
+      #
+      # Same helper the operator can run mid-session as $RUNDIR/sync, so
+      # both paths review and apply changes identically. Interactive runs
+      # confirm per tree; without a tty copies sync automatically (what a
+      # direct workspace bind did anyway - a headless `-p "..."` run that
+      # silently threw its work away would be worse than the host mutation
+      # it avoids) while overlays never do.
+      if [ -n "$SYNC_MANIFEST" ] && [ -f "$SYNC_MANIFEST" ]; then
+        if [ -t 0 ]; then
+          ${syncBack} --prompt "$SYNC_MANIFEST" || true
+        else
+          ${syncBack} --auto "$SYNC_MANIFEST" || true
         fi
       fi
 
-      # --git limited/none: the sandbox worked on a copy, so the real tree is
-      # still untouched at this point. Compare the copy against the baseline
-      # recorded in the tracking git dir (never mounted into the sandbox, so
-      # the agent cannot rewrite the baseline to smuggle a change past this
-      # review) and copy the differences over. Interactive runs confirm
-      # first; non-tty runs sync automatically, which is what a direct
-      # workspace bind did anyway - a headless `-p "..."` run that silently
-      # threw its work away would be worse than the host mutation it avoids.
-      # Must precede the `rm -rf $RUNDIR` below, which holds the copy.
-      if [ -n "$WORKSPACE_COPY" ] && [ -d "$WORKSPACE_COPY" ] && [ -d "$TRACK_GIT" ]; then
-        WS_CHANGES=$(GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git status --porcelain --untracked-files=all 2>/dev/null || true)
-        if [ -n "$WS_CHANGES" ]; then
-          echo "llm-custody: jail workspace changed:" >&2
-          # `|| true` on both: this runs inside the EXIT trap, where errexit
-          # is still active and head closing the pipe early (EPIPE) would
-          # otherwise abort cleanup before the sync-back.
-          WS_CHANGE_COUNT=$(printf '%s\n' "$WS_CHANGES" | wc -l || true)
-          printf '%s\n' "$WS_CHANGES" | head -n 40 >&2 || true
-          if [ "$WS_CHANGE_COUNT" -gt 40 ]; then
-            echo "          ... ($WS_CHANGE_COUNT paths total)" >&2
-          fi
-          WS_SYNC=1
-          if [ -t 0 ]; then
-            WS_SYNC=0
-            printf 'llm-custody: sync these back to %s? [y/N] ' "$WORKSPACE_HOST" >&2
-            read -r ans || ans=""
-            case "$ans" in [yY]|[yY][eE][sS]) WS_SYNC=1 ;; esac
-          else
-            echo "llm-custody: no tty - syncing back automatically" >&2
-          fi
-          if [ "$WS_SYNC" = "1" ]; then
-            WS_APPLIED=0
-            # -z keeps paths literal (no quoting/escaping of odd names); the
-            # status code is the first two chars, the path starts at offset 3.
-            while IFS= read -r -d "" ws_entry; do
-              ws_code="''${ws_entry:0:2}"
-              ws_path="''${ws_entry:3}"
-              [ -n "$ws_path" ] || continue
-              case "$ws_code" in
-                *D*)
-                  rm -rf -- "$WORKSPACE_HOST/''${ws_path:?sync path empty}" 2>/dev/null || true ;;
-                *)
-                  mkdir -p -- "$(dirname -- "$WORKSPACE_HOST/$ws_path")" 2>/dev/null || true
-                  cp -a --reflink=auto -- "$WORKSPACE_COPY/$ws_path" "$WORKSPACE_HOST/$ws_path" 2>/dev/null || true ;;
-              esac
-              WS_APPLIED=$((WS_APPLIED+1))
-            done < <(GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git status --porcelain -z --untracked-files=all 2>/dev/null || true)
-            echo "llm-custody: synced $WS_APPLIED path(s) back to $WORKSPACE_HOST (review with git status/diff)" >&2
-            echo "          gitignored paths are not tracked and never sync back." >&2
-          else
-            echo "llm-custody: NOT syncing - the jail workspace copy is discarded" >&2
-          fi
+      # Session is over: drop the mid-session sync handles so nothing points
+      # at a $RUNDIR that is about to disappear.
+      if [ "$USERVAR_SET" = "1" ]; then
+        emit_sync_uservar ""
+      fi
+      if [ -n "$SYNC_REG" ]; then
+        rm -f "$SYNC_REG"
+        if [ "$(readlink "$(dirname "$SYNC_REG")/current" 2>/dev/null || true)" = "$RUNDIR/sync" ]; then
+          rm -f "$(dirname "$SYNC_REG")/current"
         fi
       fi
 
@@ -552,7 +505,55 @@ pkgs.writeShellApplication {
         exit 1
       fi
       rm -rf "$RUNDIR/overlay-probe" "$RUNDIR/overlay-probe.log"
+      SYNC_ENTRIES+=("$(printf 'overlay\t%s\t-\t%s\t%s' "$RUNDIR/workspace-upper" "$WORKSPACE_HOST" "overlay workspace")")
     fi
+
+    # Copy a host tree into the jail runtime dir, minus its .git - used for
+    # the workspace and for every extra rw --mount under --git limited|none.
+    jail_copy_tree() {
+      local src="$1" dest="$2" entry
+      mkdir -p "$dest"
+      # dotglob picks up hidden entries (.config, .envrc) but never . or ..;
+      # .git is skipped explicitly. --reflink=auto makes this a cheap CoW
+      # clone on btrfs/xfs and a normal copy elsewhere.
+      shopt -s dotglob nullglob
+      for entry in "$src"/*; do
+        [ "''${entry##*/}" = ".git" ] && continue
+        cp -a --reflink=auto -- "$entry" "$dest/" || {
+          echo "ERROR: copying $entry into the jail copy at $dest failed" >&2
+          exit 1
+        }
+      done
+      shopt -u dotglob nullglob
+    }
+
+    # Re-init a copy as a fresh repo with a single baseline commit, so in-jail
+    # git (status/diff/commit/branch) still works with no history to mine.
+    jail_init_repo() {
+      local dir="$1" src="$2" label="$3" branch
+      # Same branch name as the host checkout so prompts, status lines and
+      # the agent's own assumptions about the branch still line up.
+      branch=$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
+      git -C "$dir" init -q -b "$branch"
+      git -C "$dir" "''${JAIL_GIT_IDENT[@]}" add -A
+      git -C "$dir" "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
+      git -C "$dir" tag jail-baseline
+      echo "llm-custody: $label: branch $branch, single commit tagged jail-baseline" >&2
+    }
+
+    # Change tracking for the sync-back, in its own git dir under RUNDIR that
+    # is never mounted into the sandbox. Deliberately not the jail repo
+    # above: that one is writable by the agent, which could amend its
+    # baseline away and have changes sync back unreviewed. /.git/ is excluded
+    # so the jail repo's own objects never count as changes.
+    jail_track_init() {
+      local worktree="$1" track="$2"
+      GIT_DIR="$track" GIT_WORK_TREE="$worktree" git init -q
+      mkdir -p "$track/info"
+      printf '/.git/\n' > "$track/info/exclude"
+      GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "''${JAIL_GIT_IDENT[@]}" add -A
+      GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody tracking baseline" --allow-empty
+    }
 
     # --git limited|none: hand the sandbox a copy of the working tree instead
     # of the real one, with .git left behind on the host. Without this, --mask
@@ -573,20 +574,8 @@ pkgs.writeShellApplication {
       WORKSPACE_COPY="$RUNDIR/workspace"
       TRACK_GIT="$RUNDIR/track.git"
       WORKSPACE_BIND="$WORKSPACE_COPY"
-      mkdir -p "$WORKSPACE_COPY"
       echo "llm-custody: --git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)" >&2
-      # dotglob picks up hidden entries (.config, .envrc) but never . or ..;
-      # .git is skipped explicitly. --reflink=auto makes this a cheap CoW
-      # clone on btrfs/xfs and a normal copy elsewhere.
-      shopt -s dotglob nullglob
-      for entry in "$WORKSPACE_HOST"/*; do
-        [ "''${entry##*/}" = ".git" ] && continue
-        cp -a --reflink=auto -- "$entry" "$WORKSPACE_COPY/" || {
-          echo "ERROR: copying $entry into the jail workspace failed" >&2
-          exit 1
-        }
-      done
-      shopt -u dotglob nullglob
+      jail_copy_tree "$WORKSPACE_HOST" "$WORKSPACE_COPY"
 
       # Masked paths are deleted from the copy rather than shadowed by an
       # empty bind: with no .git next to them there is nothing left to
@@ -605,28 +594,13 @@ pkgs.writeShellApplication {
       fi
 
       if [ "$GIT_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
-        # Same branch name as the host checkout so prompts, status lines and
-        # the agent's own assumptions about the branch still line up.
-        BASE_BRANCH=$(git -C "$WORKSPACE_HOST" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
-        git -C "$WORKSPACE_COPY" init -q -b "$BASE_BRANCH"
-        git -C "$WORKSPACE_COPY" "''${JAIL_GIT_IDENT[@]}" add -A
-        git -C "$WORKSPACE_COPY" "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
-        git -C "$WORKSPACE_COPY" tag jail-baseline
-        echo "llm-custody: jail repo: branch $BASE_BRANCH, single commit tagged jail-baseline" >&2
+        jail_init_repo "$WORKSPACE_COPY" "$WORKSPACE_HOST" "jail repo"
       elif [ "$GIT_MODE" = "limited" ]; then
         echo "llm-custody: workspace is not a git repo - jail gets a plain copy" >&2
       fi
 
-      # Change tracking for the sync-back, in its own git dir under RUNDIR
-      # that is never mounted into the sandbox. Deliberately not the jail repo
-      # above: that one is writable by the agent, which could amend its
-      # baseline away and have changes sync back unreviewed. /.git/ is
-      # excluded so the jail repo's own objects never count as changes.
-      GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git init -q
-      mkdir -p "$TRACK_GIT/info"
-      printf '/.git/\n' > "$TRACK_GIT/info/exclude"
-      GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git "''${JAIL_GIT_IDENT[@]}" add -A
-      GIT_DIR="$TRACK_GIT" GIT_WORK_TREE="$WORKSPACE_COPY" git "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody tracking baseline" --allow-empty
+      jail_track_init "$WORKSPACE_COPY" "$TRACK_GIT"
+      SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$WORKSPACE_COPY" "$TRACK_GIT" "$WORKSPACE_HOST" "jail workspace")")
     fi
 
     nsenter_holder() {
@@ -1104,6 +1078,45 @@ pkgs.writeShellApplication {
       MOUNT_SOURCES+=("$hostpath")
       if [ "$mode" = "ro" ]; then
         BWRAP_ARGS+=(--ro-bind "$hostpath" "$guestpath")
+        continue
+      fi
+
+      # Extra rw mounts get the same host-tree protection as the workspace,
+      # chosen by the same flags - an agent let loose in a second checkout
+      # can do exactly as much damage there as in the main one, so a direct
+      # bind only when --git full explicitly asks for the real tree.
+      # --mask is not applied here: its globs are workspace-relative.
+      MOUNT_INDEX=$((MOUNT_INDEX+1))
+      if [ ! -d "$hostpath" ]; then
+        # Single file: nothing to copy into a repo or diff against a
+        # baseline, so it stays a direct bind in every mode.
+        if [ "$GIT_MODE" != "full" ] || [ "$OVERLAY" = "1" ]; then
+          echo "llm-custody: --mount $hostpath is a file - bound directly, writes hit the host immediately" >&2
+        fi
+        BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
+        continue
+      fi
+      if [ "$GIT_MODE" != "full" ]; then
+        mount_copy="$RUNDIR/mounts/$MOUNT_INDEX"
+        mount_track="$RUNDIR/mounts/$MOUNT_INDEX.git"
+        echo "llm-custody: --git $GIT_MODE - copying $hostpath into $RUNDIR (history stays on the host)" >&2
+        jail_copy_tree "$hostpath" "$mount_copy"
+        if [ "$GIT_MODE" = "limited" ] && [ -d "$hostpath/.git" ]; then
+          jail_init_repo "$mount_copy" "$hostpath" "jail repo for $guestpath"
+        fi
+        jail_track_init "$mount_copy" "$mount_track"
+        SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$mount_copy" "$mount_track" "$hostpath" "mount $guestpath")")
+        BWRAP_ARGS+=(--bind "$mount_copy" "$guestpath")
+      elif [ "$OVERLAY" = "1" ]; then
+        # Upper and work dir must share a filesystem (overlayfs requirement);
+        # both under $RUNDIR, which the --overlay-workspace preflight already
+        # probed for unprivileged-overlay support.
+        mkdir -p "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$RUNDIR/mounts/$MOUNT_INDEX-work"
+        SYNC_ENTRIES+=("$(printf 'overlay\t%s\t-\t%s\t%s' "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$hostpath" "overlay mount $guestpath")")
+        BWRAP_ARGS+=(
+          --overlay-src "$hostpath"
+          --overlay "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$RUNDIR/mounts/$MOUNT_INDEX-work" "$guestpath"
+        )
       else
         BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
       fi
@@ -1163,6 +1176,55 @@ pkgs.writeShellApplication {
         bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
       fi
       exit $?
+    fi
+
+    # Mid-session sync: the exit trap is not the only moment the operator
+    # may want the jail's work on the host - a long session can produce
+    # something worth keeping (or reviewing in a real editor) long before
+    # the agent is done. The manifest plus a one-line launcher make the
+    # exact same sync-back runnable from a second terminal, as often as
+    # wanted: each sync advances the tracking baseline, so the next one only
+    # reports what changed since.
+    #
+    # Deliberately *not* reachable from inside the sandbox: $RUNDIR is not
+    # mounted there, so the agent cannot sync its own work out unreviewed.
+    if [ "''${#SYNC_ENTRIES[@]}" -gt 0 ]; then
+      SYNC_MANIFEST="$RUNDIR/sync-manifest"
+      : > "$SYNC_MANIFEST"
+      for entry in "''${SYNC_ENTRIES[@]}"; do
+        printf '%s\n' "$entry" >> "$SYNC_MANIFEST"
+      done
+      # %q on the manifest path: $RUNDIR inherits --tmpdir, which may well
+      # contain a space or a quote.
+      printf '#!%s\nexec %s --prompt %s "$@"\n' \
+        "${pkgs.bash}/bin/sh" "${syncBack}" "$(printf '%q' "$SYNC_MANIFEST")" > "$RUNDIR/sync"
+      chmod +x "$RUNDIR/sync"
+
+      # Stable handle for anything that wants to find the live session
+      # without parsing terminal output: a per-pid symlink plus `current`
+      # for the most recent run. Concurrent runs each keep their own pid
+      # entry; `current` is simply the latest to start.
+      SYNC_REG_DIR="''${XDG_RUNTIME_DIR:-$LLMCUSTODY_TMPDIR}/llm-custody"
+      mkdir -p "$SYNC_REG_DIR"
+      SYNC_REG="$SYNC_REG_DIR/$$.sync"
+      ln -sfn "$RUNDIR/sync" "$SYNC_REG"
+      ln -sfn "$RUNDIR/sync" "$SYNC_REG_DIR/current"
+
+      echo "llm-custody: mid-session sync: $RUNDIR/sync (also $SYNC_REG_DIR/current)" >&2
+
+      # Terminals that understand OSC 1337 SetUserVar get the path as a
+      # variable too, which is what makes a one-key sync binding possible.
+      # Off by default elsewhere: terminals that don't know the sequence may
+      # print it. LLMCUSTODY_USERVAR=1/0 forces the decision either way.
+      case "''${LLMCUSTODY_USERVAR:-auto}" in
+        0|off|no) ;;
+        1|on|yes) emit_sync_uservar "$RUNDIR/sync"; USERVAR_SET=1 ;;
+        *)
+          if [ -n "''${WEZTERM_PANE:-}" ] || [ "''${TERM_PROGRAM:-}" = "WezTerm" ]; then
+            emit_sync_uservar "$RUNDIR/sync"
+            USERVAR_SET=1
+          fi ;;
+      esac
     fi
 
     # Session resume: translate the generic -c/--continue (resume most

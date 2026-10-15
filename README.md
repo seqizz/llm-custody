@@ -102,13 +102,13 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--state-dir PATH` | Jail state root dir, mounted read-write | `~/.config/llm-custody` |
 | `--same-path` | Mount the workspace and every `--mount` at their host paths instead of under `/workspace` | off |
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
-| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable) | `/workspace/<basename HOSTPATH>` |
+| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable). Isolated like the workspace: copy + sync-back under `--git limited/none`, copy-on-write with `--overlay-workspace`, real tree with `--git full`. A single file is always bound directly | `/workspace/<basename HOSTPATH>` |
 | `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | `/workspace/<basename HOSTPATH>` |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
 | `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh single-commit repo (no host history), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
-| `--overlay-workspace` | Mount the workspace copy-on-write; edits sync back to the real tree only on explicit confirmation at exit (needs `--git full`) | off |
+| `--overlay-workspace` | Mount the workspace and every rw `--mount` copy-on-write; edits sync back to the real trees only on explicit confirmation (needs `--git full`) | off |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
@@ -216,14 +216,19 @@ you get the change list and a y/N prompt, without one (e.g. `-p "..."`) the
 sync happens automatically, which is what a direct workspace bind did
 anyway. Change detection uses a separate git dir under the runtime dir that
 is never mounted into the sandbox, so an agent cannot rewrite the baseline
-to smuggle an edit past the review.
+to smuggle an edit past the review. The same applies to every read-write
+`--mount` (see [Syncing changes back](#syncing-changes-back)), and it does
+not have to wait for exit - see
+[Mid-session sync](#mid-session-sync).
 
 Trade-offs:
 
-- The copy costs disk and time proportional to the working tree. It lands
-  under `--tmpdir` (default `/tmp`, which is tmpfs on NixOS - point
-  `--tmpdir` at real disk for big repos). `cp --reflink=auto` makes it near
-  free on btrfs/xfs.
+- The copy costs disk and time proportional to the working tree, and every
+  read-write `--mount` adds its own. They land under `--tmpdir` (default
+  `/tmp`, which is tmpfs on NixOS - point `--tmpdir` at real disk for big
+  repos). `cp --reflink=auto` makes them near free on btrfs/xfs.
+- A copy is a snapshot: edits you make on the host during the run do not
+  reach the jail. `--git full` is the mode for live two-way editing.
 - Gitignored paths are copied into the jail but not tracked, so changes to
   them never sync back.
 - No history in the jail means no `git log`, `git blame`, rebase or
@@ -255,6 +260,88 @@ Disable network filtering entirely:
 nix run .#pi -- --no-net-filter
 ```
 
+### Syncing changes back
+
+Everything the sandbox sees through a copy or an overlay instead of a
+direct bind goes through the same review-and-sync step, and that covers
+extra mounts, not just the workspace - an agent let loose in a second
+checkout can do exactly as much damage there as in the main one:
+
+| Mode | Workspace and every rw `--mount` | Sync-back |
+|------|----------------------------------|-----------|
+| `--git limited` (default) | copy of the working tree, fresh single-commit repo | yes: prompted on a tty, automatic without one |
+| `--git none` | copy of the working tree, no repo | yes: same as above |
+| `--git full` | the real host tree | n/a - writes are live |
+| `--git full --overlay-workspace` | copy-on-write overlay | yes, but **only** on explicit confirmation; never unattended |
+
+`--ro-mount` is always a plain read-only bind, and a `--mount` pointing at
+a single file is always bound directly (there is no tree to copy or diff) -
+both are reported at launch. `--mask` globs still apply to the workspace
+only.
+
+#### Mid-session sync
+
+A long session often produces something worth keeping - or worth reading in
+a real editor - well before the agent is done. The runner writes the exact
+same sync-back out as a standalone command, runnable from a second terminal
+as often as you like while the session keeps going:
+
+```bash
+$XDG_RUNTIME_DIR/llm-custody/current      # the most recently started run
+$XDG_RUNTIME_DIR/llm-custody/<pid>.sync   # a specific run, for concurrent sessions
+```
+
+Both are symlinks to `$RUNDIR/sync`, whose path is also printed at launch.
+Each sync advances the tracking baseline, so the next one only reports what
+changed since - and the exit prompt then has nothing left to ask about for
+the parts already synced.
+
+This is deliberately *not* reachable from inside the sandbox: `$RUNDIR` is
+not mounted there, so an agent cannot sync its own work out unreviewed.
+Syncing while the agent is mid-write is safe for the host (worst case a
+file lands half-written and the next sync corrects it), but the jail-side
+copy is the agent's working tree, so review as usual.
+
+In a WezTerm pane the sync command is also published as the user var
+`llm_custody_sync` (OSC 1337 `SetUserVar`, tmux passthrough handled), which
+is enough for a one-key binding. It is cleared when the session ends:
+
+```lua
+-- wezterm.lua
+local shell = os.getenv('SHELL') or '/bin/sh'
+
+config.keys = {
+  {
+    key = 's', mods = 'CTRL|SHIFT',
+    action = wezterm.action_callback(function(win, pane)
+      local sync = pane:get_user_vars().llm_custody_sync
+      if not sync or sync == '' then
+        win:toast_notification('llm-custody', 'no live jail session in this pane', nil, 3000)
+        return
+      end
+      -- Own pane, because the sync prompts y/N per changed tree - and held
+      -- open afterwards, because a bare spawn would close it together with
+      -- the report of what was applied.
+      win:perform_action(
+        wezterm.action.SplitPane {
+          direction = 'Down',
+          size = { Percent = 35 },
+          command = {
+            args = { shell, '-c', sync .. '; printf "\\n[finished, press enter]"; read -r _' },
+          },
+        },
+        pane
+      )
+    end),
+  },
+}
+```
+
+Emission is automatic only when WezTerm is detected (`WEZTERM_PANE` or
+`TERM_PROGRAM=WezTerm`), since terminals that do not know the sequence may
+print it. `LLMCUSTODY_USERVAR=1` forces it on (e.g. a terminal that
+understands the same OSC but is not detected), `LLMCUSTODY_USERVAR=0` off.
+
 ## What's isolated
 
 **Filesystem.** The sandbox has its own mount namespace; only explicitly
@@ -285,7 +372,10 @@ bound paths are visible inside it:
   too)
 - `/nix/store` (read-only)
 - Any directories added via `--mount` / `--ro-mount`, by default under
-  `/workspace` next to the workspace itself
+  `/workspace` next to the workspace itself. A read-write one is isolated
+  the same way the workspace is (copy, overlay or real tree, per `--git` /
+  `--overlay-workspace`) and reviewed on the way back out - see
+  [Syncing changes back](#syncing-changes-back)
 
 The sandboxed process runs without `CAP_SYS_ADMIN` (bwrap
 `--cap-drop CAP_SYS_ADMIN`), so it cannot create bind mounts or remount
@@ -440,6 +530,8 @@ whitelisted domains unless you pass `--no-net-filter`.
 |    - dnsmasq (domain whitelist) + nftables (IP gate)      |
 |    - opens seccomp fd (lib/seccomp-denylist.nix)          |
 |    - nsenter's into the netns holder, execs bwrap ...     |
+|    - on exit (and on demand, lib/sync-back.sh): reviews   |
+|      the jail copies/overlays back into the host trees    |
 |                                                            |
 |  +-- bwrap sandbox (mount/pid/ipc/uts/user ns) --------+ |
 |  |  /nix/store         <- ro-bind                        | |
