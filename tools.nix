@@ -8,6 +8,11 @@
       # relative to /home/user. Host skill dirs are bound here one entry at
       # a time.
       skillsDir = ".agents/skills";
+      # Subdirectory of the state dir holding session transcripts, for
+      # --list-sessions. Both supported tools store one *.jsonl per session
+      # under a per-project subdirectory, so the runner just walks it.
+      # (pi: getSessionsDir() = <agentDir>/sessions in its dist/config.js.)
+      sessionsDir = "sessions";
       # Root-level settings.json keys --merge-config must never offer: the
       # bootstrapScript owns these and rewrites them on every launch, so
       # adopting a host value would be undone immediately.
@@ -55,6 +60,9 @@
       # so these binds land *inside* the state mount (they stack because
       # bwrap applies them after it).
       skillsDir = ".claude/skills";
+      # Claude Code keeps one *.jsonl per session under projects/<cwd>/ in
+      # its config dir, same shape pi uses for sessions/.
+      sessionsDir = "projects";
       # Trust and onboarding live in .claude.json, not settings.json, so the
       # bootstrapScript rewrites nothing here and every settings key is
       # offerable to --merge-config.

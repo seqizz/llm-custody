@@ -80,6 +80,16 @@ pkgs.writeShellApplication {
     RW_SKILLS=0
     DANGEROUS=0
     X11=0
+    DRYRUN=0
+    LIST_PROFILES=0
+    LIST_SESSIONS=0
+    SYNC_EXCLUDES=()
+    # Seconds between unsynced-change checks during a session. 0 disables
+    # the watcher entirely - worth it on a tree big enough for `git status`
+    # to cost real time.
+    WATCH_INTERVAL=15
+    # 0 = warnings and errors only, 1 = normal, 2 = verbose.
+    VERBOSITY=1
     DANGEROUS_FLAG="${dangerousFlag}"
     # Root-level settings.json keys --merge-config never offers, because the
     # bootstrapScript owns them (tools.nix mergeSkipKeys).
@@ -92,6 +102,31 @@ pkgs.writeShellApplication {
     CONTINUE_FLAG="${toolDefaults.resumeFlags.continue}"
     RESUME_FLAG="${toolDefaults.resumeFlags.resume}"
     RESUME_WITH_ID_FLAG="${toolDefaults.resumeFlags.resumeWithId}"
+    # Where this tool keeps session transcripts inside its state dir
+    # (tools.nix sessionsDir), used by --list-sessions.
+    SESSIONS_SUBDIR="${toolDefaults.sessionsDir}"
+
+    # Everything the runner says about itself goes through these, on stderr,
+    # so the jailed tool keeps stdout to itself (a `-p` run piped into
+    # something else must not get runner chatter mixed into its output).
+    #
+    # Colour follows the usual two conditions - stderr is a terminal and
+    # NO_COLOR is unset - so a redirected log stays plain text.
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_RED=""; C_YELLOW=""; C_GREEN=""; C_CYAN=""
+    if [ -t 2 ] && [ -z "''${NO_COLOR:-}" ]; then
+      C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+      C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'
+    fi
+
+    log()  { [ "$VERBOSITY" -ge 1 ] && printf '%sllm-custody:%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2 || true; }
+    vlog() { [ "$VERBOSITY" -ge 2 ] && printf '%sllm-custody:%s %s%s%s\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$*" "$C_RESET" >&2 || true; }
+    warn() { printf '%sllm-custody: WARNING%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+    err()  { printf '%sllm-custody: ERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+    # Continuation line under a log/warn/err message. Never suppressed by
+    # --quiet: it only ever appears attached to something already printed.
+    hint() { printf '            %s\n' "$*" >&2; }
+    die()  { err "$*"; exit 1; }
 
     usage() {
       cat <<'USAGE'
@@ -140,9 +175,25 @@ pkgs.writeShellApplication {
                              copy-on-write; edits are shown for review and
                              synced back to the real trees on exit, never
                              without confirmation (needs --git full)
+      --sync-exclude GLOB   Never sync paths matching GLOB back to the host
+                             tree, in any mode that syncs (repeatable).
+                             Matched against tree-relative paths; '*' crosses
+                             '/' here, so '*.log' covers every depth
+      --watch-interval N    Seconds between unsynced-change checks during the
+                             session (default 15, 0 disables). The count is
+                             written to RUNDIR/dirty and published as the
+                             llm_custody_dirty user var whenever it changes
       --selftest            Run a sandbox self-check (full chain incl. netns +
                              seccomp + git wrapper) and exit without launching
                              the tool; no in-jail /login needed
+      --dry-run             Resolve everything (mounts, masks, domains, env,
+                             bwrap arguments) and print it instead of
+                             launching. Starts no network namespace and
+                             copies no trees
+      --list-profiles       List the state profiles of this tool and exit
+      --list-sessions       List the sessions stored in this profile and exit
+      -q, --quiet           Only warnings and errors
+      -v, --verbose         Extra detail about mounts and network setup
       -c, --continue, -r, --resume [ID]
                              Resume a session; translated to the tool's own
                              resume flags (see tools.nix resumeFlags)
@@ -162,40 +213,74 @@ pkgs.writeShellApplication {
                              Same as --merge-config with an explicit source
                              file instead of the default host settings.json
       -h, --help            Show this help
+
+    Environment:
+      LLMCUSTODY_PROFILE    Default for --profile
+      LLMCUSTODY_STATE_DIR  Default for --state-dir
+      LLMCUSTODY_USERVAR    1/0 forces the WezTerm user-var emission that is
+                             otherwise only done when WezTerm is detected
+      TMPDIR                Default for --tmpdir
+      NO_COLOR              Set to anything to disable coloured output
+      PAGER                 Pager for the 'd' answer at the sync prompt
+
+    Files:
+      --state-dir/domains   Extra whitelist domains, one per line, '#' comments
+      --state-dir/${name}/PROFILE
+                            Per-profile tool state (sessions, credentials)
     USAGE
       exit 0
     }
 
+    # Every flag below that does `shift 2` reads "$2" first, and under
+    # `set -u` a missing value aborts with a bare "$2: unbound variable" and
+    # a line number - no mention of which flag the operator mistyped. Called
+    # as `need_arg "$@"`, so $# is what is left on the command line.
+    need_arg() {
+      [ $# -ge 2 ] || die "$1 needs an argument"
+    }
+
     while [ $# -gt 0 ]; do
       case "$1" in
-        --profile)       PROFILE="$2"; shift 2 ;;
-        --state-dir)     STATE_ROOT="$2"; shift 2 ;;
+        --profile)       need_arg "$@"; PROFILE="$2"; shift 2 ;;
+        --state-dir)     need_arg "$@"; STATE_ROOT="$2"; shift 2 ;;
         --same-path)     SAME_PATH=1; shift ;;
-        --tmpdir)        LLMCUSTODY_TMPDIR="$2"; shift 2 ;;
-        --mount)         EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
-        --ro-mount)      EXTRA_MOUNTS+=("$2:ro"); shift 2 ;;
-        --allow-domain)  EXTRA_DOMAINS+=("$2"); shift 2 ;;
-        --env)           ENV_PAIRS+=("$2"); shift 2 ;;
+        --tmpdir)        need_arg "$@"; LLMCUSTODY_TMPDIR="$2"; shift 2 ;;
+        --mount)         need_arg "$@"; EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
+        --ro-mount)      need_arg "$@"; EXTRA_MOUNTS+=("$2:ro"); shift 2 ;;
+        --allow-domain)  need_arg "$@"; EXTRA_DOMAINS+=("$2"); shift 2 ;;
+        --env)           need_arg "$@"; ENV_PAIRS+=("$2"); shift 2 ;;
         --overlay-workspace) OVERLAY=1; shift ;;
         --git)
+          need_arg "$@"
           case "$2" in
             full|limited|none) GIT_MODE="$2" ;;
-            *) echo "ERROR: --git expects full|limited|none, got: $2" >&2; exit 1 ;;
+            *) die "--git expects full|limited|none, got: $2" ;;
           esac
           shift 2 ;;
         --selftest)      SELFTEST=1; shift ;;
+        --dry-run)       DRYRUN=1; shift ;;
+        --list-profiles) LIST_PROFILES=1; shift ;;
+        --list-sessions) LIST_SESSIONS=1; shift ;;
+        -q|--quiet)      VERBOSITY=0; shift ;;
+        -v|--verbose)    VERBOSITY=2; shift ;;
         --dangerous)
           if [ -z "$DANGEROUS_FLAG" ]; then
-            echo "ERROR: ${name} has no dangerous-mode flag (tools.nix dangerousFlag unset)" >&2
-            exit 1
+            die "${name} has no dangerous-mode flag (tools.nix dangerousFlag unset)"
           fi
           DANGEROUS=1; shift ;;
         --rw-skills)     RW_SKILLS=1; shift ;;
         --x11)           X11=1; shift ;;
-        --mask)          MASK_PATTERNS+=("$2"); shift 2 ;;
+        --mask)          need_arg "$@"; MASK_PATTERNS+=("$2"); shift 2 ;;
+        --sync-exclude)  need_arg "$@"; SYNC_EXCLUDES+=("$2"); shift 2 ;;
+        --watch-interval)
+          need_arg "$@"
+          case "$2" in
+            ""|*[!0-9]*) die "--watch-interval expects whole seconds (0 disables), got: $2" ;;
+          esac
+          WATCH_INTERVAL="$2"; shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
         --merge-config)      MERGE_CONFIG=1; shift ;;
-        --merge-config-from) MERGE_CONFIG=1; MERGE_CONFIG_SRC="$2"; shift 2 ;;
+        --merge-config-from) need_arg "$@"; MERGE_CONFIG=1; MERGE_CONFIG_SRC="$2"; shift 2 ;;
         -c|--continue)   RESUME_MODE="continue"; shift ;;
         -r|--resume)     RESUME_MODE="picker"; shift
           # Optional session id: --resume <id> targets a specific session
@@ -203,7 +288,19 @@ pkgs.writeShellApplication {
           if [ $# -gt 0 ] && [[ "$1" != -* ]]; then RESUME_ARG="$1"; shift; fi ;;
         -h|--help)       usage ;;
         --)              shift; TOOL_ARGS=("$@"); break ;;
-        *)               # Anything we don't recognize isn't necessarily
+        /*)              # A bare absolute path here is almost always a
+                         # second mount written without its flag
+                         # (`--mount /a /b`), and forwarding it would hand
+                         # the tool a prompt consisting of a path - a wasted
+                         # session the operator only notices once the agent
+                         # starts answering it. Refuse instead; `--` is the
+                         # escape hatch for the rare tool that really does
+                         # take a bare path.
+                         err "unexpected bare path argument: $1"
+                         hint "to mount it:  --mount $1"
+                         hint "to pass it to ${name} anyway, put it after --"
+                         exit 1 ;;
+        *)               # Anything else we don't recognize isn't necessarily
                          # wrong - it may be a tool argument (e.g. pi's -p)
                          # nix run left after consuming its own `--`. Pass it
                          # through; the tool's own parser rejects what it
@@ -233,8 +330,80 @@ pkgs.writeShellApplication {
     # limited/none already hand the sandbox a copy, with their own
     # review-and-sync-back step at exit.
     if [ "$OVERLAY" = "1" ] && [ "$GIT_MODE" != "full" ]; then
-      echo "ERROR: --overlay-workspace needs --git full (limited/none already isolate the host tree)" >&2
-      exit 1
+      die "--overlay-workspace needs --git full (limited/none already isolate the host tree)"
+    fi
+    if [ "$DRYRUN" = "1" ] && [ "$SELFTEST" = "1" ]; then
+      die "--dry-run and --selftest are mutually exclusive (--selftest really runs the sandbox)"
+    fi
+
+    # Jail-private tool state, fully separate from the host tool's own
+    # config dir - never the host tool's real config. Resolved before the
+    # git safety net below so the listing modes, which want nothing but this
+    # path, can answer and exit without taking a snapshot of the workspace
+    # or touching it at all.
+    if [ -z "$STATE_ROOT" ]; then
+      STATE_ROOT="''${XDG_CONFIG_HOME:-$HOME/.config}/llm-custody"
+    fi
+    STATE_DIR="$STATE_ROOT/${name}/$PROFILE"
+
+    # --list-profiles: every profile dir that exists for this tool, with the
+    # one the current flags would select marked. Sessions are counted rather
+    # than listed; --list-sessions is the detailed view.
+    if [ "$LIST_PROFILES" = "1" ]; then
+      TOOL_ROOT="$STATE_ROOT/${name}"
+      if [ ! -d "$TOOL_ROOT" ]; then
+        log "no profiles yet for ${name} (state root: $STATE_ROOT)"
+        exit 0
+      fi
+      log "profiles for ${name} under $TOOL_ROOT:"
+      shopt -s nullglob
+      for entry in "$TOOL_ROOT"/*; do
+        [ -d "$entry" ] || continue
+        pname="''${entry##*/}"
+        scount=0
+        if [ -d "$entry/$SESSIONS_SUBDIR" ]; then
+          shopt -s globstar
+          for s in "$entry/$SESSIONS_SUBDIR"/**/*.jsonl; do
+            [ -f "$s" ] && scount=$((scount+1))
+          done
+          shopt -u globstar
+        fi
+        marker="  "
+        [ "$pname" = "$PROFILE" ] && marker="''${C_GREEN}* ''${C_RESET}"
+        printf '%s%s%s%s (%s session(s))\n' "$marker" "$C_BOLD" "$pname" "$C_RESET" "$scount" >&2
+      done
+      shopt -u nullglob
+      exit 0
+    fi
+
+    # --list-sessions: the jail-private transcripts of this profile. Host
+    # sessions of the same tool are deliberately invisible here, exactly as
+    # they are to --resume: the state dirs are separate on purpose.
+    if [ "$LIST_SESSIONS" = "1" ]; then
+      SESSIONS_ROOT="$STATE_DIR/$SESSIONS_SUBDIR"
+      if [ ! -d "$SESSIONS_ROOT" ]; then
+        log "no sessions yet in profile '$PROFILE' ($SESSIONS_ROOT)"
+        exit 0
+      fi
+      log "sessions in profile '$PROFILE' ($SESSIONS_ROOT), newest first:"
+      shopt -s nullglob globstar
+      # -t sorts by mtime; the paths are passed in one batch so the ordering
+      # is across all projects, not per project.
+      SESSION_FILES=("$SESSIONS_ROOT"/**/*.jsonl)
+      shopt -u nullglob globstar
+      if [ "''${#SESSION_FILES[@]}" -eq 0 ]; then
+        log "none found"
+        exit 0
+      fi
+      # stat+sort rather than `ls -lt`: the mtime is wanted as a sort key,
+      # and parsing it back out of an ls listing is both fragile and the
+      # thing SC2012 exists to flag.
+      while read -r ts size path; do
+        printf '  %s%s%s  %7s  %s\n' \
+          "$C_DIM" "$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts")" "$C_RESET" \
+          "$size" "''${path#"$SESSIONS_ROOT"/}" >&2
+      done < <(stat -c '%Y %s %n' "''${SESSION_FILES[@]}" 2>/dev/null | sort -rn)
+      exit 0
     fi
 
     # Safety net for two ways a jailed agent's git usage could bite the host
@@ -251,7 +420,7 @@ pkgs.writeShellApplication {
     # cleanup fires before GIT_SAFETY is otherwise touched.
     GIT_SAFETY=0
     PRE_HOOKSPATH=""
-    if [ -d "$WORKSPACE_HOST/.git" ] && command -v git >/dev/null 2>&1; then
+    if [ "$DRYRUN" != "1" ] && [ -d "$WORKSPACE_HOST/.git" ] && command -v git >/dev/null 2>&1; then
       GIT_SAFETY=1
       PRE_HOOKSPATH=$(git -C "$WORKSPACE_HOST" config --get core.hooksPath 2>/dev/null || true)
       # `stash create` only parks a dangling commit object (and prints its
@@ -260,17 +429,12 @@ pkgs.writeShellApplication {
       # tracked-file damage. Doesn't cover untracked files or a plain
       # `rm -rf` of the tree.
       if SNAPSHOT=$(git -C "$WORKSPACE_HOST" stash create 2>/dev/null) && [ -n "$SNAPSHOT" ]; then
-        echo "llm-custody: safety snapshot of tracked changes: $SNAPSHOT (git show $SNAPSHOT to inspect, git stash apply $SNAPSHOT to restore)" >&2
+        log "safety snapshot of tracked changes: $SNAPSHOT"
+        hint "git show $SNAPSHOT to inspect, git stash apply $SNAPSHOT to restore"
       fi
     fi
 
-    # Jail-private tool state, fully separate from the host tool's own
-    # config dir - never the host tool's real config.
-    if [ -z "$STATE_ROOT" ]; then
-      STATE_ROOT="''${XDG_CONFIG_HOME:-$HOME/.config}/llm-custody"
-    fi
-    STATE_DIR="$STATE_ROOT/${name}/$PROFILE"
-    mkdir -p "$STATE_DIR"
+    [ "$DRYRUN" = "1" ] || mkdir -p "$STATE_DIR"
 
     # Persistent per-run additions to the network whitelist: a plain file
     # next to the state dirs (one domain per line, '#' comments allowed).
@@ -283,11 +447,20 @@ pkgs.writeShellApplication {
       done < "$STATE_ROOT/domains"
     fi
 
-    ${launcherOut.bootstrapScript}
+    # Wrapped in a function rather than run inline so --dry-run can skip it:
+    # the bootstrap writes real files into $STATE_DIR (settings.json, the
+    # memory file), and a dry run is supposed to resolve the sandbox without
+    # changing anything on the host.
+    run_bootstrap() {
+      # bootstrapScript is optional (tools.nix), and an empty function body
+      # is a bash syntax error - this `:` is what keeps such a tool building.
+      :
+      ${launcherOut.bootstrapScript}
+    }
+    [ "$DRYRUN" = "1" ] || run_bootstrap
 
     if [ ! -d "$LLMCUSTODY_TMPDIR" ]; then
-      echo "ERROR: tmpdir '$LLMCUSTODY_TMPDIR' does not exist" >&2
-      exit 1
+      die "tmpdir '$LLMCUSTODY_TMPDIR' does not exist"
     fi
 
     RUNDIR=$(mktemp -d --tmpdir="$LLMCUSTODY_TMPDIR")
@@ -303,16 +476,13 @@ pkgs.writeShellApplication {
       SRC="''${MERGE_CONFIG_SRC:-$HOME/${toolDefaults.configDirName}/settings.json}"
       TARGET="$STATE_DIR/settings.json"
       if [ ! -r "$SRC" ]; then
-        echo "ERROR: --merge-config source not readable: $SRC" >&2
-        exit 1
+        die "--merge-config source not readable: $SRC"
       fi
       if ! jq -e . "$SRC" >/dev/null 2>&1; then
-        echo "ERROR: --merge-config source is not valid JSON: $SRC" >&2
-        exit 1
+        die "--merge-config source is not valid JSON: $SRC"
       fi
       if [ ! -t 0 ]; then
-        echo "ERROR: --merge-config prompts per key on stdin; needs a tty" >&2
-        exit 1
+        die "--merge-config prompts per key on stdin; needs a tty"
       fi
       MERGE_DOC="$RUNDIR/merge.json"
       if [ -f "$TARGET" ]; then
@@ -322,12 +492,6 @@ pkgs.writeShellApplication {
       fi
       MERGE_ALL=0
       MERGED=0
-      # ANSI colors for the interactive prompt. NO_COLOR opts out; the
-      # prompt already required a tty above, so no further guard is needed.
-      C_RESET=$'\033[0m'
-      C_KEY=$'\033[1;36m'
-      C_BOLD=$'\033[1m'
-      [ -n "''${NO_COLOR:-}" ] && { C_RESET=""; C_KEY=""; C_BOLD=""; }
       # Keys arrive on fd 3, not stdin: the loop-level redirect would
       # otherwise hijack fd 0 for the whole loop body, stealing the terminal
       # from the `read -r ans` below (prompts would fire back-to-back with no
@@ -352,12 +516,12 @@ pkgs.writeShellApplication {
           # actual approval target. -r keeps objects/arrays multi-line and
           # prints strings/bools as literal text; each line indented for
           # readability under the prompt header.
-          printf 'llm-custody: merge key %s%s%s from %s:\n' "$C_KEY" "$key" "$C_RESET" "$(basename "$SRC")" >&2
+          log "merge key $C_BOLD$key$C_RESET from $(basename "$SRC"):"
           printf '%s\n' "$(jq -r --arg k "$key" '.[$k]' "$SRC")" | while IFS= read -r line; do printf '    %s\n' "$line"; done >&2
           printf '%sAccept this value?%s [y/N/a] ' "$C_BOLD" "$C_RESET" >&2
           # EOF on the tty (Ctrl-D) aborts the whole merge - and the launch -
           # rather than answering 'no' silently; target stays unmodified.
-          read -r ans || { echo "llm-custody: --merge-config aborted (no answer)" >&2; exit 1; }
+          read -r ans || die "--merge-config aborted (no answer)"
           case "$ans" in
             [yY]|[yY][eE][sS]) ;;
             [aA]|[aA][lL][lL]) MERGE_ALL=1 ;;
@@ -371,9 +535,9 @@ pkgs.writeShellApplication {
       done 3< <(jq -r 'keys[]' "$SRC")
       if [ "$MERGED" -gt 0 ]; then
         jq -S . "$MERGE_DOC" > "$TARGET.tmp" && mv "$TARGET.tmp" "$TARGET"
-        echo "llm-custody: --merge-config: merged $MERGED key(s) into $TARGET" >&2
+        log "--merge-config: merged $MERGED key(s) into $TARGET"
       else
-        echo "llm-custody: --merge-config: nothing changed (jail settings already match)" >&2
+        log "--merge-config: nothing changed (jail settings already match)"
       fi
     fi
     # Workspace exposure, filled in by the --git limited/none copy step below.
@@ -391,6 +555,18 @@ pkgs.writeShellApplication {
     SYNC_MANIFEST=""
     SYNC_REG=""
     USERVAR_SET=0
+    TITLE_SET=0
+    # Set right before handing control to the tool. The exit summary keys off
+    # it so a run that failed during setup (bad flag, missing tmpdir) doesn't
+    # report a session duration for a session that never started.
+    LAUNCHED=0
+    # --sync-exclude globs, as ready-made arguments for the sync-back helper.
+    # Built once here because the exit trap and the $RUNDIR/sync launcher
+    # both need the same list.
+    SYNC_EXCLUDE_ARGS=()
+    for glob in "''${SYNC_EXCLUDES[@]+"''${SYNC_EXCLUDES[@]}"}"; do
+      SYNC_EXCLUDE_ARGS+=(--exclude "$glob")
+    done
     MOUNT_INDEX=0
     # Names the empty bind sources under $RUNDIR/masks. Shared by every tree
     # jail_mask_binds shadows (workspace and extra mounts alike), so it is
@@ -405,17 +581,21 @@ pkgs.writeShellApplication {
     SLIRP_PID=""
     DNSMASQ_PID=""
     WATCH_PID=""
+    DIRTY_PID=""
 
-    # Publish this run's mid-session sync command as a WezTerm user var, so a
-    # keybinding can fire it (pane:get_user_vars().llm_custody_sync) instead
-    # of the operator having to catch - and keep - the path printed at
-    # launch. Written straight to the terminal device so it never ends up in
-    # a redirected stdout, and wrapped in tmux's DCS passthrough when there
-    # is a tmux between us and the terminal. Empty value = session gone.
-    emit_sync_uservar() {
-      local value="$1" b64 seq
+    # Publish per-run facts as WezTerm user vars, so the terminal config can
+    # act on them: llm_custody_sync carries this run's mid-session sync
+    # command (a keybinding can fire it via
+    # pane:get_user_vars().llm_custody_sync instead of the operator having
+    # to catch - and keep - the path printed at launch), llm_custody_jail
+    # carries the jail marker plus tool name for the tab title. Written
+    # straight to the terminal device so they never end up in a redirected
+    # stdout, and wrapped in tmux's DCS passthrough when there is a tmux
+    # between us and the terminal. Empty value = session gone.
+    emit_uservar() {
+      local var="$1" value="$2" b64 seq
       b64=$(printf '%s' "$value" | base64 -w0)
-      seq=$(printf '\033]1337;SetUserVar=llm_custody_sync=%s\007' "$b64")
+      seq=$(printf '\033]1337;SetUserVar=%s=%s\007' "$var" "$b64")
       if [ -n "''${TMUX:-}" ]; then
         # DCS passthrough: ESC P tmux; <payload, every ESC doubled> ESC \.
         # The payload's only ESC is its leading one, hence the single extra
@@ -426,8 +606,95 @@ pkgs.writeShellApplication {
       printf '%s' "$seq" > /dev/tty 2>/dev/null || true
     }
 
+    # ▥ marks the window as jailed at a glance. The jailed tool sets its own
+    # OSC 2 title during the session and will overwrite this one, which is
+    # why the same marker also goes out as a user var above - a terminal
+    # config can prepend it durably, where a title we set once cannot
+    # survive. Sent anyway for terminals with no such config: it is at least
+    # correct until the tool's first title update.
+    # One column wide (U+25A5 is East Asian Ambiguous, which terminals
+    # render narrow by default), so a consumer putting this in a tab bar
+    # pays one cell rather than the two a fullwidth glyph costs.
+    JAIL_MARK="▥"
+    set_title() {
+      printf '\033]2;%s\007' "$1" > /dev/tty 2>/dev/null || true
+    }
+
+    # Whether this terminal gets user vars at all. Decided once, here,
+    # because three separate places emit them (the sync path at setup, the
+    # jail marker at launch, the dirty counter during the session) and they
+    # must agree. Automatic only when WezTerm is detected, since terminals
+    # that do not know the sequence may print it instead of consuming it;
+    # LLMCUSTODY_USERVAR=1/0 forces the decision either way.
+    USERVAR_ON=0
+    case "''${LLMCUSTODY_USERVAR:-auto}" in
+      0|off|no) ;;
+      1|on|yes) USERVAR_ON=1 ;;
+      *)
+        if [ -n "''${WEZTERM_PANE:-}" ] || [ "''${TERM_PROGRAM:-}" = "WezTerm" ]; then
+          USERVAR_ON=1
+        fi ;;
+    esac
+
+    # What the sandbox tried to reach and didn't get. Both halves have to be
+    # collected before cleanup() kills the holder: the nftables counter
+    # lives in that namespace, and the dnsmasq log is under $RUNDIR, which
+    # the same function removes.
+    #
+    # This is the one piece of feedback a blocked agent otherwise never
+    # produces: a request to a non-whitelisted domain just fails somewhere
+    # inside the tool, with no indication that the jail is why.
+    DROPPED_PACKETS=0
+    BLOCKED_DOMAINS=""
+    collect_net_stats() {
+      local line n dom ip
+      [ "$NET_FILTER" = "1" ] || return 0
+      if [ -n "$HOLDER_PID" ] && kill -0 "$HOLDER_PID" 2>/dev/null; then
+        while IFS= read -r line; do
+          case "$line" in
+            *"counter packets "*)
+              n="''${line##*counter packets }"
+              n="''${n%% *}"
+              case "$n" in ""|*[!0-9]*) continue ;; esac
+              DROPPED_PACKETS=$((DROPPED_PACKETS+n)) ;;
+          esac
+        done < <(nsenter_holder nft list chain inet filter output 2>/dev/null || true)
+      fi
+      if [ -f "$RUNDIR/dnsmasq.log" ]; then
+        # dnsmasq logs its own answer as "<source> <name> is <address>", so
+        # a name that landed on the address=/#/ catch-all reads as
+        # "... is 0.0.0.0" / "... is ::". Parsed from the right, like the
+        # whitelist watcher does, because the log line also carries a
+        # timestamp and a pid prefix.
+        # `|| true` on the whole pipeline: this runs first thing in the exit
+        # trap with errexit active, and `head` closing the pipe early would
+        # otherwise abort cleanup before the sync-back below ever runs.
+        BLOCKED_DOMAINS=$(
+          { while IFS= read -r line; do
+            case "$line" in
+              *" is "*) ;;
+              *) continue ;;
+            esac
+            ip="''${line##* is }"
+            case "$ip" in
+              0.0.0.0|::) ;;
+              *) continue ;;
+            esac
+            dom="''${line% is *}"
+            dom="''${dom##* }"
+            [ -n "$dom" ] && printf '%s\n' "$dom"
+          done < "$RUNDIR/dnsmasq.log" | sort -u | head -n 20; } || true
+        )
+      fi
+    }
+
     cleanup() {
       local status=$?
+      # First, so the watcher cannot emit a stale count over the top of the
+      # clearing emission further down, or run its git against trees the
+      # sync-back is in the middle of.
+      [ -n "$DIRTY_PID" ] && kill "$DIRTY_PID" 2>/dev/null || true
+      collect_net_stats
       [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null || true
       [ -n "$DNSMASQ_PID" ] && kill "$DNSMASQ_PID" 2>/dev/null || true
       [ -n "$SLIRP_PID" ] && kill "$SLIRP_PID" 2>/dev/null || true
@@ -451,16 +718,18 @@ pkgs.writeShellApplication {
       # it avoids) while overlays never do.
       if [ -n "$SYNC_MANIFEST" ] && [ -f "$SYNC_MANIFEST" ]; then
         if [ -t 0 ]; then
-          ${syncBack} --prompt "$SYNC_MANIFEST" || true
+          ${syncBack} --prompt "''${SYNC_EXCLUDE_ARGS[@]+"''${SYNC_EXCLUDE_ARGS[@]}"}" "$SYNC_MANIFEST" || true
         else
-          ${syncBack} --auto "$SYNC_MANIFEST" || true
+          ${syncBack} --auto "''${SYNC_EXCLUDE_ARGS[@]+"''${SYNC_EXCLUDE_ARGS[@]}"}" "$SYNC_MANIFEST" || true
         fi
       fi
 
       # Session is over: drop the mid-session sync handles so nothing points
       # at a $RUNDIR that is about to disappear.
       if [ "$USERVAR_SET" = "1" ]; then
-        emit_sync_uservar ""
+        emit_uservar llm_custody_sync ""
+        emit_uservar llm_custody_jail ""
+        emit_uservar llm_custody_dirty ""
       fi
       if [ -n "$SYNC_REG" ]; then
         rm -f "$SYNC_REG"
@@ -474,10 +743,37 @@ pkgs.writeShellApplication {
       if [ "$GIT_SAFETY" = "1" ]; then
         POST_HOOKSPATH=$(git -C "$WORKSPACE_HOST" config --get core.hooksPath 2>/dev/null || true)
         if [ "$POST_HOOKSPATH" != "$PRE_HOOKSPATH" ]; then
-          echo "llm-custody: WARNING - core.hooksPath in $WORKSPACE_HOST/.git/config changed during this run" >&2
-          echo "          (was: [''${PRE_HOOKSPATH:-unset}], now: [''${POST_HOOKSPATH:-unset}])" >&2
-          echo "          plain git run outside the jail on this repo will honor whatever it points to now - review before trusting it." >&2
+          warn "core.hooksPath in $WORKSPACE_HOST/.git/config changed during this run"
+          hint "(was: [''${PRE_HOOKSPATH:-unset}], now: [''${POST_HOOKSPATH:-unset}])"
+          hint "plain git run outside the jail on this repo will honor whatever it points to now - review before trusting it."
         fi
+      fi
+
+      # Exit summary, last so it isn't buried under the sync prompts above.
+      # Only the parts that have something to say are printed: a short,
+      # uneventful run ends with one line about how long it took.
+      if [ "$LAUNCHED" = "1" ] && [ "$VERBOSITY" -ge 1 ]; then
+        printf '%s%s session ended after %dm%02ds%s\n' \
+          "$C_DIM" "$JAIL_MARK" "$((SECONDS / 60))" "$((SECONDS % 60))" "$C_RESET" >&2
+        if [ -n "$BLOCKED_DOMAINS" ]; then
+          warn "the sandbox tried to reach domains that are not whitelisted:"
+          while IFS= read -r d; do
+            [ -n "$d" ] && hint "$d"
+          done <<< "$BLOCKED_DOMAINS"
+          hint "allow one with --allow-domain DOMAIN, or permanently via $STATE_ROOT/domains"
+        fi
+        if [ "$DROPPED_PACKETS" -gt 0 ]; then
+          warn "$DROPPED_PACKETS packet(s) dropped by the IP gate (connections to addresses no whitelisted lookup returned)"
+        fi
+      fi
+
+      # The tool owned the title for the whole session; hand it back rather
+      # than leaving the jail marker on a window that is no longer jailed.
+      # $SHELL is only a default - a terminal that writes its own title on
+      # every prompt overwrites this immediately anyway.
+      if [ "$TITLE_SET" = "1" ]; then
+        TITLE_RESTORE="''${SHELL:-sh}"
+        set_title "''${TITLE_RESTORE##*/}"
       fi
 
       exit "$status"
@@ -499,13 +795,13 @@ pkgs.writeShellApplication {
              --overlay-src "$RUNDIR/overlay-probe/lower" \
              --overlay "$RUNDIR/overlay-probe/upper" "$RUNDIR/overlay-probe/work" /mnt \
              -- "${pkgs.coreutils}/bin/true" 2>"$RUNDIR/overlay-probe.log"; then
-        echo "ERROR: --overlay-workspace is not usable on this host:" >&2
+        err "--overlay-workspace is not usable on this host:"
         # Indented read loop rather than sed: everything else in this script
         # sticks to coreutils/bash builtins that runtimeInputs guarantees.
-        while IFS= read -r line; do printf '       %s\n' "$line" >&2; done < "$RUNDIR/overlay-probe.log"
-        echo "       Unprivileged overlayfs needs kernel >= 5.11, and the upper layer must sit" >&2
-        echo "       on a filesystem with user xattr support (tmpfs: kernel >= 6.6)." >&2
-        echo "       Point --tmpdir at a disk-backed directory, or drop --overlay-workspace." >&2
+        while IFS= read -r line; do hint "$line"; done < "$RUNDIR/overlay-probe.log"
+        hint "Unprivileged overlayfs needs kernel >= 5.11, and the upper layer must sit"
+        hint "on a filesystem with user xattr support (tmpfs: kernel >= 6.6)."
+        hint "Point --tmpdir at a disk-backed directory, or drop --overlay-workspace."
         exit 1
       fi
       rm -rf "$RUNDIR/overlay-probe" "$RUNDIR/overlay-probe.log"
@@ -523,10 +819,7 @@ pkgs.writeShellApplication {
       shopt -s dotglob nullglob
       for entry in "$src"/*; do
         [ "''${entry##*/}" = ".git" ] && continue
-        cp -a --reflink=auto -- "$entry" "$dest/" || {
-          echo "ERROR: copying $entry into the jail copy at $dest failed" >&2
-          exit 1
-        }
+        cp -a --reflink=auto -- "$entry" "$dest/" || die "copying $entry into the jail copy at $dest failed"
       done
       shopt -u dotglob nullglob
     }
@@ -564,8 +857,8 @@ pkgs.writeShellApplication {
       )
       [ -n "$removed" ] || return 0
       count=$(printf '%s\n' "$removed" | wc -l)
-      echo "llm-custody: --mask: removed $count path(s) from $label" >&2
-      while IFS= read -r line; do printf '          %s\n' "$line" >&2; done <<< "$removed"
+      log "--mask: removed $count path(s) from $label"
+      while IFS= read -r line; do hint "$line"; done <<< "$removed"
     }
 
     # Mask a tree the sandbox sees through a direct bind (--ro-mount, and
@@ -607,11 +900,11 @@ pkgs.writeShellApplication {
         fi
         BWRAP_ARGS+=(--ro-bind "$RUNDIR/masks/$MASK_INDEX" "$guestroot/$entry")
       done
-      echo "llm-custody: --mask: shadowed ''${#matches[@]} path(s) in $label with empty binds" >&2
+      log "--mask: shadowed ''${#matches[@]} path(s) in $label with empty binds"
       if [ -d "$hostroot/.git" ]; then
-        echo "          NOTE: $label is bound along with its .git, so masked content is still" >&2
-        echo "          readable from history (git show HEAD:<path>). Only a copy (--mount" >&2
-        echo "          under --git limited|none) removes it outright." >&2
+        warn "$label is bound along with its .git, so masked content is still"
+        hint "readable from history (git show HEAD:<path>). Only a copy (--mount"
+        hint "under --git limited|none) removes it outright."
       fi
     }
 
@@ -626,7 +919,7 @@ pkgs.writeShellApplication {
       git -C "$dir" "''${JAIL_GIT_IDENT[@]}" add -A
       git -C "$dir" "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
       git -C "$dir" tag jail-baseline
-      echo "llm-custody: $label: branch $branch, single commit tagged jail-baseline" >&2
+      vlog "$label: branch $branch, single commit tagged jail-baseline"
     }
 
     # Change tracking for the sync-back, in its own git dir under RUNDIR that
@@ -656,32 +949,74 @@ pkgs.writeShellApplication {
     # Changes come back via cleanup()'s sync-back step.
     if [ "$GIT_MODE" != "full" ]; then
       if ! command -v git >/dev/null 2>&1; then
-        echo "ERROR: --git $GIT_MODE needs git on the host (it records the baseline used for sync-back)" >&2
-        exit 1
+        die "--git $GIT_MODE needs git on the host (it records the baseline used for sync-back)"
       fi
       WORKSPACE_COPY="$RUNDIR/workspace"
       TRACK_GIT="$RUNDIR/track.git"
       WORKSPACE_BIND="$WORKSPACE_COPY"
-      echo "llm-custody: --git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)" >&2
-      jail_copy_tree "$WORKSPACE_HOST" "$WORKSPACE_COPY"
+      if [ "$DRYRUN" = "1" ]; then
+        # A dry run resolves paths but copies nothing: on a large repo the
+        # copy is the slowest part of a launch, and reproducing it would
+        # make the one mode meant for a quick look the expensive one.
+        log "--git $GIT_MODE would copy $WORKSPACE_HOST into $RUNDIR (not done for --dry-run)"
+      else
+        log "--git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)"
+        jail_copy_tree "$WORKSPACE_HOST" "$WORKSPACE_COPY"
 
-      jail_apply_masks "$WORKSPACE_COPY" "the workspace copy"
+        jail_apply_masks "$WORKSPACE_COPY" "the workspace copy"
 
-      if [ "$GIT_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
-        jail_init_repo "$WORKSPACE_COPY" "$WORKSPACE_HOST" "jail repo"
-      elif [ "$GIT_MODE" = "limited" ]; then
-        echo "llm-custody: workspace is not a git repo - jail gets a plain copy" >&2
+        if [ "$GIT_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
+          jail_init_repo "$WORKSPACE_COPY" "$WORKSPACE_HOST" "jail repo"
+        elif [ "$GIT_MODE" = "limited" ]; then
+          log "workspace is not a git repo - jail gets a plain copy"
+        fi
+
+        jail_track_init "$WORKSPACE_COPY" "$TRACK_GIT"
+        SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$WORKSPACE_COPY" "$TRACK_GIT" "$WORKSPACE_HOST" "jail workspace")")
       fi
-
-      jail_track_init "$WORKSPACE_COPY" "$TRACK_GIT"
-      SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$WORKSPACE_COPY" "$TRACK_GIT" "$WORKSPACE_HOST" "jail workspace")")
     fi
 
     nsenter_holder() {
       nsenter -U -n -t "$HOLDER_PID" --preserve-credentials -- "$@"
     }
 
-    if [ "$NET_FILTER" = "1" ]; then
+    # Host preflight. Nothing here is NixOS-specific support (anything else
+    # is unsupported), but both conditions produce a bwrap failure whose own
+    # message says nothing about the cause, so one line of warning here
+    # saves the search. Warnings, not errors: a kernel may well allow what
+    # these files claim it doesn't, and refusing to start on a guess would
+    # be worse than a launch that fails a second later with bwrap's own
+    # message right under this one.
+    if [ -r /proc/sys/kernel/unprivileged_userns_clone ] &&
+       [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)" = "0" ]; then
+      warn "kernel.unprivileged_userns_clone=0 - bwrap cannot create a user namespace"
+      hint "sysctl -w kernel.unprivileged_userns_clone=1 (as root) to allow it"
+    fi
+    if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] &&
+       [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+      warn "AppArmor restricts unprivileged user namespaces on this host (Ubuntu 24.04 default)"
+      hint "sysctl -w kernel.apparmor_restrict_unprivileged_userns=0, or install an AppArmor profile for bwrap"
+    fi
+    if [ ! -e /run/current-system/sw ]; then
+      vlog "no /run/current-system - this does not look like NixOS, which is the only supported host"
+    fi
+
+    # Auto-extract domains from base URL env vars, same as the old QEMU
+    # runner - otherwise a custom API endpoint's traffic would be forwarded
+    # but never whitelisted, silently breaking on the network filter instead
+    # of just working. Outside the net-filter block below so --dry-run
+    # reports the same domain list a real run would use.
+    for var in ANTHROPIC_BASE_URL OPENAI_BASE_URL; do
+      val="''${!var:-}"
+      if [ -n "$val" ]; then
+        domain="''${val#*://}"
+        domain="''${domain%%/*}"
+        domain="''${domain%%:*}"
+        [ -n "$domain" ] && EXTRA_DOMAINS+=("$domain")
+      fi
+    done
+
+    if [ "$NET_FILTER" = "1" ] && [ "$DRYRUN" != "1" ]; then
       # Long-lived netns holder: slirp4netns and dnsmasq/nft attach to its
       # /proc/<pid>/ns/{user,net} by PID; the final sandboxed process later
       # re-enters the same pair via nsenter, sharing this network without
@@ -701,10 +1036,11 @@ pkgs.writeShellApplication {
       # gets forced to "deny" and a wide range (not just identity 0) is
       # genuinely mapped.
       if ! command -v newuidmap >/dev/null || ! command -v newgidmap >/dev/null; then
-        echo "ERROR: newuidmap/newgidmap not found - required for network filtering." >&2
-        echo "       (NixOS: enabled by any rootless-container feature, e.g. Incus; see /etc/subuid)" >&2
+        err "newuidmap/newgidmap not found - required for network filtering."
+        hint "(NixOS: enabled by any rootless-container feature, e.g. Incus; see /etc/subuid)"
         exit 1
       fi
+      vlog "starting private network namespace"
       unshare --user --net -- sleep infinity &
       HOLDER_PID=$!
       for _ in $(seq 1 50); do
@@ -722,24 +1058,42 @@ pkgs.writeShellApplication {
       # -6/--enable-ipv6 is marked experimental by slirp4netns itself, but
       # --configure applies to whatever families are enabled, so no extra
       # manual route/address setup is needed for v6 beyond this flag.
+      #
+      # --ready-fd makes slirp4netns announce completion instead of being
+      # waited out: it writes one byte to the fd once tap0 and the routes
+      # are configured. The fixed sleep this replaces was a guess that held
+      # on an idle laptop and not on a loaded one, where dnsmasq would bind
+      # before the interface existed.
+      #
+      # A regular file, not a fifo. The byte written is a bare "1" with no
+      # newline, so a `read` waiting for a line never completes on it - the
+      # status would report failure on a slirp4netns that worked perfectly.
+      # Polling a file sidesteps that and the fifo's blocking-open rendezvous
+      # at the same time, and matches how dnsmasq is waited for just below.
+      : > "$RUNDIR/slirp-ready"
       slirp4netns --configure --mtu=65520 --disable-host-loopback --disable-dns \
-        --enable-ipv6 "$HOLDER_PID" tap0 >"$RUNDIR/slirp4netns.log" 2>&1 &
+        --enable-ipv6 --ready-fd=3 "$HOLDER_PID" tap0 \
+        >"$RUNDIR/slirp4netns.log" 2>&1 3>>"$RUNDIR/slirp-ready" &
       SLIRP_PID=$!
-      sleep 0.3 # let slirp4netns finish configuring tap0/routes before dnsmasq binds
-
-      # Auto-extract domains from base URL env vars, same as the old QEMU
-      # runner - otherwise a custom API endpoint's traffic would be
-      # forwarded but never whitelisted, silently breaking on the network
-      # filter instead of just working.
-      for var in ANTHROPIC_BASE_URL OPENAI_BASE_URL; do
-        val="''${!var:-}"
-        if [ -n "$val" ]; then
-          domain="''${val#*://}"
-          domain="''${domain%%/*}"
-          domain="''${domain%%:*}"
-          [ -n "$domain" ] && EXTRA_DOMAINS+=("$domain")
-        fi
+      SLIRP_READY=0
+      for _ in $(seq 1 500); do
+        if [ -s "$RUNDIR/slirp-ready" ]; then SLIRP_READY=1; break; fi
+        # Nothing to wait for if it already died; its log has the reason and
+        # the next step fails on its own terms.
+        kill -0 "$SLIRP_PID" 2>/dev/null || break
+        sleep 0.02
       done
+      if [ "$SLIRP_READY" = "1" ]; then
+        vlog "slirp4netns reported tap0 configured"
+      else
+        warn "slirp4netns did not report ready within 10s - continuing anyway"
+        hint "see $RUNDIR/slirp4netns.log"
+      fi
+
+      # The one resolver allowed out of the namespace. Named rather than
+      # repeated because the nftables ruleset below pins DNS to exactly this
+      # address, and the two drifting apart would break every lookup.
+      UPSTREAM_DNS="9.9.9.9"
 
       {
         echo "no-resolv"
@@ -751,7 +1105,7 @@ pkgs.writeShellApplication {
         # upstream and everything else falls through to the catch-all dead end -
         # this is the primary block, not just the nftables IP gate below.
         for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
-          echo "server=/$d/9.9.9.9"
+          echo "server=/$d/$UPSTREAM_DNS"
         done
         # server= above forwards both A and AAAA lookups for allowed domains
         # to the same (dual-stack) upstream - only the catch-all needs a
@@ -763,14 +1117,30 @@ pkgs.writeShellApplication {
       nsenter_holder dnsmasq --conf-file="$RUNDIR/dnsmasq.conf" \
         --keep-in-foreground --pid-file="$RUNDIR/dnsmasq.pid" &
       DNSMASQ_PID=$!
-      sleep 0.2
+      # dnsmasq writes its pid file once it has bound its listening address,
+      # which is the point the pre-resolve below can start querying it. Poll
+      # for it instead of sleeping a guessed interval; bail out early if the
+      # process died, so the failure surfaces as its own error rather than
+      # as a timeout.
+      for _ in $(seq 1 100); do
+        [ -s "$RUNDIR/dnsmasq.pid" ] && break
+        kill -0 "$DNSMASQ_PID" 2>/dev/null || break
+        sleep 0.02
+      done
 
+      # Sets first, chain further down. The pre-resolve step between the two
+      # has to reach a resolver, and on a host whose /etc/resolv.conf points
+      # at something other than loopback that query leaves the namespace -
+      # which the chain's drop policy would block. With no base chain in the
+      # table yet, nothing is filtered, so the pre-resolve runs before the
+      # policy exists and the sandbox still never sees an unfiltered moment
+      # (it starts long after).
+      #
       # ip daddr only ever matches IPv4 packets, even inside a dual-stack
       # inet-family table - it's simply not-applicable (not "false") for an
       # IPv6 packet, so a v6-unaware ruleset here wouldn't just fail to
-      # filter v6 traffic, it would silently let it all through under the
-      # chain's default accept policy. Hence the separate ipv6_addr set and
-      # ip6 daddr rule below, not just one shared set.
+      # filter v6 traffic, it would silently let it all through. Hence the
+      # separate ipv6_addr set and ip6 daddr rule, not just one shared set.
       nsenter_holder nft -f - <<'NFT'
     table inet filter {
       set allowed {
@@ -780,13 +1150,6 @@ pkgs.writeShellApplication {
       set allowed6 {
         type ipv6_addr
         flags interval
-      }
-      chain output {
-        type filter hook output priority 0; policy accept;
-        udp dport 53 accept
-        tcp dport 53 accept
-        tcp dport { 80, 443 } ip daddr != @allowed drop
-        tcp dport { 80, 443 } ip6 daddr != @allowed6 drop
       }
     }
     NFT
@@ -817,24 +1180,64 @@ pkgs.writeShellApplication {
       # the queries go out the same slirp link the sandbox will use and the
       # answers match its resolver). The log watcher still tracks CDN record
       # drift during the run.
+      #
+      # `getent ahosts`, not the ahostsv4/ahostsv6 pair this used to call:
+      # those two return rc=2 and print nothing on this glibc even for names
+      # that plainly resolve (the same quirk lib/selftest.nix documents),
+      # which made the whole pre-resolve a silent no-op and left the race it
+      # exists to close wide open. `ahosts` returns both families in one
+      # listing, so the family is decided by looking at the address.
       if command -v getent >/dev/null 2>&1; then
+        PREARMED=0
         for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
           while read -r line; do
             ip="''${line%% *}"
             case "$ip" in
-              ""|0.0.0.0|*:*|*[!0-9.]*) continue ;;
+              ""|0.0.0.0|::) continue ;;
+              *:*)
+                case "$ip" in *[!0-9a-fA-F:]*) continue ;; esac
+                nsenter_holder nft add element inet filter allowed6 "{ $ip }" 2>/dev/null || true ;;
+              *[!0-9.]*) continue ;;
+              *)
+                nsenter_holder nft add element inet filter allowed "{ $ip }" 2>/dev/null || true ;;
             esac
-            nsenter_holder nft add element inet filter allowed "{ $ip }" 2>/dev/null || true
-          done < <(nsenter_holder getent ahostsv4 "$d" 2>/dev/null)
-          while read -r line; do
-            ip="''${line%% *}"
-            case "$ip" in
-              ""|*[!0-9a-fA-F:]*) continue ;;
-            esac
-            nsenter_holder nft add element inet filter allowed6 "{ $ip }" 2>/dev/null || true
-          done < <(nsenter_holder getent ahostsv6 "$d" 2>/dev/null)
+            PREARMED=$((PREARMED+1))
+          done < <(nsenter_holder getent ahosts "$d" 2>/dev/null)
         done
+        vlog "pre-armed the IP whitelist with $PREARMED address(es)"
       fi
+
+      # Policy drop, with the whitelisted addresses as the only general exit.
+      # The earlier ruleset gated TCP 80/443 only, which left every other
+      # port - and UDP 443, i.e. HTTP/3 - reaching any address at all under
+      # an accept policy. Gating on the address rather than on a port list
+      # also means the whitelist covers protocols nobody enumerated: git over
+      # ssh to an allowed host works, a QUIC connection to a hardcoded
+      # address does not.
+      #
+      # DNS is pinned to the one upstream dnsmasq forwards to. The sandbox's
+      # own resolver is 127.0.0.1 (covered by the loopback rule), so an
+      # outbound query to anything else is either a misconfiguration or a
+      # DNS tunnel, and neither should leave.
+      #
+      # ICMP stays open in both families because IPv6 neighbour discovery
+      # rides on it - dropping it breaks v6 on the tap link entirely.
+      # Unquoted heredoc so $UPSTREAM_DNS expands; the ruleset itself has no
+      # other shell metacharacters.
+      nsenter_holder nft -f - <<NFT
+    table inet filter {
+      chain output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        meta l4proto { icmp, ipv6-icmp } accept
+        ip daddr $UPSTREAM_DNS udp dport 53 accept
+        ip daddr $UPSTREAM_DNS tcp dport 53 accept
+        ip daddr @allowed accept
+        ip6 daddr @allowed6 accept
+        counter drop
+      }
+    }
+    NFT
 
       echo "nameserver 127.0.0.1" > "$RUNDIR/resolv.conf"
     fi
@@ -992,7 +1395,7 @@ pkgs.writeShellApplication {
         *) REAL_GIT="" ;;
       esac
       if [ -z "$REAL_GIT" ]; then
-        echo "warning: git resolves to $REAL_GIT_RESOLVED, not visible inside the jail (needs /nix/store or a bound /usr/bin) - skipping in-jail git hooks shadow" >&2
+        warn "git resolves to $REAL_GIT_RESOLVED, not visible inside the jail (needs /nix/store or a bound /usr/bin) - skipping in-jail git hooks shadow"
       fi
       if [ -n "$REAL_GIT" ]; then
         GIT_WRAPPER_DIR="$RUNDIR/bin"
@@ -1035,7 +1438,8 @@ pkgs.writeShellApplication {
         fi
       done
       if [ "$RW_SKILLS" = "1" ]; then
-        echo "llm-custody: WARNING - skills are read-write; an in-jail agent can modify ~/.claude/skills content that the host reads (and skillissue may push). Only continue if in-jail skill maintenance is intended." >&2
+        warn "skills are read-write; an in-jail agent can modify ~/.claude/skills content that the host reads (and skillissue may push)."
+        hint "Only continue if in-jail skill maintenance is intended."
       fi
     fi
     [ -f /etc/nsswitch.conf ] && BWRAP_ARGS+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
@@ -1070,8 +1474,7 @@ pkgs.writeShellApplication {
       key="''${spec%%=*}"
       val="''${spec#*=}"
       if [ -z "$key" ] || [ "$key" = "$spec" ]; then
-        echo "ERROR: --env expects KEY=VAL, got: $spec" >&2
-        exit 1
+        die "--env expects KEY=VAL, got: $spec"
       fi
       BWRAP_ARGS+=(--setenv "$key" "$val")
     done
@@ -1116,8 +1519,7 @@ pkgs.writeShellApplication {
         hostpath="$paths"; guestpath=""
       fi
       if [ ! -e "$hostpath" ]; then
-        echo "ERROR: mount path does not exist: $hostpath" >&2
-        exit 1
+        die "mount path does not exist: $hostpath"
       fi
       if [ -z "$guestpath" ]; then
         if [ "$SAME_PATH" = "1" ]; then
@@ -1128,8 +1530,8 @@ pkgs.writeShellApplication {
           mountname=$(basename -- "$hostpath")
           case "$mountname" in
             /|.|..)
-              echo "ERROR: cannot derive a mount target from '$hostpath'" >&2
-              echo "       pass one explicitly: --mount $hostpath:$WORKSPACE_ROOT/<name>" >&2
+              err "cannot derive a mount target from '$hostpath'"
+              hint "pass one explicitly: --mount $hostpath:$WORKSPACE_ROOT/<name>"
               exit 1 ;;
           esac
           guestpath="$WORKSPACE_ROOT/$mountname"
@@ -1141,10 +1543,10 @@ pkgs.writeShellApplication {
       fi
       for i in "''${!MOUNT_TARGETS[@]}"; do
         if [ "''${MOUNT_TARGETS[$i]}" = "$guestpath" ]; then
-          echo "ERROR: two mounts resolve to the same jail path: $guestpath" >&2
-          echo "       already taken by: ''${MOUNT_SOURCES[$i]}" >&2
-          echo "       conflicting with: $hostpath" >&2
-          echo "       give one an explicit target, e.g. --mount $hostpath:$WORKSPACE_ROOT/<other-name>" >&2
+          err "two mounts resolve to the same jail path: $guestpath"
+          hint "already taken by: ''${MOUNT_SOURCES[$i]}"
+          hint "conflicting with: $hostpath"
+          hint "give one an explicit target, e.g. --mount $hostpath:$WORKSPACE_ROOT/<other-name>"
           exit 1
         fi
       done
@@ -1172,7 +1574,7 @@ pkgs.writeShellApplication {
         # Single file: nothing to copy into a repo or diff against a
         # baseline, so it stays a direct bind in every mode.
         if [ "$GIT_MODE" != "full" ] || [ "$OVERLAY" = "1" ]; then
-          echo "llm-custody: --mount $hostpath is a file - bound directly, writes hit the host immediately" >&2
+          warn "--mount $hostpath is a file - bound directly, writes hit the host immediately"
         fi
         BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
         continue
@@ -1180,14 +1582,18 @@ pkgs.writeShellApplication {
       if [ "$GIT_MODE" != "full" ]; then
         mount_copy="$RUNDIR/mounts/$MOUNT_INDEX"
         mount_track="$RUNDIR/mounts/$MOUNT_INDEX.git"
-        echo "llm-custody: --git $GIT_MODE - copying $hostpath into $RUNDIR (history stays on the host)" >&2
-        jail_copy_tree "$hostpath" "$mount_copy"
-        jail_apply_masks "$mount_copy" "the copy of $hostpath"
-        if [ "$GIT_MODE" = "limited" ] && [ -d "$hostpath/.git" ]; then
-          jail_init_repo "$mount_copy" "$hostpath" "jail repo for $guestpath"
+        if [ "$DRYRUN" = "1" ]; then
+          log "--git $GIT_MODE would copy $hostpath into $RUNDIR (not done for --dry-run)"
+        else
+          log "--git $GIT_MODE - copying $hostpath into $RUNDIR (history stays on the host)"
+          jail_copy_tree "$hostpath" "$mount_copy"
+          jail_apply_masks "$mount_copy" "the copy of $hostpath"
+          if [ "$GIT_MODE" = "limited" ] && [ -d "$hostpath/.git" ]; then
+            jail_init_repo "$mount_copy" "$hostpath" "jail repo for $guestpath"
+          fi
+          jail_track_init "$mount_copy" "$mount_track"
+          SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$mount_copy" "$mount_track" "$hostpath" "mount $guestpath")")
         fi
-        jail_track_init "$mount_copy" "$mount_track"
-        SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$mount_copy" "$mount_track" "$hostpath" "mount $guestpath")")
         BWRAP_ARGS+=(--bind "$mount_copy" "$guestpath")
       elif [ "$OVERLAY" = "1" ]; then
         # Upper and work dir must share a filesystem (overlayfs requirement);
@@ -1222,10 +1628,9 @@ pkgs.writeShellApplication {
       # exercises everything a real session would, without needing an
       # in-jail /login.
       if [ ! -x "${toolExe}" ]; then
-        echo "ERROR (selftest): tool binary not found: ${toolExe}" >&2
-        exit 1
+        die "(selftest) tool binary not found: ${toolExe}"
       fi
-      echo "llm-custody selftest: toolExe=${toolExe}" >&2
+      log "selftest: toolExe=${toolExe}"
       BWRAP_ARGS+=(--setenv SELFTEST_NET "$NET_FILTER")
       BWRAP_ARGS+=(--setenv SELFTEST_CONFIGDIR "/home/user/${toolDefaults.configDirName}")
       BWRAP_ARGS+=(--setenv SELFTEST_UNSHARE "${selftestUnshare}")
@@ -1239,6 +1644,80 @@ pkgs.writeShellApplication {
       fi
       exit $?
     fi
+
+    # How many paths the jail has changed but not yet synced, across every
+    # isolated tree in the manifest. Same two sources the sync-back itself
+    # reads, so the number here and the number it reports agree.
+    #
+    # --no-optional-locks because this runs concurrently with a possible
+    # mid-session $RUNDIR/sync: plain `git status` may refresh (and so lock)
+    # the index, which would collide with that sync's own `git add`. The
+    # flag is exactly for status-reporting callers like this one.
+    jail_dirty_count() {
+      local type src track n total=0
+      [ -n "$SYNC_MANIFEST" ] && [ -f "$SYNC_MANIFEST" ] || { printf '0'; return 0; }
+      # The manifest's host-tree and label columns are the sync-back's
+      # business, not this counter's - read into one throwaway so the two
+      # fields it does need stay aligned with the format.
+      while IFS=$'\t' read -r type src track _; do
+        n=0
+        case "$type" in
+          copy)
+            [ -d "$src" ] && [ -d "$track" ] || continue
+            n=$(GIT_DIR="$track" GIT_WORK_TREE="$src" git --no-optional-locks \
+                  status --porcelain --untracked-files=all 2>/dev/null | wc -l) || n=0 ;;
+          overlay)
+            # An overlay upper layer holds only what was written, so every
+            # entry in it is by definition an unsynced change. Plain
+            # directories are skipped: overlayfs materializes a directory
+            # just to hold a changed file below it, so counting them would
+            # inflate the number against the per-path count a copy reports.
+            # Symlinks and whiteouts (char devices) do count.
+            [ -d "$src" ] || continue
+            n=$(
+              cd "$src" 2>/dev/null || exit 0
+              shopt -s globstar dotglob nullglob
+              c=0
+              for e in **/*; do
+                [ -d "$e" ] && [ ! -L "$e" ] && continue
+                c=$((c + 1))
+              done
+              printf '%s' "$c"
+            ) || n=0 ;;
+          *) continue ;;
+        esac
+        case "$n" in ""|*[!0-9]*) n=0 ;; esac
+        total=$((total + n))
+      done < "$SYNC_MANIFEST"
+      printf '%s' "$total"
+    }
+
+    # Background poller feeding the indicator. Only emits on a *change*, so
+    # a long session writes a handful of escape sequences rather than one
+    # every interval - the jailed tool owns the terminal while this runs,
+    # and a write landing inside one of its own sequences would corrupt a
+    # frame.
+    start_dirty_watcher() {
+      local last="" now
+      while :; do
+        now=$(jail_dirty_count 2>/dev/null) || now=""
+        if [ -n "$now" ] && [ "$now" != "$last" ]; then
+          printf '%s\n' "$now" > "$RUNDIR/dirty.tmp" 2>/dev/null &&
+            mv -f "$RUNDIR/dirty.tmp" "$RUNDIR/dirty" 2>/dev/null || true
+          if [ "$USERVAR_ON" = "1" ]; then
+            # Empty, not "0", when clean: a consumer can then test the var
+            # for emptiness exactly like the other two.
+            if [ "$now" = "0" ]; then
+              emit_uservar llm_custody_dirty ""
+            else
+              emit_uservar llm_custody_dirty "$now"
+            fi
+          fi
+          last="$now"
+        fi
+        sleep "$WATCH_INTERVAL"
+      done
+    }
 
     # Mid-session sync: the exit trap is not the only moment the operator
     # may want the jail's work on the host - a long session can produce
@@ -1256,10 +1735,16 @@ pkgs.writeShellApplication {
       for entry in "''${SYNC_ENTRIES[@]}"; do
         printf '%s\n' "$entry" >> "$SYNC_MANIFEST"
       done
-      # %q on the manifest path: $RUNDIR inherits --tmpdir, which may well
-      # contain a space or a quote.
-      printf '#!%s\nexec %s --prompt %s "$@"\n' \
-        "${pkgs.bash}/bin/sh" "${syncBack}" "$(printf '%q' "$SYNC_MANIFEST")" > "$RUNDIR/sync"
+      # %q on the manifest path and on every exclude glob: $RUNDIR inherits
+      # --tmpdir, which may well contain a space or a quote, and a glob is
+      # by definition full of characters a shell would otherwise act on.
+      SYNC_EXCLUDE_LITERAL=""
+      for glob in "''${SYNC_EXCLUDES[@]+"''${SYNC_EXCLUDES[@]}"}"; do
+        SYNC_EXCLUDE_LITERAL="$SYNC_EXCLUDE_LITERAL --exclude $(printf '%q' "$glob")"
+      done
+      printf '#!%s\nexec %s --prompt%s %s "$@"\n' \
+        "${pkgs.bash}/bin/sh" "${syncBack}" "$SYNC_EXCLUDE_LITERAL" \
+        "$(printf '%q' "$SYNC_MANIFEST")" > "$RUNDIR/sync"
       chmod +x "$RUNDIR/sync"
 
       # Stable handle for anything that wants to find the live session
@@ -1272,21 +1757,31 @@ pkgs.writeShellApplication {
       ln -sfn "$RUNDIR/sync" "$SYNC_REG"
       ln -sfn "$RUNDIR/sync" "$SYNC_REG_DIR/current"
 
-      echo "llm-custody: mid-session sync: $RUNDIR/sync (also $SYNC_REG_DIR/current)" >&2
+      vlog "mid-session sync: $RUNDIR/sync (also $SYNC_REG_DIR/current, or llm-custody-sync)"
 
       # Terminals that understand OSC 1337 SetUserVar get the path as a
       # variable too, which is what makes a one-key sync binding possible.
-      # Off by default elsewhere: terminals that don't know the sequence may
-      # print it. LLMCUSTODY_USERVAR=1/0 forces the decision either way.
-      case "''${LLMCUSTODY_USERVAR:-auto}" in
-        0|off|no) ;;
-        1|on|yes) emit_sync_uservar "$RUNDIR/sync"; USERVAR_SET=1 ;;
-        *)
-          if [ -n "''${WEZTERM_PANE:-}" ] || [ "''${TERM_PROGRAM:-}" = "WezTerm" ]; then
-            emit_sync_uservar "$RUNDIR/sync"
-            USERVAR_SET=1
-          fi ;;
-      esac
+      if [ "$USERVAR_ON" = "1" ]; then
+        emit_uservar llm_custody_sync "$RUNDIR/sync"
+        USERVAR_SET=1
+      fi
+
+      # Unsynced-change indicator. The count of paths the jail has changed
+      # but not yet synced goes into $RUNDIR/dirty (atomically renamed, so a
+      # reader never catches a half-written file) and, on a change, out as
+      # the llm_custody_dirty user var. Without this, a session that has
+      # produced work the host has not seen looks exactly like one that has
+      # not - and the only moment that difference surfaces today is the
+      # prompt at exit, which is late to learn it.
+      #
+      # The file exists from the start so a consumer polling it does not
+      # have to special-case "not there yet".
+      if [ "$WATCH_INTERVAL" -gt 0 ]; then
+        printf '0\n' > "$RUNDIR/dirty"
+        start_dirty_watcher &
+        DIRTY_PID=$!
+        vlog "watching for unsynced changes every ''${WATCH_INTERVAL}s ($RUNDIR/dirty)"
+      fi
     fi
 
     # Session resume: translate the generic -c/--continue (resume most
@@ -1312,6 +1807,98 @@ pkgs.writeShellApplication {
       TOOL_ARGS=("$DANGEROUS_FLAG" "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}")
     fi
 
+    # Session card: one block, printed last, describing what the sandbox
+    # this run is about to enter actually looks like. It is here for the
+    # settings that are dangerous when they are not the ones the operator
+    # thought they were - a stray --git full or --no-net-filter is visible
+    # in red on the line above the prompt instead of buried somewhere in the
+    # scrollback of a command typed ten minutes ago.
+    card_row() {
+      printf '%s│%s %-9s %s\n' "$C_DIM" "$C_RESET" "$1" "$2" >&2
+    }
+
+    print_card() {
+      local ws_line net_line git_line mounts_line extras
+
+      ws_line="$WORKSPACE_HOST ''${C_DIM}->''${C_RESET} $WORKSPACE_GUEST"
+
+      case "$GIT_MODE" in
+        full)
+          if [ "$OVERLAY" = "1" ]; then
+            git_line="''${C_YELLOW}full''${C_RESET}, copy-on-write overlay (review before any sync)"
+          else
+            git_line="''${C_RED}full''${C_RESET}, real tree bound read-write - writes hit the host immediately"
+          fi ;;
+        limited) git_line="''${C_GREEN}limited''${C_RESET}, baseline-only copy, syncs back on exit" ;;
+        none)    git_line="''${C_GREEN}none''${C_RESET}, plain copy with no repo, syncs back on exit" ;;
+      esac
+
+      if [ "$NET_FILTER" = "1" ]; then
+        net_line="''${C_GREEN}filtered''${C_RESET}, $((''${#ALLOWED_DOMAINS[@]} + ''${#EXTRA_DOMAINS[@]})) domain(s) allowed"
+      else
+        net_line="''${C_RED}UNFILTERED''${C_RESET} - the sandbox can reach anything"
+      fi
+
+      mounts_line="$((''${#MOUNT_TARGETS[@]} - 1)) extra"
+      [ "''${#MASK_PATTERNS[@]}" -gt 0 ] && mounts_line="$mounts_line, ''${#MASK_PATTERNS[@]} mask pattern(s)"
+      [ "''${#SYNC_EXCLUDES[@]}" -gt 0 ] && mounts_line="$mounts_line, ''${#SYNC_EXCLUDES[@]} sync exclude(s)"
+
+      extras=""
+      [ "$DANGEROUS" = "1" ] && extras="$extras ''${C_RED}dangerous''${C_RESET}"
+      [ "$RW_SKILLS" = "1" ] && extras="$extras ''${C_YELLOW}rw-skills''${C_RESET}"
+      [ "$X11" = "1" ] && extras="$extras ''${C_YELLOW}x11''${C_RESET}"
+      [ "$SAME_PATH" = "1" ] && extras="$extras same-path"
+
+      printf '%s┌─ %s%s %s%s %s(%s)%s\n' \
+        "$C_DIM" "$C_RESET" "$JAIL_MARK" "$C_BOLD" "${name}" "$C_DIM" "$PROFILE" "$C_RESET" >&2
+      card_row workspace "$ws_line"
+      card_row repo "$git_line"
+      card_row network "$net_line"
+      card_row mounts "$mounts_line"
+      [ -n "$extras" ] && card_row flags "''${extras# }"
+      card_row state "$STATE_DIR"
+      printf '%s└─%s\n' "$C_DIM" "$C_RESET" >&2
+    }
+
+    if [ "$DRYRUN" = "1" ]; then
+      print_card
+      log "allowed domains:"
+      for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
+        hint "$d"
+      done
+      # One argument per line rather than a reconstructed command line: the
+      # point of a dry run is auditing the mounts, and a 60-argument bwrap
+      # invocation on one line is exactly what that cannot be read from.
+      log "bwrap arguments:"
+      for arg in "''${BWRAP_ARGS[@]}"; do
+        hint "$arg"
+      done
+      if [ "''${#TOOL_ARGS[@]}" -gt 0 ]; then
+        log "command: ${toolExe} ''${TOOL_ARGS[*]}"
+      else
+        log "command: ${toolExe}"
+      fi
+      exit 0
+    fi
+
+    [ "$VERBOSITY" -ge 1 ] && print_card
+
+    # The jailed tool takes the title over as soon as it starts, so the
+    # marker also goes out as a user var a terminal config can keep in front
+    # of whatever the tool sets.
+    set_title "$JAIL_MARK ${name}: $WORKSPACE_NAME"
+    TITLE_SET=1
+    if [ "$USERVAR_ON" = "1" ]; then
+      emit_uservar llm_custody_jail "$JAIL_MARK ${name}"
+      USERVAR_SET=1
+    fi
+
+    # SECONDS is reset here, not at script start, so the duration in the
+    # exit summary measures the session rather than the setup that preceded
+    # it (a large --git limited copy can take a while, and counting it would
+    # misreport how long the agent actually ran).
+    SECONDS=0
+    LAUNCHED=1
     if [ "$NET_FILTER" = "1" ]; then
       nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"
     else

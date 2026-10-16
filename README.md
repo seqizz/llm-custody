@@ -109,7 +109,14 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
 | `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh single-commit repo (no host history), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
 | `--overlay-workspace` | Mount the workspace and every rw `--mount` copy-on-write; edits sync back to the real trees only on explicit confirmation (needs `--git full`) | off |
+| `--sync-exclude GLOB` | Never sync paths matching GLOB back to the host tree, in any mode that syncs (repeatable). Matched against tree-relative paths; unlike `--mask`, `*` crosses `/` here, so `*.log` covers every depth | - |
+| `--watch-interval N` | Seconds between unsynced-change checks during the session; 0 disables the watcher (see [Unsynced-change indicator](#unsynced-change-indicator)) | `15` |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
+| `--dry-run` | Resolve everything (mounts, masks, domains, env, bwrap arguments) and print it instead of launching. Starts no network namespace and copies no trees | off |
+| `--list-profiles` | List the state profiles of this tool, with session counts, and exit | off |
+| `--list-sessions` | List the sessions stored in the selected profile, newest first, and exit | off |
+| `-q`, `--quiet` | Only warnings and errors | normal |
+| `-v`, `--verbose` | Extra detail about mounts and network setup | normal |
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
@@ -122,7 +129,19 @@ llm-custody-<tool> [options] [-- tool-args...]
 
 Any other argument (e.g. pi's `-p`) is passed straight through to the tool,
 so the quick-start style `nix run .#pi -- -p "..."` works as written - the
-runner only intercepts its own flags.
+runner only intercepts its own flags. The one exception is a bare absolute
+path: that is almost always a second `--mount` written without its flag, so
+it is refused rather than forwarded as a prompt. Put it after `--` if the
+tool really is meant to receive it.
+
+Environment: `LLMCUSTODY_PROFILE` and `LLMCUSTODY_STATE_DIR` are the
+defaults for `--profile` and `--state-dir`, `LLMCUSTODY_USERVAR=1|0` forces
+the WezTerm user-var emission, `NO_COLOR` disables coloured output, and
+`PAGER` is used for the `d` answer at the sync prompt.
+
+Shell completions for bash, zsh and fish ship in the package under
+`share/`, so they are picked up automatically wherever the package is on a
+profile.
 
 Not yet ported from the old QEMU jail: `--immutable`, `--nix-env`,
 `--devenv`.
@@ -171,6 +190,20 @@ denylist, git wrapper) without starting a session:
 
 ```bash
 nix run .#pi -- --selftest
+```
+
+See exactly which trees would be mounted where, with the full bwrap
+argument list, without starting anything:
+
+```bash
+nix run .#pi -- --mount /srv/data --mask 'secrets/*' --dry-run
+```
+
+List the state profiles of a tool and the sessions inside one:
+
+```bash
+nix run .#pi -- --list-profiles
+nix run .#pi -- --profile work --list-sessions
 ```
 
 Resume a previous session (the aliases are translated to the tool's own
@@ -304,14 +337,27 @@ same sync-back out as a standalone command, runnable from a second terminal
 as often as you like while the session keeps going:
 
 ```bash
+nix run .#sync                            # the most recently started run
+nix run .#sync -- --list                  # live sessions, with their pids
+nix run .#sync -- 48213                   # a specific run, for concurrent sessions
+```
+
+`llm-custody-sync` is a front end over a registry of live runs:
+
+```bash
 $XDG_RUNTIME_DIR/llm-custody/current      # the most recently started run
 $XDG_RUNTIME_DIR/llm-custody/<pid>.sync   # a specific run, for concurrent sessions
 ```
 
-Both are symlinks to `$RUNDIR/sync`, whose path is also printed at launch.
-Each sync advances the tracking baseline, so the next one only reports what
-changed since - and the exit prompt then has nothing left to ask about for
-the parts already synced.
+Both are symlinks to `$RUNDIR/sync`, whose path is also printed at launch
+under `--verbose`. Each sync advances the tracking baseline, so the next one
+only reports what changed since - and the exit prompt then has nothing left
+to ask about for the parts already synced.
+
+Every prompt takes `d` as well as `y`/`N`: `d` pages the full diff of what
+is about to be written to the host (through `$PAGER`) and asks again.
+`--sync-exclude GLOB` holds paths back permanently, in both the exit trap
+and the mid-session runs.
 
 This is deliberately *not* reachable from inside the sandbox: `$RUNDIR` is
 not mounted there, so an agent cannot sync its own work out unreviewed.
@@ -358,6 +404,64 @@ Emission is automatic only when WezTerm is detected (`WEZTERM_PANE` or
 `TERM_PROGRAM=WezTerm`), since terminals that do not know the sequence may
 print it. `LLMCUSTODY_USERVAR=1` forces it on (e.g. a terminal that
 understands the same OSC but is not detected), `LLMCUSTODY_USERVAR=0` off.
+
+A second user var, `llm_custody_jail`, carries the jail marker and the tool
+name (`▥ pi`) for the whole session. The runner also sets the window title
+to the same thing at launch, but the jailed tool sets its own title as soon
+as it starts and overwrites it - the user var is what a terminal config can
+keep in front of whatever the tool writes.
+
+#### Unsynced-change indicator
+
+A jail copy that has work the host has not seen looks exactly like one that
+does not, and without an indicator the first moment that difference surfaces
+is the prompt at exit. So the runner counts the paths changed-but-not-synced
+across every isolated tree (the same two sources the sync-back reads) and
+publishes the number two ways:
+
+- `$RUNDIR/dirty`, a plain file holding the count, rewritten atomically.
+  Readable by anything - a tmux `status-right`, a starship module, a polling
+  script
+- `llm_custody_dirty`, a user var, emitted **only when the count changes**
+  (empty when clean). A long session writes a handful of escape sequences
+  rather than one per interval: the jailed tool owns the terminal, and a
+  write landing inside one of its own sequences would corrupt a frame
+
+`--watch-interval` sets the poll period (default 15s, `0` disables it
+entirely - worth doing on a tree big enough for `git status` to cost real
+time). The check uses `git --no-optional-locks status`, so it never collides
+with a mid-session sync running `git add` against the same tracking dir.
+
+Putting both vars in the tab title:
+
+```lua
+wezterm.on('format-tab-title', function(tab)
+  local vars = tab.active_pane.user_vars
+  local title = tab.active_pane.title
+  if not vars.llm_custody_jail or vars.llm_custody_jail == '' then
+    return title
+  end
+  local dirty = vars.llm_custody_dirty
+  return {
+    -- Marker colored by state, not widened by the count: a badge that gains
+    -- a cell when the count crosses 9 reflows the whole tab bar, and it does
+    -- so every time the agent writes a file.
+    { Foreground = { Color = (dirty and dirty ~= '') and '#fb4934' or '#d5c4a1' } },
+    { Text = '▥ ' },
+    { Text = title },
+  }
+end)
+```
+
+The count itself is better placed somewhere with room to vary - a status
+line, or just `llm-custody-sync --list`.
+
+`llm-custody-sync --list` reports the same count per live session, which
+needs no terminal support at all:
+
+```
+/tmp/tmp.T4dWf4vSKz/sync  (pid 48213, 7 unsynced path(s))
+```
 
 ## What's isolated
 
@@ -465,14 +569,21 @@ so workspace writes stay owned by you - claude otherwise refuses
 `--dangerously-skip-permissions` for a uid-0 process).
 
 **Network.** By default, outbound access is restricted via DNS-based domain
-filtering and a port-level firewall inside a private network namespace:
+filtering and a default-deny firewall inside a private network namespace:
 
 - DNS resolution (via a per-run dnsmasq instance) is limited to the tool's
   whitelisted API/service domains
-- Only HTTP/HTTPS traffic (ports 80/443) is allowed outbound to IPs that a
-  whitelisted domain actually resolved to (nftables set populated from
-  dnsmasq's query log) - a hardcoded-IP bypass that skips DNS still hits
-  the drop rule
+- The nftables output chain is `policy drop`. What gets out: loopback,
+  ICMP/ICMPv6 (IPv6 neighbour discovery rides on it), DNS to the single
+  upstream resolver dnsmasq forwards to, and any traffic to an IP that a
+  whitelisted domain actually resolved to (set populated from dnsmasq's
+  query log). A hardcoded-IP bypass that skips DNS hits the drop, and so
+  does UDP 443 (HTTP/3) and every other port - the gate is on the address,
+  not on a port list, so `git` over SSH to an allowed host works while a
+  QUIC connection to an unknown address does not
+- DNS itself is pinned to that one upstream address. The sandbox's resolver
+  is `127.0.0.1`, so an outbound query to anything else is either a
+  misconfiguration or a tunnel
 - Custom API endpoints (via `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) are
   automatically whitelisted
 - Additional domains can be added with `--allow-domain` (suffix/subdomain
@@ -481,6 +592,10 @@ filtering and a port-level firewall inside a private network namespace:
 - Whitelisted domains are pre-resolved into the nftables sets before the
   sandbox starts (first-connect race mitigation); later DNS answers keep
   the sets fresh
+- At exit, the runner reports every domain the sandbox tried to reach that
+  was not whitelisted, plus the drop counter. A blocked request otherwise
+  just fails somewhere inside the tool with no indication that the jail was
+  the reason
 - Use `--no-net-filter` to disable all network restrictions
 
 Default allowed domains are per tool (`tools.nix` `allowedDomains`).
