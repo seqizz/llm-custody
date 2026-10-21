@@ -163,7 +163,9 @@ pkgs.writeShellApplication {
                              are stripped so the terminal uses OSC 52 instead
       --git MODE            How much of the repo the jail sees (default: limited)
                              limited: copy of the working tree as a fresh repo
-                                      with a single baseline commit - no host
+                                      with a jail-baseline commit holding the
+                                      host's HEAD and the host's uncommitted
+                                      work as one commit on top - no host
                                       history, so masked files can't be read
                                       back out of .git
                              none:    same copy, no repo at all
@@ -908,14 +910,73 @@ pkgs.writeShellApplication {
       fi
     }
 
-    # Re-init a copy as a fresh repo with a single baseline commit, so in-jail
-    # git (status/diff/commit/branch) still works with no history to mine.
+    # Re-init a copy as a fresh repo with a two-commit history, so in-jail
+    # git (status/diff/commit/branch) still works with no history to mine:
+    #
+    #   jail-baseline  the host's committed HEAD content
+    #   HEAD           whatever the host had uncommitted on top of it
+    #
+    # The split exists because a single commit of the copy folds the
+    # operator's uncommitted work into the baseline: the content is all
+    # there, but `git status` is clean and `git diff HEAD` empty, so nothing
+    # tells the agent which parts are work in progress. With the split,
+    # `git show HEAD` / `git diff jail-baseline` answer that.
+    #
+    # The work tree stays clean either way - the dirty state is replayed as
+    # a commit, not left uncommitted - so the usual accidents (`git stash`,
+    # `git checkout -- .`, a plain `git reset --hard`) cannot drop the
+    # operator's work from the copy.
     jail_init_repo() {
-      local dir="$1" src="$2" label="$3" branch
+      local dir="$1" src="$2" label="$3" branch headtree
       # Same branch name as the host checkout so prompts, status lines and
       # the agent's own assumptions about the branch still line up.
       branch=$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
       git -C "$dir" init -q -b "$branch"
+
+      # HEAD content has to be materialized from the host repo: the copy is
+      # the working tree, and .git deliberately stayed behind. `git archive`
+      # over a scratch dir rather than diff-and-reverse-apply, because a
+      # patch round trip has failure modes (binary hunks, clean/smudge
+      # filters, CRLF, submodule gitlinks) that an extraction does not.
+      # Costs one extra tracked-tree extraction under --tmpdir, freed again
+      # a few lines down.
+      headtree=""
+      if git -C "$src" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        headtree="$dir.headtree"
+        mkdir -p "$headtree"
+        if ! git -C "$src" archive --format=tar HEAD 2>/dev/null | tar -x -C "$headtree" 2>/dev/null; then
+          rm -rf "$headtree"
+          headtree=""
+          warn "$label: could not extract host HEAD - baseline will include uncommitted work"
+        fi
+      fi
+
+      if [ -n "$headtree" ]; then
+        # Same masking as the copy got, or the baseline commit would carry
+        # exactly the content --mask exists to keep out of the jail.
+        jail_apply_masks "$headtree" "the HEAD baseline of $label"
+        GIT_DIR="$dir/.git" GIT_WORK_TREE="$headtree" git "''${JAIL_GIT_IDENT[@]}" add -A
+        GIT_DIR="$dir/.git" GIT_WORK_TREE="$headtree" git "''${JAIL_GIT_IDENT[@]}" \
+          commit -q -m "llm-custody jail baseline" --allow-empty
+        git -C "$dir" tag jail-baseline
+        rm -rf "$headtree"
+        # Index currently holds HEAD content; staging the copy on top turns
+        # the host's uncommitted work into the second commit. --allow-empty
+        # is deliberately absent: a clean host tree gets a one-commit repo,
+        # with no empty commit implying work that does not exist.
+        git -C "$dir" "''${JAIL_GIT_IDENT[@]}" add -A
+        if git -C "$dir" diff --cached --quiet; then
+          vlog "$label: branch $branch, single commit tagged jail-baseline (host tree was clean)"
+        else
+          git -C "$dir" "''${JAIL_GIT_IDENT[@]}" \
+            commit -q -m "host uncommitted changes at jail launch"
+          vlog "$label: branch $branch, jail-baseline + host uncommitted work as one commit on top"
+        fi
+        return 0
+      fi
+
+      # No HEAD to split against (empty repo, or the extraction failed):
+      # one commit of the copy, uncommitted work included.
       git -C "$dir" "''${JAIL_GIT_IDENT[@]}" add -A
       git -C "$dir" "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
       git -C "$dir" tag jail-baseline

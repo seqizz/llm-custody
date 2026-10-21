@@ -107,7 +107,7 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
-| `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh single-commit repo (no host history), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
+| `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh repo with no host history (`jail-baseline` commit = host `HEAD`, host's uncommitted work as one commit on top), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
 | `--overlay-workspace` | Mount the workspace and every rw `--mount` copy-on-write; edits sync back to the real trees only on explicit confirmation (needs `--git full`) | off |
 | `--sync-exclude GLOB` | Never sync paths matching GLOB back to the host tree, in any mode that syncs (repeatable). Matched against tree-relative paths; unlike `--mask`, `*` crosses `/` here, so `*.log` covers every depth | - |
 | `--watch-interval N` | Seconds between unsynced-change checks during the session; 0 disables the watcher (see [Unsynced-change indicator](#unsynced-change-indicator)) | `15` |
@@ -227,10 +227,25 @@ future tool with different flag names just declares its own there.
 
 By default (`--git limited`) the sandbox does **not** see your `.git`. The
 working tree is copied into the runtime dir, masked paths are deleted from
-the copy, and the copy is re-initialized as a fresh repo with a single
-baseline commit (same branch name as the host checkout, tagged
-`jail-baseline`). In-jail `git status`/`diff`/`commit`/`branch` all work -
-there is simply no history to mine.
+the copy, and the copy is re-initialized as a fresh repo (same branch name
+as the host checkout) with at most two commits:
+
+| Commit | Content |
+|--------|---------|
+| `jail-baseline` (tag) | the host's committed `HEAD` |
+| `HEAD` | what the host had uncommitted on top of it, if anything |
+
+In-jail `git status`/`diff`/`commit`/`branch` all work - there is simply no
+history to mine. The split keeps the operator's work in progress legible:
+folded into one commit it would be invisible, since the work tree is clean
+and `git diff HEAD` empty. `git show HEAD` or `git diff jail-baseline` shows
+exactly what was in flight. A clean host tree produces just the one commit.
+
+The dirty state is replayed as a *commit*, not left uncommitted, so
+`git stash`, `git checkout -- .` or a bare `git reset --hard` cannot drop it
+from the copy. An explicit `git reset --hard jail-baseline` still can, and
+the sync-back would then carry that revert to the host - the tty prompt and
+the pre-launch `git stash create` snapshot are the backstops there.
 
 That is the point: with the real `.git` bound, `--mask` only hides the
 *working copy* of a file. `git show HEAD:secrets/hiera.yaml` still prints it
@@ -302,7 +317,7 @@ checkout can do exactly as much damage there as in the main one:
 
 | Mode | Workspace and every rw `--mount` | Sync-back |
 |------|----------------------------------|-----------|
-| `--git limited` (default) | copy of the working tree, fresh single-commit repo | yes: prompted on a tty, automatic without one |
+| `--git limited` (default) | copy of the working tree, fresh repo with no host history | yes: prompted on a tty, automatic without one |
 | `--git none` | copy of the working tree, no repo | yes: same as above |
 | `--git full` | the real host tree | n/a - writes are live |
 | `--git full --overlay-workspace` | copy-on-write overlay | yes, but **only** on explicit confirmation; never unattended |
