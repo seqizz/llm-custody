@@ -100,6 +100,7 @@ llm-custody-<tool> [options] [-- tool-args...]
 |------|-------------|---------|
 | `--profile NAME` | State profile, a subdir of `--state-dir/<tool>` | `default` |
 | `--state-dir PATH` | Jail state root dir, mounted read-write | `~/.config/llm-custody` |
+| `--toolbox-dir PATH` | Operator package profile, bound read-only at `/toolbox` and prepended to the jail's PATH (see [Providing packages](#providing-packages)) | `--state-dir/toolbox` |
 | `--same-path` | Mount the workspace and every `--mount` at their host paths instead of under `/workspace` | off |
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
 | `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable). Isolated like the workspace: copy + sync-back under `--git limited/none`, copy-on-write with `--overlay-workspace`, real tree with `--git full`. A single file is always bound directly | `/workspace/<basename HOSTPATH>` |
@@ -134,17 +135,84 @@ path: that is almost always a second `--mount` written without its flag, so
 it is refused rather than forwarded as a prompt. Put it after `--` if the
 tool really is meant to receive it.
 
-Environment: `LLMCUSTODY_PROFILE` and `LLMCUSTODY_STATE_DIR` are the
-defaults for `--profile` and `--state-dir`, `LLMCUSTODY_USERVAR=1|0` forces
-the WezTerm user-var emission, `NO_COLOR` disables coloured output, and
-`PAGER` is used for the `d` answer at the sync prompt.
+Environment: `LLMCUSTODY_PROFILE`, `LLMCUSTODY_STATE_DIR` and
+`LLMCUSTODY_TOOLBOX_DIR` are the defaults for `--profile`, `--state-dir` and
+`--toolbox-dir`, `LLMCUSTODY_USERVAR=1|0` forces the WezTerm user-var
+emission, `NO_COLOR` disables coloured output, and `PAGER` is used for the
+`d` answer at the sync prompt.
 
 Shell completions for bash, zsh and fish ship in the package under
 `share/`, so they are picked up automatically wherever the package is on a
 profile.
 
-Not yet ported from the old QEMU jail: `--immutable`, `--nix-env`,
-`--devenv`.
+Not yet ported from the old QEMU jail: `--immutable`, `--devenv`.
+`--nix-env` is superseded by the toolbox below, which provisions from the
+host instead of per run.
+
+### Providing packages
+
+Inside the sandbox `/nix/store` is read-only and no binary cache is in the
+domain whitelist, so nothing there can realize a derivation: `nix build`,
+`nix-shell` and `,` (comma) all fail. That is deliberate - a shared store the
+jail could write to is not a sandbox - but it means a tool the host does not
+already have on PATH has no way in on its own.
+
+The toolbox is that way in: a plain nix profile on the host, bound read-only
+at `/toolbox` and prepended to the jail's PATH. One profile per
+`--state-dir`, shared by every tool and every `--profile` under it, because a
+tool worth provisioning once is worth having everywhere and none of it is
+session state.
+
+```bash
+nix run .#toolbox -- add lua5_4 shellcheck   # install, host-side
+nix run .#toolbox -- list                    # what is in there
+nix run .#toolbox -- rm shellcheck
+nix run .#toolbox                            # prompt for a line of names
+```
+
+A bare name resolves against `nixpkgs` (override with
+`LLMCUSTODY_TOOLBOX_FLAKE`); anything containing `#` or `:` is handed to nix
+verbatim as a flake reference.
+
+**Additions apply to a running session.** The bind is live: `nix profile
+install` writes a new generation, `llm-custody-toolbox` retargets the
+`current` symlink the sandbox resolves through, and the next PATH lookup
+inside the jail finds the new binary. Nothing has to be restarted, which is
+the point - the agent asks for a tool mid-task and keeps going once you have
+provisioned it.
+
+Without `--dir`, the CLI targets the most recently started session's toolbox
+(`$XDG_RUNTIME_DIR/llm-custody/current.toolbox`, with `<pid>.toolbox` for a
+specific one) and falls back to the default path when no session is running.
+So answering a request needs no knowledge of which `--state-dir` that session
+used. The same path also goes out as the `llm_custody_toolbox` WezTerm user
+var, for a terminal keybinding that prompts for a name and runs the install;
+`--pause` holds the output on screen when that binding spawns a throwaway
+pane.
+
+Each launcher appends a short section to the jailed tool's user-level memory
+file (pi: `AGENTS.md`, claude: `CLAUDE.md`) telling the agent it cannot
+install anything and asking it to end its reply with:
+
+```
+required packages: lua5_4, shellcheck
+good-to-have packages: ripgrep
+```
+
+`llm-custody-toolbox add` accepts that line pasted verbatim - the labels and
+commas are stripped - so answering a request is a copy, a paste and a return.
+`, -p <command>` still works inside the jail (nix-index's database is local)
+and is how the agent turns a command name into a nixpkgs attribute.
+
+The toolbox is bound **read-only**. A writable one would put the front of the
+jail's own PATH under the agent's control, which is worth rather more to a
+misbehaving agent than any single package.
+
+A profile outside `/nix/var/nix/profiles` is not a GC root on its own, so
+`llm-custody-toolbox` writes `current` with `nix-store --indirect --add-root`
+and the toolbox survives `nix-collect-garbage`. If that call fails it falls
+back to a plain symlink and says so - the contents then last until the next
+GC, and a re-`add` restores them.
 
 ### Examples
 
@@ -426,6 +494,26 @@ to the same thing at launch, but the jailed tool sets its own title as soon
 as it starts and overwrites it - the user var is what a terminal config can
 keep in front of whatever the tool writes.
 
+A third, `llm_custody_toolbox`, carries this session's toolbox directory, so
+a binding can prompt for a package name and install it without resolving the
+registry itself:
+
+```lua
+-- prompt, then provision into the toolbox of the pane's session
+wezterm.action.PromptInputLine {
+  description = 'package(s) to add to the jail',
+  action = wezterm.action_callback(function(window, pane, line)
+    if not line or line == '' then return end
+    local dir = pane:get_user_vars().llm_custody_toolbox
+    if not dir or dir == '' then return end
+    window:perform_action(
+      wezterm.action.SpawnCommandInNewTab {
+        args = { 'llm-custody-toolbox', '--dir', dir, '--pause', 'add', line },
+      }, pane)
+  end),
+}
+```
+
 #### Unsynced-change indicator
 
 A jail copy that has work the host has not seen looks exactly like one that
@@ -684,6 +772,7 @@ whitelisted domains unless you pass `--no-net-filter`.
 |  |  /nix/store         <- ro-bind                        | |
 |  |  /workspace/<name>  <- bind (rw, cwd)                 | |
 |  |  /home/user/<cfg>   <- bind (rw, jail-private state)  | |
+|  |  /toolbox           <- ro-bind (operator packages)    | |
 |  |  seccomp denylist applied at the final execve         | |
 |  |  exec the tool                                        | |
 |  +-------------------------------------------------------+ |
@@ -721,9 +810,14 @@ unreleased build.
 3. Wire the tool's package into `flake.nix`'s `defaultArgs`.
 4. `nix run .#your-tool` - the flake generates a runner automatically.
 
-CLI flags like `--immutable`, `--nix-env`, and `--devenv` existed in the old
-QEMU jail and haven't been ported to the bwrap runner yet; a new tool that
-needs one of these needs that support added to `lib/mkBwrapRunner.nix` too.
+A launcher should also append `lib/toolbox.nix`'s `notice` to whatever
+user-level memory file its tool reads, the way `launchers/pi.nix` and
+`launchers/claude.nix` do - an agent that does not know it cannot install
+anything will burn turns on `nix` and comma against a read-only store.
+
+CLI flags like `--immutable` and `--devenv` existed in the old QEMU jail and
+haven't been ported to the bwrap runner yet; a new tool that needs one of
+these needs that support added to `lib/mkBwrapRunner.nix` too.
 
 ## License
 

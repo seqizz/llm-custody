@@ -6,6 +6,9 @@
 # low-friction: lib/mkBwrapRunner.nix and tools.nix don't need to change,
 # just a new launchers/<tool>.nix + tools.nix entry.
 { pkgs, pi-coding-agent, ... }:
+let
+  toolbox = import ../lib/toolbox.nix;
+in
 {
   toolPackage = pi-coding-agent;
 
@@ -23,6 +26,23 @@
     # mkOutOfStoreSymlink onto this exact CLAUDE.md, so cp correctly refuses
     # a same-file copy - not an error.
     [ -f "$HOME/.claude/CLAUDE.md" ] && cp "$HOME/.claude/CLAUDE.md" "$STATE_DIR/AGENTS.md" 2>/dev/null || true
+
+    # Appended after the copy above, which overwrites the file on every
+    # launch - so this is rewritten every launch too and never accumulates.
+    # Without it an agent that hits a missing tool keeps trying to install it
+    # (nix, nix-shell, comma) against a read-only store instead of asking.
+    # printf, not a heredoc: this whole script is interpolated into
+    # mkBwrapRunner.nix's indented Nix string, where a flush-left heredoc
+    # terminator would drag that string's dedent to zero and break every
+    # other line in it.
+    #
+    # The disable below is for the markdown backticks in the notice: inside
+    # the single quotes escapeShellArg puts around it they are literal text,
+    # which is the point, but SC2016 reads them as a command substitution
+    # that will not expand - and writeShellApplication fails the build on an
+    # info-level finding.
+    # shellcheck disable=SC2016
+    printf '%s' ${pkgs.lib.escapeShellArg toolbox.notice} >> "$STATE_DIR/AGENTS.md"
 
     SETTINGS="$STATE_DIR/settings.json"
     MANIFEST="$HOME/.config/llm-custody/pi-extensions"

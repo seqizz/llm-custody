@@ -67,7 +67,13 @@
         nixpkgs.lib.mapAttrs (name: def: mkTool system name def) (toolsForSystem system)
         # Host-side front end for the mid-session sync of whichever jail is
         # running, so a second terminal needs no path from the first.
-        // { sync = import ./lib/sync-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; }; }
+        // {
+          sync = import ./lib/sync-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+          # Host-side provisioning of the package profile the jail sees on its
+          # PATH - the sandbox cannot realize a derivation itself, so this is
+          # where a tool it asked for actually gets built.
+          toolbox = import ./lib/toolbox-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+        }
       );
 
       apps = forAllSystems (system:
@@ -79,6 +85,10 @@
           sync = {
             type = "app";
             program = "${self.packages.${system}.sync}/bin/llm-custody-sync";
+          };
+          toolbox = {
+            type = "app";
+            program = "${self.packages.${system}.toolbox}/bin/llm-custody-toolbox";
           };
         }
       );

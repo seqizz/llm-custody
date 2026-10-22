@@ -25,6 +25,9 @@ let
   # for the mid-session $RUNDIR/sync command the operator can run from
   # another terminal.
   syncBack = pkgs.lib.getExe (import ./sync-back.nix { inherit pkgs; });
+  # Guest path and symlink names of the operator-managed package profile
+  # (lib/toolbox.nix), shared with lib/toolbox-cli.nix and the launchers.
+  toolbox = import ./toolbox.nix;
   selftestDomain = builtins.head toolDefaults.allowedDomains;
   selftestUnshare = "${pkgs.util-linux}/bin/unshare";
   # Optional per-tool data: a tool with no dangerous-mode CLI flag (pi) just
@@ -62,6 +65,7 @@ pkgs.writeShellApplication {
 
     PROFILE="''${LLMCUSTODY_PROFILE:-default}"
     STATE_ROOT="''${LLMCUSTODY_STATE_DIR:-}"
+    TOOLBOX_DIR="''${LLMCUSTODY_TOOLBOX_DIR:-}"
     SAME_PATH=0
     NET_FILTER=1
     LLMCUSTODY_TMPDIR="''${TMPDIR:-/tmp}"
@@ -135,6 +139,13 @@ pkgs.writeShellApplication {
     Options:
       --profile NAME        State profile, a subdir of --state-dir/${name} (default: default)
       --state-dir PATH      Jail state root dir (default: ~/.config/llm-custody)
+      --toolbox-dir PATH    Operator package profile bound read-only at
+                             ${toolbox.guestDir} and prepended to the jail's PATH
+                             (default: --state-dir/toolbox). The sandbox cannot
+                             realize a derivation itself, so this is how a tool
+                             that is not on the host's PATH gets in; add to it
+                             from the host with llm-custody-toolbox, including
+                             while a session is running
       --same-path           Mount workspace and every --mount at their host
                              paths instead of under /workspace (lets tools
                              like 'claude --resume' match sessions started
@@ -219,6 +230,8 @@ pkgs.writeShellApplication {
     Environment:
       LLMCUSTODY_PROFILE    Default for --profile
       LLMCUSTODY_STATE_DIR  Default for --state-dir
+      LLMCUSTODY_TOOLBOX_DIR
+                            Default for --toolbox-dir
       LLMCUSTODY_USERVAR    1/0 forces the WezTerm user-var emission that is
                              otherwise only done when WezTerm is detected
       TMPDIR                Default for --tmpdir
@@ -227,6 +240,7 @@ pkgs.writeShellApplication {
 
     Files:
       --state-dir/domains   Extra whitelist domains, one per line, '#' comments
+      --state-dir/toolbox   Operator package profile, see --toolbox-dir
       --state-dir/${name}/PROFILE
                             Per-profile tool state (sessions, credentials)
     USAGE
@@ -245,6 +259,7 @@ pkgs.writeShellApplication {
       case "$1" in
         --profile)       need_arg "$@"; PROFILE="$2"; shift 2 ;;
         --state-dir)     need_arg "$@"; STATE_ROOT="$2"; shift 2 ;;
+        --toolbox-dir)   need_arg "$@"; TOOLBOX_DIR="$2"; shift 2 ;;
         --same-path)     SAME_PATH=1; shift ;;
         --tmpdir)        need_arg "$@"; LLMCUSTODY_TMPDIR="$2"; shift 2 ;;
         --mount)         need_arg "$@"; EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
@@ -438,6 +453,37 @@ pkgs.writeShellApplication {
 
     [ "$DRYRUN" = "1" ] || mkdir -p "$STATE_DIR"
 
+    # Operator-managed package profile, shared across tools and profiles like
+    # the domains file next to it - a tool provisioned once is wanted
+    # everywhere, and nothing in it is session state. Nothing inside the
+    # sandbox can realize a derivation (read-only store, no binary cache in
+    # the whitelist), so this is the only way a tool the host does not already
+    # have on PATH gets in.
+    if [ -z "$TOOLBOX_DIR" ]; then
+      TOOLBOX_DIR="$STATE_ROOT/toolbox"
+    fi
+
+    # nix writes the profile as `profile -> profile-N-link`, and whether that
+    # hop is relative or absolute is nix's business - an absolute one names a
+    # host path the sandbox does not have. `current` short-circuits it to the
+    # resolved /nix/store profile, which resolves identically inside the jail
+    # because the store is bound wholesale. Refreshed here as well as by
+    # llm-custody-toolbox, so a profile edited with plain `nix profile`
+    # commands is still picked up at the next launch.
+    toolbox_refresh() {
+      local real
+      [ -L "$TOOLBOX_DIR/${toolbox.profileLink}" ] || return 0
+      real=$(readlink -f "$TOOLBOX_DIR/${toolbox.profileLink}" 2>/dev/null) || return 0
+      case "$real" in
+        /nix/store/*) ln -sfn "$real" "$TOOLBOX_DIR/${toolbox.currentLink}" ;;
+        *) warn "toolbox profile resolves to $real, outside /nix/store - invisible inside the jail" ;;
+      esac
+    }
+    if [ "$DRYRUN" != "1" ]; then
+      mkdir -p "$TOOLBOX_DIR"
+      toolbox_refresh
+    fi
+
     # Persistent per-run additions to the network whitelist: a plain file
     # next to the state dirs (one domain per line, '#' comments allowed).
     # Same effect as --allow-domain, for hosts with their own API endpoints
@@ -556,6 +602,7 @@ pkgs.writeShellApplication {
     SYNC_ENTRIES=()
     SYNC_MANIFEST=""
     SYNC_REG=""
+    TOOLBOX_REG=""
     USERVAR_SET=0
     TITLE_SET=0
     # Set right before handing control to the tool. The exit summary keys off
@@ -732,11 +779,21 @@ pkgs.writeShellApplication {
         emit_uservar llm_custody_sync ""
         emit_uservar llm_custody_jail ""
         emit_uservar llm_custody_dirty ""
+        emit_uservar llm_custody_toolbox ""
       fi
       if [ -n "$SYNC_REG" ]; then
         rm -f "$SYNC_REG"
         if [ "$(readlink "$(dirname "$SYNC_REG")/current" 2>/dev/null || true)" = "$RUNDIR/sync" ]; then
           rm -f "$(dirname "$SYNC_REG")/current"
+        fi
+      fi
+      # The `current.toolbox` pointer only belongs to this run while it still
+      # names this run's directory - a session started later has already
+      # claimed it, and removing it then would strand that one.
+      if [ -n "$TOOLBOX_REG" ]; then
+        rm -f "$TOOLBOX_REG"
+        if [ "$(readlink "$(dirname "$TOOLBOX_REG")/current.toolbox" 2>/dev/null || true)" = "$TOOLBOX_DIR" ]; then
+          rm -f "$(dirname "$TOOLBOX_REG")/current.toolbox"
         fi
       fi
 
@@ -1428,6 +1485,18 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--ro-bind /bin /bin)
     fi
 
+    # The operator's toolbox, ahead of the host profiles: a package put here
+    # is a deliberate addition (often a newer or patched build of something
+    # the host also has), and it would be pointless if the host copy shadowed
+    # it. Still behind the git wrapper below, which has to stay first.
+    #
+    # Bound even when empty, because the bind is what makes a mid-session
+    # addition work: `current` is retargeted on the host and the already-bound
+    # directory shows the new target immediately. Read-only - a writable one
+    # would hand the agent the front of its own PATH.
+    BWRAP_ARGS+=(--ro-bind "$TOOLBOX_DIR" ${toolbox.guestDir})
+    JAIL_PATH="${toolbox.binDir}:$JAIL_PATH"
+
     # Shadow `git` ahead of everything else on PATH with a wrapper that
     # always forces -c core.hooksPath at the real, read-only-bound hooks
     # dir. .git/hooks is already ro-bound above, but .git/config is not -
@@ -1780,6 +1849,30 @@ pkgs.writeShellApplication {
       done
     }
 
+    # Where a second terminal (or a terminal keybinding) looks up what this
+    # session exposes, without having been told the state dir or the rundir:
+    # <pid>.sync and <pid>.toolbox, plus a `current`/`current.toolbox` pair
+    # naming the most recently started run. Shared by the toolbox block below
+    # and the sync block after it.
+    REG_DIR="''${XDG_RUNTIME_DIR:-$LLMCUSTODY_TMPDIR}/llm-custody"
+
+    # Toolbox handle. Registered unconditionally, unlike the sync launcher -
+    # every run has a toolbox, including the ones with nothing to sync back
+    # (--git full), and answering an agent's package request is exactly the
+    # case where the operator is in another terminal with no idea which
+    # --state-dir this session used.
+    if [ "$DRYRUN" != "1" ]; then
+      mkdir -p "$REG_DIR"
+      TOOLBOX_REG="$REG_DIR/$$.toolbox"
+      ln -sfn "$TOOLBOX_DIR" "$TOOLBOX_REG"
+      ln -sfn "$TOOLBOX_DIR" "$REG_DIR/current.toolbox"
+      vlog "toolbox: $TOOLBOX_DIR -> ${toolbox.guestDir} (llm-custody-toolbox add PKG)"
+      if [ "$USERVAR_ON" = "1" ]; then
+        emit_uservar llm_custody_toolbox "$TOOLBOX_DIR"
+        USERVAR_SET=1
+      fi
+    fi
+
     # Mid-session sync: the exit trap is not the only moment the operator
     # may want the jail's work on the host - a long session can produce
     # something worth keeping (or reviewing in a real editor) long before
@@ -1812,13 +1905,12 @@ pkgs.writeShellApplication {
       # without parsing terminal output: a per-pid symlink plus `current`
       # for the most recent run. Concurrent runs each keep their own pid
       # entry; `current` is simply the latest to start.
-      SYNC_REG_DIR="''${XDG_RUNTIME_DIR:-$LLMCUSTODY_TMPDIR}/llm-custody"
-      mkdir -p "$SYNC_REG_DIR"
-      SYNC_REG="$SYNC_REG_DIR/$$.sync"
+      mkdir -p "$REG_DIR"
+      SYNC_REG="$REG_DIR/$$.sync"
       ln -sfn "$RUNDIR/sync" "$SYNC_REG"
-      ln -sfn "$RUNDIR/sync" "$SYNC_REG_DIR/current"
+      ln -sfn "$RUNDIR/sync" "$REG_DIR/current"
 
-      vlog "mid-session sync: $RUNDIR/sync (also $SYNC_REG_DIR/current, or llm-custody-sync)"
+      vlog "mid-session sync: $RUNDIR/sync (also $REG_DIR/current, or llm-custody-sync)"
 
       # Terminals that understand OSC 1337 SetUserVar get the path as a
       # variable too, which is what makes a one-key sync binding possible.
@@ -1879,7 +1971,7 @@ pkgs.writeShellApplication {
     }
 
     print_card() {
-      local ws_line net_line git_line mounts_line extras
+      local ws_line net_line git_line mounts_line extras tb_entry tb_count=0
 
       ws_line="$WORKSPACE_HOST ''${C_DIM}->''${C_RESET} $WORKSPACE_GUEST"
 
@@ -1916,6 +2008,15 @@ pkgs.writeShellApplication {
       card_row repo "$git_line"
       card_row network "$net_line"
       card_row mounts "$mounts_line"
+      # Only when it has something in it: an empty toolbox is the normal case
+      # and a row saying so on every launch is noise. No nullglob - an
+      # unmatched glob stays literal and the -e test rejects it.
+      # `if` rather than a `&&` chain: a false test as the last command of the
+      # loop body makes the loop itself exit non-zero, which errexit acts on.
+      for tb_entry in "$TOOLBOX_DIR/${toolbox.currentLink}/bin"/*; do
+        if [ -e "$tb_entry" ]; then tb_count=$((tb_count + 1)); fi
+      done
+      [ "$tb_count" -gt 0 ] && card_row toolbox "$tb_count command(s) from $TOOLBOX_DIR"
       [ -n "$extras" ] && card_row flags "''${extras# }"
       card_row state "$STATE_DIR"
       printf '%s└─%s\n' "$C_DIM" "$C_RESET" >&2

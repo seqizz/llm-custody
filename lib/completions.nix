@@ -18,6 +18,7 @@ let
   flags = [
     { flag = "--profile"; arg = "string"; desc = "State profile under the state dir"; }
     { flag = "--state-dir"; arg = "dir"; desc = "Jail state root directory"; }
+    { flag = "--toolbox-dir"; arg = "dir"; desc = "Operator package profile bound into the jail PATH"; }
     { flag = "--same-path"; arg = "none"; desc = "Mount the workspace at its host path"; }
     { flag = "--tmpdir"; arg = "dir"; desc = "Directory holding the runtime data of this run"; }
     { flag = "--mount"; arg = "file"; desc = "Extra read-write mount, HOSTPATH or HOSTPATH-GUESTPATH"; }

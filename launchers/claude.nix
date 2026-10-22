@@ -3,6 +3,9 @@
 # swallows the tool packages this launcher doesn't use, so only claude-code
 # becomes a store dependency of the claude runner.
 { pkgs, claude-code, ... }:
+let
+  toolbox = import ../lib/toolbox.nix;
+in
 {
   toolPackage = claude-code;
 
@@ -34,6 +37,19 @@
     # ~/.claude, source and destination are the same file and cp correctly
     # refuses - not an error.
     [ -f "$HOME/.claude/CLAUDE.md" ] && cp "$HOME/.claude/CLAUDE.md" "$STATE_DIR/CLAUDE.md" 2>/dev/null || true
+
+    # Rewritten on every launch because the copy above overwrites the file
+    # first, so it never accumulates. printf rather than a heredoc: this
+    # script is interpolated into mkBwrapRunner.nix's indented Nix string,
+    # where a flush-left terminator would break that string's dedent.
+    #
+    # The disable below is for the markdown backticks in the notice: inside
+    # the single quotes escapeShellArg puts around it they are literal text,
+    # which is the point, but SC2016 reads them as a command substitution
+    # that will not expand - and writeShellApplication fails the build on an
+    # info-level finding.
+    # shellcheck disable=SC2016
+    printf '%s' ${pkgs.lib.escapeShellArg toolbox.notice} >> "$STATE_DIR/CLAUDE.md"
 
     # .claude.json holds onboarding state and per-project trust, and lives
     # inside CLAUDE_CONFIG_DIR rather than $HOME once that var is set. A
