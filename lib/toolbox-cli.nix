@@ -20,7 +20,12 @@ pkgs.writeShellApplication {
   # that owns /nix/var/nix and matches the running daemon, and
   # writeShellApplication prepends to PATH rather than replacing it, so the
   # host binary is what `command -v nix` finds.
-  runtimeInputs = [ pkgs.coreutils ];
+  runtimeInputs = [
+    pkgs.coreutils
+    # flock: one toolbox is shared by every jail under the same --state-dir,
+    # so two sessions can be provisioned at the same time.
+    pkgs.util-linux
+  ];
   text = ''
     set -euo pipefail
 
@@ -36,11 +41,15 @@ pkgs.writeShellApplication {
     PAUSE=0
 
     usage() {
-      printf 'Usage: llm-custody-toolbox [--dir PATH] [--pause] <add|rm|list> [PACKAGE...]\n'
+      printf 'Usage: llm-custody-toolbox [--dir PATH] [--pause] <add|rm|list|gc> [ARG...]\n'
       printf '\n'
       printf '  add PKG...   install nixpkgs attributes into the toolbox profile\n'
       printf '  rm PKG...    remove them again\n'
       printf '  list         show what is installed\n'
+      printf '  gc           drop the profile generations every add leaves\n'
+      printf '               behind, so a garbage collection can reclaim them\n'
+      printf '               [--older-than PERIOD] keep anything newer (e.g. 30d)\n'
+      printf '               [--dry-run] report without deleting\n'
       printf '  (no args)    prompt for packages to add\n'
       printf '  --pause      wait for a keypress before exiting, so a pane a\n'
       printf '               terminal keybinding spawned does not close over\n'
@@ -141,6 +150,34 @@ pkgs.writeShellApplication {
       fi
     }
 
+    # One toolbox serves every jail under the same --state-dir, so two sessions
+    # can be provisioned at the same time. nix locks the profile for its own
+    # generation switch, but `current` is retargeted *after* that lock is
+    # released: without this, two interleaved adds can leave `current` on the
+    # older generation and the second package missing from every jail's PATH
+    # until the next add. gc takes it too - a wipe racing an add would be
+    # deleting generations the other side is still creating.
+    #
+    # Lives inside $DIR, which the mkdir just guaranteed is writable; it is
+    # bound into the sandbox as an empty file, same as the symlinks beside it.
+    take_lock() {
+      mkdir -p "$DIR"
+      exec 9>"$DIR/.lock"
+      flock 9
+    }
+
+    # Generations nix has accumulated in the toolbox, counted for gc's report.
+    # Tested with -L, not -e: a generation whose store path a garbage
+    # collection already took is a dangling symlink, which -e rejects, and it
+    # is exactly one of the links gc exists to clean up.
+    count_generations() {
+      local f n=0
+      for f in "$DIR/${toolbox.profileLink}"-*-link; do
+        if [ -L "$f" ]; then n=$((n + 1)); fi
+      done
+      printf '%s' "$n"
+    }
+
     nix_profile() {
       command -v nix >/dev/null 2>&1 || die "no nix on PATH - this is the host-side half of the toolbox"
       # Spelled out rather than relying on the host's nix.conf: a host with
@@ -176,6 +213,38 @@ pkgs.writeShellApplication {
         [ -d "$DIR" ] || die "no toolbox at $DIR yet"
         nix_profile list --profile "$DIR/${toolbox.profileLink}"
         exit 0 ;;
+      gc)
+        # Every add switches the profile to a new generation and leaves the
+        # old one behind as a profile-N-link symlink. Those links are what
+        # make the toolbox grow without bound: a profile outside
+        # /nix/var/nix/profiles gets no automatic generation cleanup, and
+        # `nix-collect-garbage -d` does not know about this one.
+        [ -d "$DIR" ] || die "no toolbox at $DIR yet"
+        GC_ARGS=()
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --older-than)
+              [ $# -ge 2 ] || die "--older-than needs a period, e.g. 30d"
+              GC_ARGS+=(--older-than "$2"); shift 2 ;;
+            --dry-run) GC_ARGS+=(--dry-run); shift ;;
+            *) die "gc: unknown option: $1 (try --help)" ;;
+          esac
+        done
+        take_lock
+        BEFORE=$(count_generations)
+        nix_profile wipe-history --profile "$DIR/${toolbox.profileLink}" \
+          "''${GC_ARGS[@]+"''${GC_ARGS[@]}"}"
+        # The current generation keeps its number, so `current` still resolves
+        # - refreshed anyway because the GC root it carries is the one thing
+        # that must never be left pointing at something wipe-history dropped.
+        refresh_current
+        AFTER=$(count_generations)
+        printf 'llm-custody-toolbox: %s generation(s) dropped, %s kept\n' \
+          "$((BEFORE - AFTER))" "$AFTER" >&2
+        # Said plainly because the obvious next question is why the store did
+        # not shrink: this only unpins, it frees nothing on its own.
+        printf 'llm-custody-toolbox: store paths are only unpinned - run nix-collect-garbage to reclaim them\n' >&2
+        exit 0 ;;
       add|install|i) ;;
       rm|remove) ;;
       "")
@@ -201,7 +270,7 @@ pkgs.writeShellApplication {
     done < <(normalize_pkgs "$@")
     [ "''${#PKGS[@]}" -gt 0 ] || die "no package names in: $*"
 
-    mkdir -p "$DIR"
+    take_lock
 
     if [ "$CMD" = "add" ]; then
       BEFORE=$(snapshot_bins)

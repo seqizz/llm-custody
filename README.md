@@ -108,7 +108,7 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
-| `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh repo with no host history (`jail-baseline` commit = host `HEAD`, host's uncommitted work as one commit on top), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
+| `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh single-commit repo (no host history), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
 | `--overlay-workspace` | Mount the workspace and every rw `--mount` copy-on-write; edits sync back to the real trees only on explicit confirmation (needs `--git full`) | off |
 | `--sync-exclude GLOB` | Never sync paths matching GLOB back to the host tree, in any mode that syncs (repeatable). Matched against tree-relative paths; unlike `--mask`, `*` crosses `/` here, so `*.log` covers every depth | - |
 | `--watch-interval N` | Seconds between unsynced-change checks during the session; 0 disables the watcher (see [Unsynced-change indicator](#unsynced-change-indicator)) | `15` |
@@ -167,6 +167,7 @@ session state.
 nix run .#toolbox -- add lua5_4 shellcheck   # install, host-side
 nix run .#toolbox -- list                    # what is in there
 nix run .#toolbox -- rm shellcheck
+nix run .#toolbox -- gc                      # drop the old generations
 nix run .#toolbox                            # prompt for a line of names
 ```
 
@@ -190,6 +191,11 @@ var, for a terminal keybinding that prompts for a name and runs the install;
 `--pause` holds the output on screen when that binding spawns a throwaway
 pane.
 
+A second var, `llm_custody_toolbox_cmd`, carries the CLI's own store path.
+`nix run .#pi` is the documented way to start a jail and it installs nothing
+on the host, so a keybinding that called `llm-custody-toolbox` by name would
+find no such command; the store path always resolves.
+
 Each launcher appends a short section to the jailed tool's user-level memory
 file (pi: `AGENTS.md`, claude: `CLAUDE.md`) telling the agent it cannot
 install anything and asking it to end its reply with:
@@ -208,11 +214,41 @@ The toolbox is bound **read-only**. A writable one would put the front of the
 jail's own PATH under the agent's control, which is worth rather more to a
 misbehaving agent than any single package.
 
+One toolbox is shared by every jail under the same `--state-dir` - both
+tools, every `--profile`, any number of concurrent sessions. That is the
+point (a tool provisioned once is wanted everywhere, and none of it is
+session state), and `--toolbox-dir` separates them when it is not. Concurrent
+`add`s are serialised on a lock file in the toolbox directory: nix locks the
+profile for its own generation switch, but `current` is retargeted after that
+lock drops, so two interleaved adds could otherwise leave it on the older
+generation.
+
+### Garbage collection
+
 A profile outside `/nix/var/nix/profiles` is not a GC root on its own, so
 `llm-custody-toolbox` writes `current` with `nix-store --indirect --add-root`
 and the toolbox survives `nix-collect-garbage`. If that call fails it falls
 back to a plain symlink and says so - the contents then last until the next
 GC, and a re-`add` restores them.
+
+Only the *current* generation is rooted that way. Every `add` leaves the one
+before it behind as a `profile-N-link` symlink, and nothing cleans those up:
+a custom profile path gets no automatic generation pruning, and
+`nix-collect-garbage -d` does not know about this profile at all.
+
+```bash
+nix run .#toolbox -- gc                      # drop every generation but the current one
+nix run .#toolbox -- gc --older-than 30d     # keep the recent ones
+nix run .#toolbox -- gc --dry-run            # report first
+```
+
+`gc` only unpins; it frees nothing by itself. Run `nix-collect-garbage`
+afterwards to actually reclaim the store paths. To check what is holding a
+generation:
+
+```bash
+nix-store --query --roots ~/.config/llm-custody/toolbox/profile-1-link
+```
 
 ### Examples
 
@@ -295,25 +331,10 @@ future tool with different flag names just declares its own there.
 
 By default (`--git limited`) the sandbox does **not** see your `.git`. The
 working tree is copied into the runtime dir, masked paths are deleted from
-the copy, and the copy is re-initialized as a fresh repo (same branch name
-as the host checkout) with at most two commits:
-
-| Commit | Content |
-|--------|---------|
-| `jail-baseline` (tag) | the host's committed `HEAD` |
-| `HEAD` | what the host had uncommitted on top of it, if anything |
-
-In-jail `git status`/`diff`/`commit`/`branch` all work - there is simply no
-history to mine. The split keeps the operator's work in progress legible:
-folded into one commit it would be invisible, since the work tree is clean
-and `git diff HEAD` empty. `git show HEAD` or `git diff jail-baseline` shows
-exactly what was in flight. A clean host tree produces just the one commit.
-
-The dirty state is replayed as a *commit*, not left uncommitted, so
-`git stash`, `git checkout -- .` or a bare `git reset --hard` cannot drop it
-from the copy. An explicit `git reset --hard jail-baseline` still can, and
-the sync-back would then carry that revert to the host - the tty prompt and
-the pre-launch `git stash create` snapshot are the backstops there.
+the copy, and the copy is re-initialized as a fresh repo with a single
+baseline commit (same branch name as the host checkout, tagged
+`jail-baseline`). In-jail `git status`/`diff`/`commit`/`branch` all work -
+there is simply no history to mine.
 
 That is the point: with the real `.git` bound, `--mask` only hides the
 *working copy* of a file. `git show HEAD:secrets/hiera.yaml` still prints it
@@ -385,7 +406,7 @@ checkout can do exactly as much damage there as in the main one:
 
 | Mode | Workspace and every rw `--mount` | Sync-back |
 |------|----------------------------------|-----------|
-| `--git limited` (default) | copy of the working tree, fresh repo with no host history | yes: prompted on a tty, automatic without one |
+| `--git limited` (default) | copy of the working tree, fresh single-commit repo | yes: prompted on a tty, automatic without one |
 | `--git none` | copy of the working tree, no repo | yes: same as above |
 | `--git full` | the real host tree | n/a - writes are live |
 | `--git full --overlay-workspace` | copy-on-write overlay | yes, but **only** on explicit confirmation; never unattended |
@@ -494,24 +515,32 @@ to the same thing at launch, but the jailed tool sets its own title as soon
 as it starts and overwrites it - the user var is what a terminal config can
 keep in front of whatever the tool writes.
 
-A third, `llm_custody_toolbox`, carries this session's toolbox directory, so
-a binding can prompt for a package name and install it without resolving the
-registry itself:
+A third and fourth, `llm_custody_toolbox` and `llm_custody_toolbox_cmd`,
+carry this session's toolbox directory and the store path of the CLI that
+fills it, so a binding can prompt for a package and install it without
+resolving the registry itself and without llm-custody being on the host's
+PATH:
 
 ```lua
 -- prompt, then provision into the toolbox of the pane's session
-wezterm.action.PromptInputLine {
-  description = 'package(s) to add to the jail',
-  action = wezterm.action_callback(function(window, pane, line)
-    if not line or line == '' then return end
-    local dir = pane:get_user_vars().llm_custody_toolbox
-    if not dir or dir == '' then return end
-    window:perform_action(
-      wezterm.action.SpawnCommandInNewTab {
-        args = { 'llm-custody-toolbox', '--dir', dir, '--pause', 'add', line },
-      }, pane)
-  end),
-}
+wezterm.action_callback(function(window, pane)
+  local vars = pane:get_user_vars()
+  local dir = vars.llm_custody_toolbox
+  if not dir or dir == '' then return end
+  -- store path, because `nix run .#pi` installs nothing on the host
+  local cmd = vars.llm_custody_toolbox_cmd or 'llm-custody-toolbox'
+  window:perform_action(wezterm.action.PromptInputLine {
+    description = 'package(s) to add to the jail',
+    action = wezterm.action_callback(function(w, p, line)
+      if not line or line:match('^%s*$') then return end
+      -- the line is user input: pass it as an argument, never concatenated
+      -- into a shell string
+      w:perform_action(wezterm.action.SpawnCommandInNewTab {
+        args = { cmd, '--dir', dir, '--pause', 'add', line },
+      }, p)
+    end),
+  }, pane)
+end)
 ```
 
 #### Unsynced-change indicator
