@@ -605,6 +605,7 @@ pkgs.writeShellApplication {
     SYNC_ENTRIES=()
     SYNC_MANIFEST=""
     SYNC_REG=""
+    STATE_REG=""
     TOOLBOX_REG=""
     USERVAR_SET=0
     TITLE_SET=0
@@ -644,6 +645,12 @@ pkgs.writeShellApplication {
     # straight to the terminal device so they never end up in a redirected
     # stdout, and wrapped in tmux's DCS passthrough when there is a tmux
     # between us and the terminal. Empty value = session gone.
+    #
+    # llm_custody_sync stays strictly "absolute path or empty": it is a
+    # command a binding execs, and a magic non-path value in it is one
+    # consumer that skips its own guard away from being spawned as one.
+    # Everything a consumer needs to *explain* a session instead of running
+    # it lives in llm_custody_state (see session_state below).
     emit_uservar() {
       local var="$1" value="$2" b64 seq
       b64=$(printf '%s' "$value" | base64 -w0)
@@ -656,6 +663,47 @@ pkgs.writeShellApplication {
         seq=$(printf '\033Ptmux;\033%s\033\134' "$seq")
       fi
       printf '%s' "$seq" > /dev/tty 2>/dev/null || true
+    }
+
+    # Everything a consumer needs to *describe* this session, as a record of
+    # newline-separated key=value lines - first '=' splits, so values stay
+    # free-form and only a newline (which none of these fields can hold)
+    # would need escaping. Published as the llm_custody_state user var and
+    # as $REG_DIR/<pid>.state, both written once at setup.
+    #
+    # A record rather than more single-purpose variables, or magic values
+    # inside existing ones: the questions a consumer asks keep growing (is
+    # there anything to sync? if not, why not? which git mode, which
+    # workspace?), and every answer would otherwise cost another var that
+    # every emission site has to keep in step. An unknown key is ignorable,
+    # so a consumer written today keeps working when a key is added.
+    #
+    # $1 is the state: `sync` (isolated trees exist, `sync` names the
+    # command that folds them back) or `direct` (every tree is bound
+    # straight through, so the host already has whatever the agent wrote).
+    session_state() {
+      printf 'state=%s\n' "$1"
+      printf 'tool=%s\n' "${name}"
+      printf 'pid=%s\n' "$$"
+      printf 'workspace=%s\n' "$WORKSPACE_HOST"
+      printf 'git=%s\n' "$GIT_MODE"
+      printf 'overlay=%s\n' "$OVERLAY"
+      if [ "$1" = "sync" ]; then
+        printf 'sync=%s\n' "$RUNDIR/sync"
+      fi
+    }
+
+    # Writes the record to the registry and, where the terminal takes user
+    # vars, out to it. One caller per state, but both of them need both
+    # sinks and they must not drift.
+    publish_state() {
+      mkdir -p "$REG_DIR"
+      STATE_REG="$REG_DIR/$$.state"
+      session_state "$1" > "$STATE_REG"
+      if [ "$USERVAR_ON" = "1" ]; then
+        emit_uservar llm_custody_state "$(session_state "$1")"
+        USERVAR_SET=1
+      fi
     }
 
     # ▥ marks the window as jailed at a glance. The jailed tool sets its own
@@ -780,10 +828,14 @@ pkgs.writeShellApplication {
       # at a $RUNDIR that is about to disappear.
       if [ "$USERVAR_SET" = "1" ]; then
         emit_uservar llm_custody_sync ""
+        emit_uservar llm_custody_state ""
         emit_uservar llm_custody_jail ""
         emit_uservar llm_custody_dirty ""
         emit_uservar llm_custody_toolbox ""
         emit_uservar llm_custody_toolbox_cmd ""
+      fi
+      if [ -n "$STATE_REG" ]; then
+        rm -f "$STATE_REG"
       fi
       if [ -n "$SYNC_REG" ]; then
         rm -f "$SYNC_REG"
@@ -1867,6 +1919,7 @@ pkgs.writeShellApplication {
         emit_uservar llm_custody_sync "$RUNDIR/sync"
         USERVAR_SET=1
       fi
+      publish_state sync
 
       # Unsynced-change indicator. The count of paths the jail has changed
       # but not yet synced goes into $RUNDIR/dirty (atomically renamed, so a
@@ -1884,6 +1937,15 @@ pkgs.writeShellApplication {
         DIRTY_PID=$!
         vlog "watching for unsynced changes every ''${WATCH_INTERVAL}s ($RUNDIR/dirty)"
       fi
+    elif [ "$DRYRUN" != "1" ]; then
+      # No isolated tree in this run (--git full without --overlay-workspace,
+      # or nothing mounted rw at all): the sandbox writes through to the host
+      # trees, so there is nothing to fold back and no sync launcher to
+      # register. The state record still goes out - an operator hitting their
+      # sync key or running llm-custody-sync needs "already on the host" and
+      # "no jail running" told apart, and without it the two look identical
+      # from outside.
+      publish_state direct
     fi
 
     # Session resume: translate the generic -c/--continue (resume most

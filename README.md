@@ -458,6 +458,14 @@ under `--verbose`. Each sync advances the tracking baseline, so the next one
 only reports what changed since - and the exit prompt then has nothing left
 to ask about for the parts already synced.
 
+Alongside those, every run registers `$XDG_RUNTIME_DIR/llm-custody/<pid>.state`
+describing itself (see the state record below). A run with no isolated tree
+(`--git full` without `--overlay-workspace`) has no sync-back to register, so
+the record is all it leaves: `--list` still shows it, and syncing it reports
+that there is nothing to fold back and exits 0. "Your changes are already on
+the host" and "no jail is running" are opposite answers, and without the
+record they looked identical from outside.
+
 Every prompt takes `d` as well as `y`/`N`: `d` pages the full diff of what
 is about to be written to the host (through `$PAGER`) and asks again.
 `--sync-exclude GLOB` holds paths back permanently, in both the exit trap
@@ -469,21 +477,69 @@ Syncing while the agent is mid-write is safe for the host (worst case a
 file lands half-written and the next sync corrects it), but the jail-side
 copy is the agent's working tree, so review as usual.
 
-In a WezTerm pane the sync command is also published as the user var
-`llm_custody_sync` (OSC 1337 `SetUserVar`, tmux passthrough handled), which
-is enough for a one-key binding. It is cleared when the session ends:
+#### The session state record
+
+What a run *is* gets published once at setup, as a record of
+newline-separated `key=value` lines - first `=` splits, so values stay
+free-form and nothing but a newline (which none of these fields can hold)
+would need escaping. It goes to two sinks that never drift, because one
+function writes both: the registry file `<pid>.state`, and the WezTerm user
+var `llm_custody_state`.
+
+| Key | Value |
+|-----|-------|
+| `state` | `sync` (isolated trees exist, fold them back with the command in `sync`) or `direct` (every tree bound straight through - the host already has whatever the agent wrote) |
+| `tool` | tool name (`pi`) |
+| `pid` | runner pid, the same one the registry filename carries |
+| `workspace` | host path of the workspace |
+| `git` | `full` / `limited` / `none` |
+| `overlay` | `1` with `--overlay-workspace`, `0` otherwise |
+| `sync` | the mid-session sync command - present only when `state=sync` |
+
+A record rather than more single-purpose variables, or magic values stuffed
+into existing ones: the questions a consumer asks keep growing (is there
+anything to sync? if not, why not? which git mode, which workspace?), and
+every answer would otherwise cost another variable that every emission site
+has to keep in step. **An unknown key is ignorable, so a consumer written
+today keeps working when a key is added** - parse the whole record, read the
+keys you know, ignore the rest.
+
+`llm_custody_sync` still carries the sync command on its own (path when
+there is one, empty otherwise) and stays strictly a path: it is what a
+binding execs, and a magic non-path value in it is one missing guard away
+from being spawned as a command.
+
+In a WezTerm pane this is enough for a one-key binding that can tell all
+three cases apart. All user vars are cleared when the session ends:
 
 ```lua
 -- wezterm.lua
 local shell = os.getenv('SHELL') or '/bin/sh'
 
+-- key=value lines -> table. Unknown keys land in it and are simply unused.
+local function parse_state(raw)
+  if not raw or raw == '' then return nil end
+  local state = {}
+  for line in raw:gmatch('[^\n]+') do
+    local k, v = line:match('^([^=]+)=(.*)$')
+    if k then state[k] = v end
+  end
+  return state
+end
+
 config.keys = {
   {
     key = 's', mods = 'CTRL|SHIFT',
     action = wezterm.action_callback(function(win, pane)
-      local sync = pane:get_user_vars().llm_custody_sync
-      if not sync or sync == '' then
+      local st = parse_state(pane:get_user_vars().llm_custody_state)
+      if not st then
         win:toast_notification('llm-custody', 'no live jail session in this pane', nil, 3000)
+        return
+      end
+      if not st.sync then
+        win:toast_notification('llm-custody',
+          ('nothing to sync - --git %s writes to %s directly'):format(st.git, st.workspace),
+          nil, 4000)
         return
       end
       -- Own pane, because the sync prompts y/N per changed tree - and held
@@ -494,7 +550,7 @@ config.keys = {
           direction = 'Down',
           size = { Percent = 35 },
           command = {
-            args = { shell, '-c', sync .. '; printf "\\n[finished, press enter]"; read -r _' },
+            args = { shell, '-c', st.sync .. '; printf "\\n[finished, press enter]"; read -r _' },
           },
         },
         pane
@@ -509,13 +565,13 @@ Emission is automatic only when WezTerm is detected (`WEZTERM_PANE` or
 print it. `LLMCUSTODY_USERVAR=1` forces it on (e.g. a terminal that
 understands the same OSC but is not detected), `LLMCUSTODY_USERVAR=0` off.
 
-A second user var, `llm_custody_jail`, carries the jail marker and the tool
+Another user var, `llm_custody_jail`, carries the jail marker and the tool
 name (`▥ pi`) for the whole session. The runner also sets the window title
 to the same thing at launch, but the jailed tool sets its own title as soon
 as it starts and overwrites it - the user var is what a terminal config can
 keep in front of whatever the tool writes.
 
-A third and fourth, `llm_custody_toolbox` and `llm_custody_toolbox_cmd`,
+Two more, `llm_custody_toolbox` and `llm_custody_toolbox_cmd`,
 carry this session's toolbox directory and the store path of the CLI that
 fills it, so a binding can prompt for a package and install it without
 resolving the registry itself and without llm-custody being on the host's
