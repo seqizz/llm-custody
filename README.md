@@ -443,7 +443,8 @@ Every `add` therefore stamps a lease: one file per package under
 element name, its mtime being the last time an operator asked for it.
 `prune` removes the elements whose lease has gone 30 days unrenewed, deletes
 those lease files, retargets `current` and wipes the generations that held
-them.
+them. Every jail start runs it (see below), so this happens whether or not
+anyone thinks about it.
 
 ```bash
 llm-custody-toolbox add shellcheck       # install, 30-day lease starts
@@ -491,15 +492,24 @@ effect is live: a command a running jail had a moment ago can be gone from
 its next PATH lookup. That is the deal a lease makes, and the session carries
 on without it.
 
-What `prune` does **not** do is collect garbage. It unpins - the profile
-elements first, then the generations that held them - and leaves reclaiming
-the store to the `nix-collect-garbage` that runs next, which is where the
-policy for the rest of the store already lives. The pairing to put in a
-cleanup alias is therefore:
+**Expiry runs itself, at every jail start.** The broker each runner starts
+does one `prune` plus one `gc` in the background, right after its socket comes
+up: a jail start is the one moment that reliably happens, and the broker is
+already running host-side with the toolbox and its lock. It costs the launch
+nothing (the runner is waiting for `request.sock`, not for nix), failures are
+a line in `broker.log` and nothing else, and
+`LLMCUSTODY_TOOLBOX_AUTOPRUNE=0` turns it off. Running `prune` by hand is
+then only for expiring something early or with a different lifetime.
 
-```bash
-nix run .#toolbox -- prune && sudo nix-collect-garbage
-```
+Leaving it to an operator-run `prune` was the earlier design, and it expires
+packages on the days somebody remembers to type it, which is not a policy.
+
+What that pass does **not** do is collect garbage. It unpins - the profile
+elements, then the generations that held them, then the generations `add` and
+`upgrade` left behind - and leaves reclaiming the store to whatever
+`nix-collect-garbage` the host already runs, which is where the policy for the
+rest of the store lives. So a cleanup alias needs nothing from this project:
+by the time it runs, the expired paths are already unreferenced.
 
 ### Garbage collection
 
@@ -522,9 +532,11 @@ nix run .#toolbox -- gc --older-than 30d     # keep the recent ones
 nix run .#toolbox -- gc --dry-run            # report first
 ```
 
-`prune` already does the unconditional form of this for the generations it
-creates, so `gc` is for the ones `add` and `upgrade` leave behind between
-prunes.
+Both of these run on their own at every jail start (see [Package
+leases](#package-leases)), `gc` with the lease period as its `--older-than`
+and a floor of one day. Calling either by hand is for doing it sooner, or
+harder: a bare `gc` keeps only the current generation, which nothing automatic
+will ever do.
 
 `gc` only unpins; it frees nothing by itself. Run `nix-collect-garbage`
 afterwards to actually reclaim the store paths. To check what is holding a

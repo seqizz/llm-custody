@@ -44,7 +44,9 @@ Usage: llm-custody-toolbox [--dir PATH] [--pause] <command> [ARG...]
                     [--older-than PERIOD]
   upgrade [PKG...]  rebuild installed packages against their flake refs
   prune             remove the packages whose lease has expired, then drop
-                    the generations that held them
+                    the generations that held them. Every jail start does
+                    this on its own (see serve), so running it by hand is
+                    for pruning early or with another lifetime
                     [--older-than PERIOD] lifetime to apply, e.g. 30d
                     [--dry-run] report without removing
   gc                drop the profile generations every add leaves behind
@@ -59,6 +61,10 @@ Usage: llm-custody-toolbox [--dir PATH] [--pause] <command> [ARG...]
                     separate arguments and no shell involved. Its
                     failure is never the request's problem.
                     $LLMCUSTODY_NOTIFY_HOOK is the default.
+                    Also runs one prune + gc in the background, which is
+                    what keeps expired leases from accumulating without
+                    anyone remembering to look.
+                    $LLMCUSTODY_TOOLBOX_AUTOPRUNE=0 turns that off.
   requests          pending package requests from running jails
                     [--json] machine-readable, for a terminal integration
   answer            the same queue, interactively: pick a numbered row to

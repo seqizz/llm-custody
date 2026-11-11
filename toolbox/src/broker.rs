@@ -159,6 +159,8 @@ pub fn serve(layout: Layout, opts: ServeOpts) -> Result<()> {
         util::human_duration(opts.timeout)
     ));
 
+    start_expiry_pass(Arc::clone(&broker));
+
     // The control listener runs on its own thread so an approval is never
     // waiting behind a jail client that opened a connection and went quiet.
     {
@@ -196,6 +198,60 @@ fn cleanup(dir: &Path) {
     let _ = fs::remove_file(dir.join(proto::META_FILE));
     let _ = fs::remove_file(dir.join(proto::PENDING_FILE));
     let _ = fs::remove_dir(dir);
+}
+
+/// Drop expired leases, and the generations nothing needs any more, once per
+/// session.
+///
+/// Provisioning is otherwise a one-way ratchet: a package added for one
+/// afternoon stays on every future jail's PATH, with its whole closure pinned,
+/// until somebody remembers its name. Leaving that to an operator-run `prune`
+/// means it happens on the days somebody remembers, which is not a policy.
+/// A jail start is the one moment that reliably happens, and the broker is the
+/// part of it already running host-side with a `Toolbox` and its lock.
+///
+/// On a thread, because nothing here belongs on the launch path: the runner is
+/// waiting for `request.sock` to appear, not for nix. Best effort in every
+/// direction - a failure is a line in `broker.log` and nothing else, and a
+/// toolbox busy with another session's approve just makes this wait on the
+/// lock. `LLMCUSTODY_TOOLBOX_AUTOPRUNE=0` turns it off for a host that would
+/// rather drive it by hand.
+///
+/// Unpinning only. Reclaiming the store stays with whatever
+/// `nix-collect-garbage` the host already runs, which is where the policy for
+/// the rest of the store lives.
+fn start_expiry_pass(broker: Arc<Broker>) {
+    if std::env::var("LLMCUSTODY_TOOLBOX_AUTOPRUNE").is_ok_and(|v| v == "0") {
+        util::note("auto-prune disabled by LLMCUSTODY_TOOLBOX_AUTOPRUNE=0");
+        return;
+    }
+    std::thread::spawn(move || {
+        let period = broker.toolbox.layout.lease_period;
+        match broker.toolbox.prune(period, false) {
+            Ok(o) if o.removed.is_empty() && o.orphaned.is_empty() => {}
+            Ok(o) => util::note(format!(
+                "auto-prune: {} expired lease(s) dropped ({}), {} generation(s)",
+                o.removed.len() + o.orphaned.len(),
+                o.removed.iter().chain(o.orphaned.iter()).cloned().collect::<Vec<_>>().join(" "),
+                o.generations_dropped
+            )),
+            Err(e) => util::note(format!("auto-prune: {}", e.msg)),
+        }
+        // The generations `prune` wipes are only the ones that held what it
+        // just removed. Every `add` and `upgrade` also leaves its predecessor
+        // behind as a GC root pinning a whole old closure, and those are
+        // exactly what no later `nix-collect-garbage` can reach: the toolbox
+        // lives outside /nix/var/nix/profiles, so even `-d` does not know it
+        // exists. Same period as the leases, floored at a day so a short
+        // LLMCUSTODY_TOOLBOX_LEASE_DAYS cannot round down into "drop every
+        // generation but the current one".
+        let days = std::cmp::max(1, period.as_secs() / 86400);
+        match broker.toolbox.gc(Some(&format!("{days}d")), false) {
+            Ok(0) => {}
+            Ok(n) => util::note(format!("auto-prune: {n} stale generation(s) dropped")),
+            Err(e) => util::note(format!("auto-prune: {}", e.msg)),
+        }
+    });
 }
 
 /// The notification hook's command line.
