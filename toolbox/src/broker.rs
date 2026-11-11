@@ -4,7 +4,9 @@
 //! `$XDG_RUNTIME_DIR/llm-custody/brokers/<broker-id>/`, holds requests in
 //! memory while the operator decides, and performs an approved install through
 //! exactly the same `Toolbox::add` the host CLI uses - there is no second
-//! install path to keep in step.
+//! install path to keep in step. An approved mount request likewise runs the
+//! session's own mount launcher (`--mount-cmd`), the same command the
+//! operator's keybinding runs.
 
 use std::collections::HashMap;
 use std::fs;
@@ -43,10 +45,16 @@ pub struct ServeOpts {
     pub uservar: bool,
     /// Optional host-side notification command, run on every queue change.
     pub notify_hook: Option<PathBuf>,
+    /// The session's mount launcher, run as `<cmd> add --mode M -- PATH` to
+    /// approve a mount request. Absent for a jail started without one, where
+    /// a mount request is accepted into the queue but cannot be approved.
+    pub mount_cmd: Option<PathBuf>,
 }
 
 enum Outcome {
-    Approved { commands: Vec<String> },
+    /// `commands` is what a package approval put on PATH, `guest` where a
+    /// mount approval attached the tree; the other one is empty.
+    Approved { commands: Vec<String>, guest: String },
     Denied(String),
     /// Nobody answered before the hold time ran out. Separate from `Denied`
     /// because the agent treats a denial as final.
@@ -55,6 +63,9 @@ enum Outcome {
 }
 
 struct Pending {
+    /// `proto::KIND_PACKAGE` or `proto::KIND_MOUNT`.
+    kind: String,
+    /// The nixpkgs attribute, or the host path of a mount request.
     attr: String,
     reason: String,
     created: u64,
@@ -72,6 +83,7 @@ struct Broker {
     dir: PathBuf,
     uservar: bool,
     notify_hook: Option<PathBuf>,
+    mount_cmd: Option<PathBuf>,
     /// Last count published to the terminal. Emission is on change only -
     /// nothing is gained by repeating a count, and an agent that spams
     /// requests should not get to decide how often this writes to a terminal.
@@ -145,6 +157,7 @@ pub fn serve(layout: Layout, opts: ServeOpts) -> Result<()> {
         dir: dir.clone(),
         uservar: opts.uservar,
         notify_hook: opts.notify_hook.clone(),
+        mount_cmd: opts.mount_cmd.clone(),
         last_published: Mutex::new(None),
     });
     // Start from a known-empty queue rather than leaving whatever a previous
@@ -254,6 +267,18 @@ fn start_expiry_pass(broker: Arc<Broker>) {
     });
 }
 
+/// The mount launcher's command line for an approved mount request.
+///
+/// Same discipline as the hook: the path came from inside a jail, so it is
+/// one argv entry after a `--`, never part of a string anything re-parses.
+/// The mode is the operator's, validated before it gets here.
+fn mount_command(launcher: &Path, mode: &str, path: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(launcher);
+    cmd.args(["add", "--mode", mode, "--", path])
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
 /// The notification hook's command line.
 ///
 /// Separate from `run_hook` so the argv can be asserted on without spawning
@@ -277,6 +302,47 @@ fn hook_command(
     cmd.args([event, id, attr, reason, count.as_str(), label])
         .stdin(std::process::Stdio::null());
     cmd
+}
+
+/// Run the session's mount launcher and return the guest path it reports.
+///
+/// The launcher prints exactly one line on stdout, `GUEST<TAB>POINT<TAB>FIXED`,
+/// and everything else on stderr; a failure's stderr is what the operator and
+/// the agent both get to read, since neither can see the broker log.
+fn run_mount(launcher: &Path, mode: &str, path: &str) -> Result<String> {
+    let out = util::ctx(
+        mount_command(launcher, mode, path).output(),
+        format!("running {}", launcher.display()),
+    )?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let why = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("mount launcher failed")
+            .trim()
+            .to_string();
+        return fail(format!("mounting {path} failed: {why}"));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let guest = stdout
+        .lines()
+        .last()
+        .and_then(|l| l.split('\t').next())
+        .unwrap_or("")
+        .to_string();
+    if guest.is_empty() {
+        return fail(format!("mount launcher reported no guest path for {path}"));
+    }
+    // The launcher's own commentary (mode, warnings about a bound .git) is
+    // worth having in the broker log next to the request it belongs to.
+    for line in stderr.lines() {
+        if !line.trim().is_empty() {
+            util::note(format!("mount: {}", line.trim()));
+        }
+    }
+    Ok(guest)
 }
 
 impl Broker {
@@ -363,12 +429,22 @@ impl Broker {
         // This socket has exactly one verb. Approval lives on the control
         // socket, which is never bound into a jail - see proto.rs.
         if msg.str_field("op") != "request" {
-            return fail("this socket only accepts package requests");
+            return fail("this socket only accepts package and mount requests");
         }
 
+        // A message with no kind is a package request from a client built
+        // before mounts existed.
+        let kind = match msg.str_field("kind") {
+            "" => proto::KIND_PACKAGE.to_string(),
+            k => k.to_string(),
+        };
         let attr = msg.str_field("attr").to_string();
         let reason = msg.str_field("reason").trim().to_string();
-        proto::validate_attr(&attr)?;
+        match kind.as_str() {
+            proto::KIND_PACKAGE => proto::validate_attr(&attr)?,
+            proto::KIND_MOUNT => proto::validate_mount_path(&attr)?,
+            other => return fail(format!("unknown request kind: {other}")),
+        }
         proto::validate_reason(&reason)?;
 
         let id = format!("{}.{}", self.id, self.seq.fetch_add(1, Ordering::Relaxed) + 1);
@@ -384,6 +460,7 @@ impl Broker {
             pending.insert(
                 id.clone(),
                 Pending {
+                    kind: kind.clone(),
                     attr: attr.clone(),
                     reason: reason.clone(),
                     created: util::now_secs(),
@@ -391,7 +468,11 @@ impl Broker {
                 },
             );
         }
-        util::note(format!("request {id}: {attr} ({})", if reason.is_empty() { "no reason given" } else { &reason }));
+        util::note(format!(
+            "request {id}: {}{attr} ({})",
+            if kind == proto::KIND_MOUNT { "mount " } else { "" },
+            if reason.is_empty() { "no reason given" } else { &reason }
+        ));
         // After the lock above is dropped, so announce() can count the queue.
         self.announce("request", &id, &attr, &reason);
 
@@ -403,6 +484,7 @@ impl Broker {
             &json::Obj::new()
                 .str("status", "pending")
                 .str("id", &id)
+                .str("kind", &kind)
                 .str("attr", &attr)
                 .num("timeout", self.timeout.as_secs())
                 .finish(),
@@ -410,10 +492,13 @@ impl Broker {
 
         let outcome = self.wait_for_outcome(&id, &rx, &mut reader, stream);
         let reply = match outcome {
-            Some(Outcome::Approved { commands }) => {
+            Some(Outcome::Approved { commands, guest }) => {
                 let mut o = proto::ok_response().str("id", &id).str("attr", &attr);
                 if !commands.is_empty() {
                     o = o.str("commands", &commands.join(" "));
+                }
+                if !guest.is_empty() {
+                    o = o.str("guest", &guest);
                 }
                 o.finish()
             }
@@ -525,7 +610,7 @@ impl Broker {
                 proto::write_message(stream, &reply)
             }
             "approve" => {
-                let reply = self.approve(msg.str_field("id"))?;
+                let reply = self.approve(msg.str_field("id"), msg.str_field("mode"))?;
                 proto::write_message(stream, &reply)
             }
             "deny" => {
@@ -550,6 +635,7 @@ impl Broker {
             arr.push_str(
                 &json::Obj::new()
                     .str("id", id)
+                    .str("kind", &p.kind)
                     .str("attr", &p.attr)
                     .str("reason", &p.reason)
                     .num("age", now.saturating_sub(p.created))
@@ -568,8 +654,30 @@ impl Broker {
     /// Approval installs through the ordinary `Toolbox::add`, which also means
     /// it takes the ordinary toolbox lock, creates or renews the lease, and
     /// retargets `current` - so the package is visible to *every* running jail
-    /// the moment this returns, not just the one that asked.
-    fn approve(&self, id: &str) -> Result<String> {
+    /// the moment this returns, not just the one that asked. A mount request
+    /// runs the session's mount launcher instead, with the mode the operator
+    /// chose (`mode`; empty means read-only).
+    fn approve(&self, id: &str, mode: &str) -> Result<String> {
+        let mode = if mode.is_empty() { proto::DEFAULT_MOUNT_MODE } else { mode };
+        proto::validate_mount_mode(mode)?;
+        // Checked before the request leaves the queue: a mount nobody can
+        // perform should stay listed, not be consumed by a failed approval.
+        let launcher = {
+            let pending = self.pending.lock().unwrap();
+            match pending.get(id) {
+                None => return fail(format!("no pending request with id {id}")),
+                Some(p) if p.kind == proto::KIND_MOUNT => match &self.mount_cmd {
+                    Some(l) => Some(l.clone()),
+                    None => {
+                        return fail(
+                            "this jail was started without a mount launcher, so the request \
+                             cannot be approved - deny it, or restart the session",
+                        )
+                    }
+                },
+                Some(_) => None,
+            }
+        };
         // Taken out of the map before the install so a second `approve` of the
         // same id cannot start a second one, and so the lock below is never
         // held while the pending map is.
@@ -581,13 +689,40 @@ impl Broker {
         // queue, and a nix build can take minutes during which the badge
         // would otherwise still be asking for attention.
         self.announce("approved", id, &p.attr, &p.reason);
+
+        if let Some(launcher) = launcher {
+            util::note(format!("request {id}: approved, mounting {} ({mode})", p.attr));
+            return match run_mount(&launcher, mode, &p.attr) {
+                Ok(guest) => {
+                    let delivered =
+                        p.tx.send(Outcome::Approved { commands: Vec::new(), guest: guest.clone() }).is_ok();
+                    let mut o = proto::ok_response()
+                        .str("id", id)
+                        .str("attr", &p.attr)
+                        .str("guest", &guest)
+                        .str("mode", mode);
+                    if !delivered {
+                        o = o.str("note", "mounted, but the jail client had already gone away");
+                    }
+                    Ok(o.finish())
+                }
+                Err(e) => {
+                    let _ = p.tx.send(Outcome::Failed(e.msg.clone()));
+                    Err(e)
+                }
+            };
+        }
+
         util::note(format!("request {id}: approved, installing {}", p.attr));
         match self.toolbox.add(std::slice::from_ref(&p.attr)) {
             Ok(outcome) => {
                 let commands = outcome.new_commands.clone();
                 // A client that gave up in the meantime is not an error: the
                 // package is installed and the next jail to look will find it.
-                let delivered = p.tx.send(Outcome::Approved { commands: commands.clone() }).is_ok();
+                let delivered = p
+                    .tx
+                    .send(Outcome::Approved { commands: commands.clone(), guest: String::new() })
+                    .is_ok();
                 let mut o = proto::ok_response()
                     .str("id", id)
                     .str("attr", &p.attr)
@@ -812,6 +947,22 @@ mod tests {
         assert_eq!(args[3], OsStr::new(HOSTILE));
         assert_eq!(args[4], OsStr::new("2"));
         assert_eq!(args[5], OsStr::new("pi /workspace/llm-custody"));
+    }
+
+    /// The mount launcher gets the operator's mode and the agent's path as
+    /// separate arguments, the path after a `--` so a path starting with a
+    /// dash cannot read as an option.
+    #[test]
+    fn mount_launcher_gets_separate_arguments() {
+        let cmd = mount_command(Path::new("/run/x/mount"), "limited", "/srv/-weird; rm -rf /");
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(cmd.get_program(), OsStr::new("/run/x/mount"));
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], OsStr::new("add"));
+        assert_eq!(args[1], OsStr::new("--mode"));
+        assert_eq!(args[2], OsStr::new("limited"));
+        assert_eq!(args[3], OsStr::new("--"));
+        assert_eq!(args[4], OsStr::new("/srv/-weird; rm -rf /"));
     }
 
     #[test]

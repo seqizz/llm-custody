@@ -46,6 +46,53 @@ pub const REQUESTS_VAR: &str = "llm_custody_requests";
 pub const MAX_LINE: usize = 8 * 1024;
 pub const MAX_ATTR: usize = 128;
 pub const MAX_REASON: usize = 512;
+/// PATH_MAX; anything longer is not a path the host could mount anyway.
+pub const MAX_PATH: usize = 4096;
+
+/// What a request asks for. A package goes into the toolbox profile, a mount
+/// attaches a host directory to the jail that asked. Both travel the same
+/// socket, hold the same place in the queue and are answered the same way;
+/// only the approval step differs.
+pub const KIND_PACKAGE: &str = "package";
+pub const KIND_MOUNT: &str = "mount";
+
+/// How an approved mount is attached. The operator picks this at approval
+/// time; a jailed client cannot name one, because `full` hands it the real
+/// tree read-write and that choice is the operator's.
+pub const MOUNT_MODES: [&str; 6] = ["ro", "full", "limited", "none", "overlay", "copy"];
+pub const DEFAULT_MOUNT_MODE: &str = "ro";
+
+pub fn validate_mount_mode(mode: &str) -> Result<()> {
+    if MOUNT_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        fail(format!("mount mode must be one of {} (got: {mode})", MOUNT_MODES.join("|")))
+    }
+}
+
+/// A mount request names a host path, and the grammar is the host's: absolute,
+/// no control characters (it is shown to the operator), no `..` component (a
+/// request shown as `/srv/data/../../etc` is a request to read as the
+/// resolved path, and the operator should see that path). The host side still
+/// decides whether the path exists and what, if anything, to do with it.
+pub fn validate_mount_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return fail("empty mount path");
+    }
+    if path.len() > MAX_PATH {
+        return fail(format!("mount path longer than {MAX_PATH} bytes"));
+    }
+    if !path.starts_with('/') {
+        return fail(format!("mount path must be absolute: {path}"));
+    }
+    if path.chars().any(|c| c.is_control()) {
+        return fail("mount path contains control characters");
+    }
+    if path.split('/').any(|c| c == "..") {
+        return fail(format!("mount path must not contain '..': {path}"));
+    }
+    Ok(())
+}
 
 /// Only bare nixpkgs attributes are accepted from a jail.
 ///
@@ -152,3 +199,31 @@ pub const STATUS_OK: &str = "ok";
 pub const STATUS_DENIED: &str = "denied";
 pub const STATUS_ERROR: &str = "error";
 pub const STATUS_TIMEOUT: &str = "timeout";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_paths() {
+        assert!(validate_mount_path("/srv/data").is_ok());
+        assert!(validate_mount_path("/").is_ok());
+        assert!(validate_mount_path("/with space/and:colon").is_ok());
+        assert!(validate_mount_path("").is_err());
+        assert!(validate_mount_path("srv/data").is_err());
+        assert!(validate_mount_path("/srv/../etc").is_err());
+        assert!(validate_mount_path("/srv/data\n").is_err());
+        assert!(validate_mount_path(&format!("/{}", "a".repeat(MAX_PATH))).is_err());
+        // A dot-dot inside a name is a name, not a traversal.
+        assert!(validate_mount_path("/srv/a..b").is_ok());
+    }
+
+    #[test]
+    fn mount_modes() {
+        for m in MOUNT_MODES {
+            assert!(validate_mount_mode(m).is_ok());
+        }
+        assert!(validate_mount_mode("rw").is_err());
+        assert!(validate_mount_mode("").is_err());
+    }
+}

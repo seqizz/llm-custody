@@ -16,6 +16,20 @@ pkgs.writeText "llm-custody-selftest.sh" ''
   [ -d /nix/store ] || { echo "FAIL: /nix/store not visible"; exit 1; }
   [ -w /home/user ] || { echo "FAIL: /home/user not writable"; exit 1; }
   [ -d "$SELFTEST_CONFIGDIR" ] || { echo "FAIL: state dir not mounted"; exit 1; }
+  # /mnt is a dock: bound read-only from the runtime dir, where a live mount
+  # made in the holder's namespace propagates to. Writable would mean the
+  # agent can populate it itself.
+  if [ -d /mnt ]; then
+    if touch /mnt/.probe 2>/dev/null; then
+      rm -f /mnt/.probe
+      echo "FAIL: /mnt dock is writable from inside the jail"
+      exit 1
+    fi
+    echo "OK: /mnt dock present and read-only"
+  else
+    echo "FAIL: /mnt dock not mounted"
+    exit 1
+  fi
   if command -v git >/dev/null 2>&1; then
     echo "  git: $(git --version 2>&1)"
     hp=$(git config --get core.hooksPath 2>/dev/null || true)

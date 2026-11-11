@@ -55,7 +55,9 @@ Usage: llm-custody-toolbox [--dir PATH] [--pause] <command> [ARG...]
   serve             run the request broker for one jail (started by the
                     jail runner, not usually by hand)
                     [--broker-id ID] [--label TEXT] [--timeout PERIOD]
-                    [--uservar 0|1] [--notify-hook PATH]
+                    [--uservar 0|1] [--notify-hook PATH] [--mount-cmd PATH]
+                    --mount-cmd is the session's mount launcher; an approved
+                    mount request runs it as `add --mode M -- PATH`.
                     The hook runs on every queue change, with
                     <event> <id> <attr> <reason> <count> <label> as
                     separate arguments and no shell involved. Its
@@ -65,11 +67,14 @@ Usage: llm-custody-toolbox [--dir PATH] [--pause] <command> [ARG...]
                     what keeps expired leases from accumulating without
                     anyone remembering to look.
                     $LLMCUSTODY_TOOLBOX_AUTOPRUNE=0 turns that off.
-  requests          pending package requests from running jails
+  requests          pending package and mount requests from running jails
                     [--json] machine-readable, for a terminal integration
   answer            the same queue, interactively: pick a numbered row to
-                    approve or deny it without typing a request id
-  approve ID        install a pending request and unblock the jail
+                    approve or deny it without typing a request id (a mount
+                    then asks for its mode)
+  approve ID        grant a pending request and unblock the jail
+                    [--mode ro|full|limited|none|overlay] how a mount is
+                    attached (default ro; ignored for a package)
   deny ID           refuse it [--reason TEXT]
 
   (no args)         prompt for packages to add
@@ -447,6 +452,7 @@ fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
     let mut notify_hook = std::env::var_os("LLMCUSTODY_NOTIFY_HOOK")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
+    let mut mount_cmd = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -463,6 +469,13 @@ fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
                 match args.get(i) {
                     Some(v) => notify_hook = Some(PathBuf::from(v)),
                     None => return usage_err("--notify-hook needs a path"),
+                }
+            }
+            "--mount-cmd" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => mount_cmd = Some(PathBuf::from(v)),
+                    None => return usage_err("--mount-cmd needs a path"),
                 }
             }
             "--broker-id" => {
@@ -495,7 +508,7 @@ fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
     }
     broker::serve(
         tb.layout,
-        broker::ServeOpts { broker_id, label, timeout, uservar, notify_hook },
+        broker::ServeOpts { broker_id, label, timeout, uservar, notify_hook, mount_cmd },
     )
 }
 
@@ -508,9 +521,26 @@ fn cmd_requests(tb: &Toolbox, args: &[String]) -> Result<()> {
 }
 
 fn cmd_approve(tb: &Toolbox, args: &[String]) -> Result<()> {
-    match args.first() {
-        Some(id) if !id.starts_with('-') => brokerctl::approve(&tb.layout, id),
-        _ => usage_err("approve needs a request id - see the requests command"),
+    let mut id = None;
+    let mut mode = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mode" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => mode = v.clone(),
+                    None => return usage_err("--mode needs a value"),
+                }
+            }
+            a if a.starts_with('-') => return usage_err(format!("approve: unknown option: {a}")),
+            a => id = Some(a.to_string()),
+        }
+        i += 1;
+    }
+    match id {
+        Some(id) => brokerctl::approve(&tb.layout, &id, &mode),
+        None => usage_err("approve needs a request id - see the requests command"),
     }
 }
 

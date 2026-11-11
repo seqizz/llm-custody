@@ -1,9 +1,10 @@
 //! `custody-request`: the jail-side entry point.
 //!
-//! Reached inside the sandbox as `custody-request <attr> [--reason TEXT]`,
-//! which is the same binary under a different name. It sends one bounded
-//! message per attribute to the broker socket bound into the jail and waits
-//! for the operator's answer on the same connection.
+//! Reached inside the sandbox as `custody-request <attr> [--reason TEXT]` or
+//! `custody-request --mount <path> [--reason TEXT]`, which is the same binary
+//! under a different name. It sends one bounded message per attribute or
+//! path to the broker socket bound into the jail and waits for the operator's
+//! answer on the same connection.
 //!
 //! Nothing here is trusted by the broker: the validation in proto.rs runs on
 //! the broker side too, and this copy exists only to fail fast with a readable
@@ -26,17 +27,23 @@ pub fn usage() {
     print!(
         "\
 Usage: custody-request <nixpkgs-attr>... [--reason TEXT]
+       custody-request --mount <host-path>... [--reason TEXT]
 
 Ask the operator of this sandbox to add a package to the toolbox, which is
-the shared profile on this jail's PATH. Blocks until the request is answered.
+the shared profile on this jail's PATH, or to attach a host directory to this
+jail. Blocks until the request is answered.
 
-  --reason TEXT   why the package is needed; the operator sees this
+  --mount PATH    ask for a host path instead of a package (repeatable). The
+                  operator decides how it is attached - read-only, a synced
+                  copy, or the real tree - and the answer names where it is
+  --reason TEXT   why it is needed; the operator sees this
   --socket PATH   broker socket (default: {sock}, or ${env})
 
 Exit status: 0 approved, {denied} denied, {unanswered} nobody answered.
 
 Only bare nixpkgs attribute names are accepted - `ripgrep`, `python3Packages.black`.
 Flake references are refused: choosing a flake to fetch is the operator's call.
+Mount paths must be absolute.
 ",
         sock = proto::JAIL_SOCKET_PATH,
         env = proto::SOCKET_ENV,
@@ -46,7 +53,8 @@ Flake references are refused: choosing a flake to fetch is the operator's call.
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let mut attrs: Vec<String> = Vec::new();
+    // (kind, name) pairs in command-line order.
+    let mut wants: Vec<(&str, String)> = Vec::new();
     let mut reason = String::new();
     let mut socket: Option<PathBuf> = None;
 
@@ -71,18 +79,29 @@ pub fn run(args: &[String]) -> Result<()> {
                     None => return usage_err("--socket needs a value"),
                 }
             }
+            "--mount" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => wants.push((proto::KIND_MOUNT, v.clone())),
+                    None => return usage_err("--mount needs a host path"),
+                }
+            }
             a if a.starts_with('-') => return usage_err(format!("unknown option: {a}")),
-            a => attrs.push(a.to_string()),
+            a => wants.push((proto::KIND_PACKAGE, a.to_string())),
         }
         i += 1;
     }
 
-    if attrs.is_empty() {
+    if wants.is_empty() {
         usage();
-        return usage_err("name at least one nixpkgs attribute");
+        return usage_err("name at least one nixpkgs attribute, or --mount a host path");
     }
-    for a in &attrs {
-        proto::validate_attr(a)?;
+    for (kind, name) in &wants {
+        if *kind == proto::KIND_MOUNT {
+            proto::validate_mount_path(name)?;
+        } else {
+            proto::validate_attr(name)?;
+        }
     }
     proto::validate_reason(&reason)?;
 
@@ -93,12 +112,13 @@ pub fn run(args: &[String]) -> Result<()> {
             .unwrap_or_else(|| PathBuf::from(proto::JAIL_SOCKET_PATH))
     });
 
-    // Each attribute is its own request, so the operator can approve the one
-    // that matters and refuse the rest. Sequential on purpose: a reply usually
-    // needs a human, and three prompts at once is worse than three in a row.
+    // Each attribute or path is its own request, so the operator can approve
+    // the one that matters and refuse the rest. Sequential on purpose: a reply
+    // usually needs a human, and three prompts at once is worse than three in
+    // a row.
     let mut worst: Option<Error> = None;
-    for attr in &attrs {
-        match one(&socket, attr, &reason) {
+    for (kind, name) in &wants {
+        match one(&socket, kind, name, &reason) {
             Ok(()) => {}
             Err(e) => {
                 say(&e.msg);
@@ -124,7 +144,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 }
 
-fn one(socket: &PathBuf, attr: &str, reason: &str) -> Result<()> {
+fn one(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<()> {
     let mut stream = match UnixStream::connect(socket) {
         Ok(s) => s,
         Err(e) => {
@@ -135,8 +155,11 @@ fn one(socket: &PathBuf, attr: &str, reason: &str) -> Result<()> {
             ))
         }
     };
+    // `attr` carries the path of a mount request as well: one field, one
+    // queue, one set of hook arguments on the host side.
     let msg = json::Obj::new()
         .str("op", "request")
+        .str("kind", kind)
         .str("attr", attr)
         .str("reason", reason)
         .finish();
@@ -171,7 +194,10 @@ fn one(socket: &PathBuf, attr: &str, reason: &str) -> Result<()> {
             }
             proto::STATUS_OK => {
                 let commands = msg.str_field("commands");
-                if commands.is_empty() {
+                let guest = msg.str_field("guest");
+                if !guest.is_empty() {
+                    say(format!("{attr}: approved, mounted at {guest}"));
+                } else if commands.is_empty() {
                     say(format!("{attr}: approved and installed"));
                 } else {
                     say(format!("{attr}: approved, now on PATH: {commands}"));

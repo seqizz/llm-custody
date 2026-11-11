@@ -25,6 +25,10 @@ let
   # for the mid-session $RUNDIR/sync command the operator can run from
   # another terminal.
   syncBack = pkgs.lib.getExe (import ./sync-back.nix { inherit pkgs; });
+  # Mount controller (lib/mount-ctl.sh): every extra mount goes through it,
+  # at launch and while the session runs ($RUNDIR/mount, llm-custody-mount,
+  # the broker's approval of an agent's mount request).
+  mountCtl = pkgs.lib.getExe (import ./mount-ctl.nix { inherit pkgs; });
   # Guest path and symlink names of the operator-managed package profile
   # (lib/toolbox.nix), shared with ../toolbox and the launchers.
   toolbox = import ./toolbox.nix;
@@ -167,6 +171,12 @@ pkgs.writeShellApplication {
                              on exit, --overlay-workspace makes it
                              copy-on-write, --git full binds the real tree.
                              A single file is always bound directly.
+                             Mounts directly under /workspace or /mnt can be
+                             detached while the session runs, and more can be
+                             attached there: RUNDIR/mount (printed at launch),
+                             llm-custody-mount, or the agent's own
+                             custody-request --mount once you approve it.
+                             Any other GUESTPATH is fixed for the session.
       --ro-mount HOSTPATH[:GUESTPATH]
                              Extra read-only mount (repeatable). Same GUESTPATH
                              rules as --mount.
@@ -599,14 +609,22 @@ pkgs.writeShellApplication {
     TRACK_GIT=""
     # Every tree the sandbox sees through a copy or an overlay instead of a
     # direct bind, as manifest lines for the sync-back helper (see
-    # lib/sync-back.sh for the format). Filled in by the --git copy step and
-    # the extra-mount loop; written out to $SYNC_MANIFEST right before
-    # launch, which is also what $RUNDIR/sync and the exit trap consume.
-    SYNC_ENTRIES=()
-    SYNC_MANIFEST=""
+    # lib/sync-back.sh for the format). Appended to by the --git copy step
+    # and by the mount controller for every copy/overlay mount, at launch or
+    # later; $RUNDIR/sync, the dirty watcher and the exit trap all read it
+    # afresh, so a mount attached mid-session is synced like one from launch.
+    # Exists from here on, possibly empty, so every writer can simply append.
+    SYNC_MANIFEST="$RUNDIR/sync-manifest"
+    : > "$SYNC_MANIFEST"
     SYNC_REG=""
+    MOUNT_REG=""
     STATE_REG=""
     TOOLBOX_REG=""
+    # Guest directories a mount can be attached under while the session runs,
+    # and the host directories bound there (see the dock setup below).
+    DOCK_GUESTS=()
+    DOCK_SRCS=()
+    EXTRA_MOUNT_COUNT=0
     # The per-session package-request broker: its pid, so cleanup() can stop
     # it, and its runtime directory, so cleanup() can remove the registration
     # even when the broker was killed hard enough to skip its own handler.
@@ -625,15 +643,10 @@ pkgs.writeShellApplication {
     for glob in "''${SYNC_EXCLUDES[@]+"''${SYNC_EXCLUDES[@]}"}"; do
       SYNC_EXCLUDE_ARGS+=(--exclude "$glob")
     done
-    MOUNT_INDEX=0
-    # Names the empty bind sources under $RUNDIR/masks. Shared by every tree
-    # jail_mask_binds shadows (workspace and extra mounts alike), so it is
-    # declared here rather than next to one of its callers.
+    # Names the empty bind sources under $RUNDIR/masks for the workspace
+    # shadows (jail_mask_binds). Extra mounts keep theirs under their own
+    # record directory, see lib/mount-ctl.sh.
     MASK_INDEX=0
-    # Identity for the commits this runner makes itself (jail baseline, change
-    # tracking). The host .gitconfig may have none, or a signing key whose
-    # agent isn't reachable here.
-    JAIL_GIT_IDENT=(-c user.name=llm-custody -c user.email=llm-custody@localhost -c commit.gpgsign=false)
 
     HOLDER_PID=""
     SLIRP_PID=""
@@ -693,9 +706,12 @@ pkgs.writeShellApplication {
       printf 'workspace=%s\n' "$WORKSPACE_HOST"
       printf 'git=%s\n' "$GIT_MODE"
       printf 'overlay=%s\n' "$OVERLAY"
-      if [ "$1" = "sync" ]; then
-        printf 'sync=%s\n' "$RUNDIR/sync"
-      fi
+      # The launchers exist in every run, whatever the state: a session that
+      # bound everything straight through can still gain a copy mount later,
+      # and the sync command then has something to do.
+      printf 'sync=%s\n' "$RUNDIR/sync"
+      printf 'manifest=%s\n' "$SYNC_MANIFEST"
+      printf 'mount=%s\n' "$RUNDIR/mount"
       # Lets a consumer find this session's request queue and control socket
       # without knowing how broker ids are formed. Absent when the broker
       # failed to start, which is exactly when a consumer should not offer to
@@ -828,7 +844,9 @@ pkgs.writeShellApplication {
       # direct workspace bind did anyway - a headless `-p "..."` run that
       # silently threw its work away would be worse than the host mutation
       # it avoids) while overlays never do.
-      if [ -n "$SYNC_MANIFEST" ] && [ -f "$SYNC_MANIFEST" ]; then
+      # -s, not -f: the manifest exists from the start of every run and is
+      # empty for a session that bound everything straight through.
+      if [ -n "$SYNC_MANIFEST" ] && [ -s "$SYNC_MANIFEST" ]; then
         if [ -t 0 ]; then
           ${syncBack} --prompt "''${SYNC_EXCLUDE_ARGS[@]+"''${SYNC_EXCLUDE_ARGS[@]}"}" "$SYNC_MANIFEST" || true
         else
@@ -849,6 +867,7 @@ pkgs.writeShellApplication {
 
       if [ "$USERVAR_SET" = "1" ]; then
         emit_uservar llm_custody_sync ""
+        emit_uservar llm_custody_mount ""
         emit_uservar llm_custody_state ""
         emit_uservar llm_custody_jail ""
         emit_uservar llm_custody_dirty ""
@@ -863,6 +882,12 @@ pkgs.writeShellApplication {
         rm -f "$SYNC_REG"
         if [ "$(readlink "$(dirname "$SYNC_REG")/current" 2>/dev/null || true)" = "$RUNDIR/sync" ]; then
           rm -f "$(dirname "$SYNC_REG")/current"
+        fi
+      fi
+      if [ -n "$MOUNT_REG" ]; then
+        rm -f "$MOUNT_REG"
+        if [ "$(readlink "$(dirname "$MOUNT_REG")/current.mount" 2>/dev/null || true)" = "$RUNDIR/mount" ]; then
+          rm -f "$(dirname "$MOUNT_REG")/current.mount"
         fi
       fi
       # The broker itself was stopped above. Any request still waiting on it
@@ -950,67 +975,22 @@ pkgs.writeShellApplication {
         exit 1
       fi
       rm -rf "$RUNDIR/overlay-probe" "$RUNDIR/overlay-probe.log"
-      SYNC_ENTRIES+=("$(printf 'overlay\t%s\t-\t%s\t%s' "$RUNDIR/workspace-upper" "$WORKSPACE_HOST" "overlay workspace")")
+      printf 'overlay\t%s\t-\t%s\t%s\n' "$RUNDIR/workspace-upper" "$WORKSPACE_HOST" "overlay workspace" >> "$SYNC_MANIFEST"
     fi
 
-    # Copy a host tree into the jail runtime dir, minus its .git - used for
-    # the workspace and for every extra rw --mount under --git limited|none.
-    jail_copy_tree() {
-      local src="$1" dest="$2" entry
-      mkdir -p "$dest"
-      # dotglob picks up hidden entries (.config, .envrc) but never . or ..;
-      # .git is skipped explicitly. --reflink=auto makes this a cheap CoW
-      # clone on btrfs/xfs and a normal copy elsewhere.
-      shopt -s dotglob nullglob
-      for entry in "$src"/*; do
-        [ "''${entry##*/}" = ".git" ] && continue
-        cp -a --reflink=auto -- "$entry" "$dest/" || die "copying $entry into the jail copy at $dest failed"
-      done
-      shopt -u dotglob nullglob
-    }
+    # Tree helpers (copy, mask deletion, mask matching, baseline repo, change
+    # tracking) come from lib/jail-tree.sh, shared with the mount controller
+    # so a copy made at launch and one made mid-session are produced by the
+    # same code. Interpolated rather than sourced: the file is part of this
+    # script's text and shellcheck sees it as such.
+    ${builtins.readFile ./jail-tree.sh}
 
-    # Delete every --mask match from a jail copy. Deleting beats shadowing
-    # with an empty bind: with no .git next to them there is nothing left to
-    # recover the contents from.
-    #
-    # Globs are relative to the root of the tree they are applied to, and
-    # they are applied to *every* copied tree, not just the workspace: a
-    # pattern written to keep credentials out of the jail is meant to keep
-    # them out of a second checkout too.
-    #
-    # Must run before jail_init_repo/jail_track_init so neither baseline
-    # ever contains the masked paths. That ordering is also what keeps the
-    # masks out of the sync-back diff - copy and tracking baseline agree,
-    # so the host tree's own copies are never reported as deletions.
-    jail_apply_masks() {
-      local dir="$1" label="$2" removed count
-      [ "''${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
-      # Subshell so the cd and the glob options stay local to the expansion.
-      removed=$(
-        cd "$dir" || exit 0
-        shopt -s nullglob globstar
-        for m in "''${MASK_PATTERNS[@]}"; do
-          # shellcheck disable=SC2086
-          for entry in $m; do
-            rm -rf -- "''${entry:?mask target empty}" && printf '%s\n' "$entry"
-          done
-        done
-        # A failed rm must not take the whole runner down through errexit:
-        # the subshell's status is the loop's, and the assignment below
-        # propagates it.
-        exit 0
-      )
-      [ -n "$removed" ] || return 0
-      count=$(printf '%s\n' "$removed" | wc -l)
-      log "--mask: removed $count path(s) from $label"
-      while IFS= read -r line; do hint "$line"; done <<< "$removed"
-    }
-
-    # Mask a tree the sandbox sees through a direct bind (--ro-mount, and
-    # everything under --git full): there is no copy to delete from, so each
-    # match is shadowed by an empty read-only file/dir instead. Appends to
+    # Mask the workspace where the sandbox sees it through a direct bind
+    # (--git full): there is no copy to delete from, so each --mask match is
+    # shadowed by an empty read-only file/dir instead. Appends to
     # BWRAP_ARGS, so it has to be called after the bind it shadows - bwrap
-    # applies its mounts in argument order.
+    # applies its mounts in argument order. Extra mounts get the same
+    # treatment from lib/mount-ctl.sh, as holder-side binds.
     #
     # Weaker than the deletion jail_apply_masks does, and deliberately so
     # flagged below: an empty bind only covers the working copy, so a tree
@@ -1019,21 +999,7 @@ pkgs.writeShellApplication {
     jail_mask_binds() {
       local hostroot="$1" guestroot="$2" label="$3" entry
       local -a matches
-      [ "''${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
-      # NUL-delimited: a path with a newline in it would otherwise split
-      # into two bogus mask targets.
-      mapfile -d "" -t matches < <(
-        cd "$hostroot" || exit 0
-        shopt -s nullglob globstar
-        for m in "''${MASK_PATTERNS[@]}"; do
-          # shellcheck disable=SC2086
-          for entry in $m; do
-            [ -e "$entry" ] || [ -L "$entry" ] || continue
-            printf '%s\0' "$entry"
-          done
-        done
-        exit 0
-      )
+      mapfile -d "" -t matches < <(jail_mask_matches "$hostroot")
       [ "''${#matches[@]}" -gt 0 ] || return 0
       mkdir -p "$RUNDIR/masks"
       for entry in "''${matches[@]}"; do
@@ -1048,37 +1014,9 @@ pkgs.writeShellApplication {
       log "--mask: shadowed ''${#matches[@]} path(s) in $label with empty binds"
       if [ -d "$hostroot/.git" ]; then
         warn "$label is bound along with its .git, so masked content is still"
-        hint "readable from history (git show HEAD:<path>). Only a copy (--mount"
-        hint "under --git limited|none) removes it outright."
+        hint "readable from history (git show HEAD:<path>). Only a copy (--git"
+        hint "limited|none) removes it outright."
       fi
-    }
-
-    # Re-init a copy as a fresh repo with a single baseline commit, so in-jail
-    # git (status/diff/commit/branch) still works with no history to mine.
-    jail_init_repo() {
-      local dir="$1" src="$2" label="$3" branch
-      # Same branch name as the host checkout so prompts, status lines and
-      # the agent's own assumptions about the branch still line up.
-      branch=$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
-      git -C "$dir" init -q -b "$branch"
-      git -C "$dir" "''${JAIL_GIT_IDENT[@]}" add -A
-      git -C "$dir" "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
-      git -C "$dir" tag jail-baseline
-      vlog "$label: branch $branch, single commit tagged jail-baseline"
-    }
-
-    # Change tracking for the sync-back, in its own git dir under RUNDIR that
-    # is never mounted into the sandbox. Deliberately not the jail repo
-    # above: that one is writable by the agent, which could amend its
-    # baseline away and have changes sync back unreviewed. /.git/ is excluded
-    # so the jail repo's own objects never count as changes.
-    jail_track_init() {
-      local worktree="$1" track="$2"
-      GIT_DIR="$track" GIT_WORK_TREE="$worktree" git init -q
-      mkdir -p "$track/info"
-      printf '/.git/\n' > "$track/info/exclude"
-      GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "''${JAIL_GIT_IDENT[@]}" add -A
-      GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "''${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody tracking baseline" --allow-empty
     }
 
     # --git limited|none: hand the sandbox a copy of the working tree instead
@@ -1117,12 +1055,20 @@ pkgs.writeShellApplication {
         fi
 
         jail_track_init "$WORKSPACE_COPY" "$TRACK_GIT"
-        SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$WORKSPACE_COPY" "$TRACK_GIT" "$WORKSPACE_HOST" "jail workspace")")
+        printf 'copy\t%s\t%s\t%s\t%s\n' "$WORKSPACE_COPY" "$TRACK_GIT" "$WORKSPACE_HOST" "jail workspace" >> "$SYNC_MANIFEST"
       fi
     fi
 
+    # Into the holder's user and mount namespaces, plus its network
+    # namespace when the filter is on. -m is what lets a bind made here reach
+    # the jail: bwrap is started through this too, so the jail's mount tree
+    # is a slave copy of the holder's rather than of the host's.
     nsenter_holder() {
-      nsenter -U -n -t "$HOLDER_PID" --preserve-credentials -- "$@"
+      if [ "$NET_FILTER" = "1" ]; then
+        nsenter -U -m -n -t "$HOLDER_PID" --preserve-credentials -- "$@"
+      else
+        nsenter -U -m -t "$HOLDER_PID" --preserve-credentials -- "$@"
+      fi
     }
 
     # Host preflight. Nothing here is NixOS-specific support (anything else
@@ -1161,11 +1107,24 @@ pkgs.writeShellApplication {
       fi
     done
 
-    if [ "$NET_FILTER" = "1" ] && [ "$DRYRUN" != "1" ]; then
-      # Long-lived netns holder: slirp4netns and dnsmasq/nft attach to its
-      # /proc/<pid>/ns/{user,net} by PID; the final sandboxed process later
-      # re-enters the same pair via nsenter, sharing this network without
-      # also sharing the holder's mount/pid/ipc namespaces.
+    if [ "$DRYRUN" != "1" ]; then
+      # Long-lived namespace holder. Two jobs:
+      #
+      # Network (with the filter on): slirp4netns and dnsmasq/nft attach to
+      # its /proc/<pid>/ns/{user,net} by PID, and the sandboxed process later
+      # re-enters the same pair via nsenter, sharing this network.
+      #
+      # Mounts (always): the holder also owns a mount namespace, a copy of
+      # the host's with every mount made `shared` (--propagation shared).
+      # bwrap is started inside it and marks the jail's tree `slave` to it,
+      # so a bind made in the holder on a directory the jail has bound
+      # propagates into the jail at the same relative path, and an umount
+      # propagates back out. That is how lib/mount-ctl.sh attaches a tree
+      # to a running jail without touching the jail's own namespaces, and
+      # why every extra mount, launch-time ones included, is made here rather
+      # than by bwrap: one mechanism, and all of them detachable alike. The
+      # mounts stay invisible to the host (a slave never propagates upward)
+      # and die with the holder.
       #
       # Mapped via newuidmap/newgidmap (not `unshare --map-root-user`), on
       # purpose: a plain single-entry unprivileged mapping forces
@@ -1179,22 +1138,39 @@ pkgs.writeShellApplication {
       # rootless Incus containers already - /etc/subuid, /etc/subgid) that
       # perform the mapping from already-privileged code, so setgroups never
       # gets forced to "deny" and a wide range (not just identity 0) is
-      # genuinely mapped.
+      # genuinely mapped. Without the filter there is no dnsmasq, so a host
+      # without the helpers falls back to the plain mapping; the holder
+      # still has to be root inside its namespace, because util-linux
+      # `mount` refuses binds from anything else.
+      HAVE_IDMAP=1
       if ! command -v newuidmap >/dev/null || ! command -v newgidmap >/dev/null; then
-        err "newuidmap/newgidmap not found - required for network filtering."
-        hint "(NixOS: enabled by any rootless-container feature, e.g. Incus; see /etc/subuid)"
-        exit 1
+        HAVE_IDMAP=0
+        if [ "$NET_FILTER" = "1" ]; then
+          err "newuidmap/newgidmap not found - required for network filtering."
+          hint "(NixOS: enabled by any rootless-container feature, e.g. Incus; see /etc/subuid)"
+          exit 1
+        fi
       fi
-      vlog "starting private network namespace"
-      unshare --user --net -- sleep infinity &
+      vlog "starting namespace holder"
+      HOLDER_ARGS=(--user --mount --propagation shared)
+      [ "$NET_FILTER" = "1" ] && HOLDER_ARGS+=(--net)
+      [ "$HAVE_IDMAP" = "1" ] || HOLDER_ARGS+=(--map-root-user)
+      unshare "''${HOLDER_ARGS[@]}" -- sleep infinity &
       HOLDER_PID=$!
-      for _ in $(seq 1 50); do
-        [ -e "/proc/$HOLDER_PID/ns/net" ] && break
+      # The ns links exist from the fork on, pointing at *our* namespaces
+      # until unshare has actually run; the mapping below must land in the
+      # new user namespace, so wait for the link to move away from ours.
+      for _ in $(seq 1 100); do
+        [ "$(readlink "/proc/$HOLDER_PID/ns/user" 2>/dev/null || true)" != "$(readlink /proc/self/ns/user)" ] && break
         sleep 0.02
       done
-      newuidmap "$HOLDER_PID" 0 "$(id -u)" 1 1 100000 65536
-      newgidmap "$HOLDER_PID" 0 "$(id -g)" 1 1 100000 65536
+      if [ "$HAVE_IDMAP" = "1" ]; then
+        newuidmap "$HOLDER_PID" 0 "$(id -u)" 1 1 100000 65536
+        newgidmap "$HOLDER_PID" 0 "$(id -g)" 1 1 100000 65536
+      fi
+    fi
 
+    if [ "$NET_FILTER" = "1" ] && [ "$DRYRUN" != "1" ]; then
       nsenter_holder ip link set lo up
 
       # PID is positional, not a --pid flag (slirp4netns's own usage: `slirp4netns
@@ -1423,6 +1399,37 @@ pkgs.writeShellApplication {
       WS_SPEC=(--bind "$WORKSPACE_BIND" "$WORKSPACE_GUEST")
     fi
 
+    # Docks: the guest directories a mount can be attached under while the
+    # session runs. Each is a host directory under $RUNDIR bound read-only
+    # into the jail; the jail's copy of that bind is a propagation slave of
+    # the holder's mount, so a bind the holder makes on a subdirectory shows
+    # up inside the jail, and an umount takes it away again (see the holder
+    # setup above and lib/mount-ctl.sh). /workspace is one when it is the
+    # container the workspace hangs under (not with --same-path, and not
+    # when the workspace is / itself), /mnt always.
+    #
+    # Read-only, so the agent cannot populate a dock with its own entries (a
+    # planted symlink where the operator is about to mount would redirect
+    # the holder-side bind). Not via --ro-bind, though: that remounts every
+    # submount it finds read-only as well, which would turn a launch-time
+    # rw --mount already attached under the dock read-only. --bind keeps
+    # each submount's own flags and --remount-ro is non-recursive, so only
+    # the dock directory itself ends up read-only. The mountpoint of the
+    # workspace bind inside it is created here, since bwrap cannot create
+    # it in a read-only tree.
+    DOCK_ROOT="$RUNDIR/dock"
+    DOCK_SPEC=()
+    if [ "$WORKSPACE_GUEST" != "$WORKSPACE_ROOT" ] && [ "$SAME_PATH" != "1" ]; then
+      DOCK_GUESTS+=("$WORKSPACE_ROOT")
+      DOCK_SRCS+=("$DOCK_ROOT/workspace")
+      DOCK_SPEC+=(--bind "$DOCK_ROOT/workspace" "$WORKSPACE_ROOT" --remount-ro "$WORKSPACE_ROOT")
+      [ "$DRYRUN" = "1" ] || mkdir -p "$DOCK_ROOT/workspace/$WORKSPACE_NAME"
+    fi
+    DOCK_GUESTS+=(/mnt)
+    DOCK_SRCS+=("$DOCK_ROOT/mnt")
+    DOCK_SPEC+=(--bind "$DOCK_ROOT/mnt" /mnt --remount-ro /mnt)
+    [ "$DRYRUN" = "1" ] || mkdir -p "$DOCK_ROOT/mnt" "$DOCK_ROOT/fixed"
+
     BWRAP_ARGS=(
       --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
       --die-with-parent --new-session
@@ -1447,6 +1454,9 @@ pkgs.writeShellApplication {
       ${extraEnvArgs}
       --chdir "$WORKSPACE_GUEST"
       --ro-bind /nix/store /nix/store
+      # Docks before the workspace: the workspace bind lands inside the
+      # /workspace dock, and bwrap mounts in argument order.
+      "''${DOCK_SPEC[@]}"
       "''${WS_SPEC[@]}"
       --bind "$STATE_DIR" /home/user/${toolDefaults.configDirName}
     )
@@ -1669,17 +1679,39 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv LINES "''${STTY_SIZE%% *}" --setenv COLUMNS "''${STTY_SIZE##* }")
     fi
 
-    # Extra binds land under /workspace by default (see WORKSPACE_ROOT
-    # above), named after the host path's last component. Targets are
-    # tracked so two sources can never silently end up on the same path -
-    # the second bind would shadow the first, and the agent would see one
-    # tree where two were asked for. --same-path keeps host paths verbatim,
-    # since that mode exists specifically to make in-jail paths match the
-    # host's.
-    MOUNT_TARGETS=("$WORKSPACE_GUEST")
-    MOUNT_SOURCES=("$WORKSPACE_HOST")
+    # Everything the mount controller needs about this session, for the
+    # launch-time mounts below and for every later attach/detach: the holder
+    # to enter, the docks, the mask globs and sync excludes. declare -p
+    # output is bash's own serialisation, so a glob or a path with a space
+    # survives the round trip unchanged. Host-side only ($RUNDIR is never
+    # mounted into the sandbox), so sourcing it is sourcing our own data.
+    if [ "$DRYRUN" != "1" ]; then
+      {
+        declare -p HOLDER_PID MASK_PATTERNS SYNC_EXCLUDES SYNC_MANIFEST
+        declare -p DOCK_GUESTS DOCK_SRCS WORKSPACE_GUEST VERBOSITY
+      } > "$RUNDIR/mount.env"
+      # The launcher a second terminal (or the broker) runs: the controller
+      # with this session's runtime dir baked in. %q because $RUNDIR inherits
+      # --tmpdir, which may well contain a space or a quote.
+      printf '#!%s\nexec %s %s "$@"\n' \
+        "${pkgs.bash}/bin/sh" "${mountCtl}" "$(printf '%q' "$RUNDIR")" > "$RUNDIR/mount"
+      chmod +x "$RUNDIR/mount"
+    fi
+
+    # Extra mounts land under /workspace by default (see WORKSPACE_ROOT
+    # above), named after the host path's last component. --same-path keeps
+    # host paths verbatim, since that mode exists specifically to make
+    # in-jail paths match the host's. Each one is attached by the mount
+    # controller, exactly as a mount added mid-session would be; the
+    # controller refuses two mounts on one guest path, so the second bind
+    # can never silently shadow the first.
+    #
+    # Read-write mounts get the same host-tree protection as the workspace,
+    # chosen by the same flags - an agent let loose in a second checkout
+    # can do exactly as much damage there as in the main one, so a direct
+    # bind only when --git full explicitly asks for the real tree.
     for spec in "''${EXTRA_MOUNTS[@]+"''${EXTRA_MOUNTS[@]}"}"; do
-      mode="''${spec##*:}"
+      access="''${spec##*:}"
       paths="''${spec%:*}"
       if [[ "$paths" == *:* ]]; then
         hostpath="''${paths%%:*}"; guestpath="''${paths#*:}"
@@ -1709,74 +1741,26 @@ pkgs.writeShellApplication {
         # relative to the sandbox cwd - bwrap would reject the latter anyway.
         guestpath="$WORKSPACE_ROOT/$guestpath"
       fi
-      for i in "''${!MOUNT_TARGETS[@]}"; do
-        if [ "''${MOUNT_TARGETS[$i]}" = "$guestpath" ]; then
-          err "two mounts resolve to the same jail path: $guestpath"
-          hint "already taken by: ''${MOUNT_SOURCES[$i]}"
-          hint "conflicting with: $hostpath"
-          hint "give one an explicit target, e.g. --mount $hostpath:$WORKSPACE_ROOT/<other-name>"
-          exit 1
-        fi
-      done
-      MOUNT_TARGETS+=("$guestpath")
-      MOUNT_SOURCES+=("$hostpath")
-      if [ "$mode" = "ro" ]; then
-        BWRAP_ARGS+=(--ro-bind "$hostpath" "$guestpath")
-        # Right after the bind it shadows: bwrap honours argument order.
-        jail_mask_binds "$hostpath" "$guestpath" "$guestpath"
-        continue
-      fi
-
-      # Extra rw mounts get the same host-tree protection as the workspace,
-      # chosen by the same flags - an agent let loose in a second checkout
-      # can do exactly as much damage there as in the main one, so a direct
-      # bind only when --git full explicitly asks for the real tree.
-      #
-      # --mask applies to every tree, not just the workspace: its globs are
-      # relative to whichever tree root they are expanded against, and a
-      # pattern written to keep credentials out of the jail is meant to keep
-      # them out of a second checkout too. Copies get the deletion, direct
-      # binds the weaker empty-bind shadow, same split as the workspace.
-      MOUNT_INDEX=$((MOUNT_INDEX+1))
-      if [ ! -d "$hostpath" ]; then
-        # Single file: nothing to copy into a repo or diff against a
-        # baseline, so it stays a direct bind in every mode.
-        if [ "$GIT_MODE" != "full" ] || [ "$OVERLAY" = "1" ]; then
-          warn "--mount $hostpath is a file - bound directly, writes hit the host immediately"
-        fi
-        BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
-        continue
-      fi
-      if [ "$GIT_MODE" != "full" ]; then
-        mount_copy="$RUNDIR/mounts/$MOUNT_INDEX"
-        mount_track="$RUNDIR/mounts/$MOUNT_INDEX.git"
-        if [ "$DRYRUN" = "1" ]; then
-          log "--git $GIT_MODE would copy $hostpath into $RUNDIR (not done for --dry-run)"
-        else
-          log "--git $GIT_MODE - copying $hostpath into $RUNDIR (history stays on the host)"
-          jail_copy_tree "$hostpath" "$mount_copy"
-          jail_apply_masks "$mount_copy" "the copy of $hostpath"
-          if [ "$GIT_MODE" = "limited" ] && [ -d "$hostpath/.git" ]; then
-            jail_init_repo "$mount_copy" "$hostpath" "jail repo for $guestpath"
-          fi
-          jail_track_init "$mount_copy" "$mount_track"
-          SYNC_ENTRIES+=("$(printf 'copy\t%s\t%s\t%s\t%s' "$mount_copy" "$mount_track" "$hostpath" "mount $guestpath")")
-        fi
-        BWRAP_ARGS+=(--bind "$mount_copy" "$guestpath")
+      if [ "$access" = "ro" ]; then
+        mmode="ro"
       elif [ "$OVERLAY" = "1" ]; then
-        # Upper and work dir must share a filesystem (overlayfs requirement);
-        # both under $RUNDIR, which the --overlay-workspace preflight already
-        # probed for unprivileged-overlay support.
-        mkdir -p "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$RUNDIR/mounts/$MOUNT_INDEX-work"
-        SYNC_ENTRIES+=("$(printf 'overlay\t%s\t-\t%s\t%s' "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$hostpath" "overlay mount $guestpath")")
-        BWRAP_ARGS+=(
-          --overlay-src "$hostpath"
-          --overlay "$RUNDIR/mounts/$MOUNT_INDEX-upper" "$RUNDIR/mounts/$MOUNT_INDEX-work" "$guestpath"
-        )
-        jail_mask_binds "$hostpath" "$guestpath" "$guestpath"
+        mmode="overlay"
       else
-        BWRAP_ARGS+=(--bind "$hostpath" "$guestpath")
-        jail_mask_binds "$hostpath" "$guestpath" "$guestpath"
+        mmode="$GIT_MODE"
+      fi
+      EXTRA_MOUNT_COUNT=$((EXTRA_MOUNT_COUNT+1))
+      if [ "$DRYRUN" = "1" ]; then
+        log "would mount $hostpath at $guestpath (mode $mmode; nothing copied for --dry-run)"
+        continue
+      fi
+      # --allow-fixed: a guest path outside every dock is still honoured at
+      # launch, through a bwrap bind of the holder-side mountpoint; such a
+      # mount just cannot be detached before the session ends.
+      mount_out=$("$RUNDIR/mount" add --mode "$mmode" --guest "$guestpath" --allow-fixed -- "$hostpath") ||
+        die "mounting $hostpath failed"
+      IFS=$'\t' read -r _ mount_point mount_fixed <<< "$mount_out"
+      if [ "$mount_fixed" = "1" ]; then
+        BWRAP_ARGS+=(--bind "$mount_point" "$guestpath")
       fi
     done
 
@@ -1805,11 +1789,7 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv SELFTEST_DOMAIN "${selftestDomain}")
       BWRAP_ARGS+=(--setenv SELFTEST_GITMODE "$GIT_MODE")
       BWRAP_ARGS+=(--ro-bind "${selftestProbe}" /selftest.sh)
-      if [ "$NET_FILTER" = "1" ]; then
-        nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
-      else
-        bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
-      fi
+      nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
       exit $?
     fi
 
@@ -1926,9 +1906,11 @@ pkgs.writeShellApplication {
       # dirty-count user var is only emitted on change). The operator
       # discovers requests with `llm-custody-toolbox requests`, not by
       # watching this.
+      # --mount-cmd: an approved mount request runs this session's mount
+      # launcher, so the broker never grows a second way of attaching a tree.
       ${toolboxCli} --dir "$TOOLBOX_DIR" serve \
         --broker-id "$$" --label "${name} $WORKSPACE_HOST" \
-        --uservar "$USERVAR_ON" \
+        --uservar "$USERVAR_ON" --mount-cmd "$RUNDIR/mount" \
         >"$RUNDIR/broker.log" 2>&1 &
       BROKER_PID=$!
       # Readiness is observed, not slept for (same reason as slirp4netns and
@@ -1966,14 +1948,13 @@ pkgs.writeShellApplication {
     # wanted: each sync advances the tracking baseline, so the next one only
     # reports what changed since.
     #
+    # Registered for every run, even one whose manifest is empty at launch:
+    # a copy mount attached later lands in the same manifest, and the
+    # launcher has to already be where the operator's key looks for it.
+    #
     # Deliberately *not* reachable from inside the sandbox: $RUNDIR is not
     # mounted there, so the agent cannot sync its own work out unreviewed.
-    if [ "''${#SYNC_ENTRIES[@]}" -gt 0 ]; then
-      SYNC_MANIFEST="$RUNDIR/sync-manifest"
-      : > "$SYNC_MANIFEST"
-      for entry in "''${SYNC_ENTRIES[@]}"; do
-        printf '%s\n' "$entry" >> "$SYNC_MANIFEST"
-      done
+    if [ "$DRYRUN" != "1" ]; then
       # %q on the manifest path and on every exclude glob: $RUNDIR inherits
       # --tmpdir, which may well contain a space or a quote, and a glob is
       # by definition full of characters a shell would otherwise act on.
@@ -1986,24 +1967,37 @@ pkgs.writeShellApplication {
         "$(printf '%q' "$SYNC_MANIFEST")" > "$RUNDIR/sync"
       chmod +x "$RUNDIR/sync"
 
-      # Stable handle for anything that wants to find the live session
+      # Stable handles for anything that wants to find the live session
       # without parsing terminal output: a per-pid symlink plus `current`
-      # for the most recent run. Concurrent runs each keep their own pid
-      # entry; `current` is simply the latest to start.
+      # for the most recent run, for the sync launcher and the mount
+      # launcher alike. Concurrent runs each keep their own pid entry;
+      # `current` is simply the latest to start.
       mkdir -p "$REG_DIR"
       SYNC_REG="$REG_DIR/$$.sync"
       ln -sfn "$RUNDIR/sync" "$SYNC_REG"
       ln -sfn "$RUNDIR/sync" "$REG_DIR/current"
+      MOUNT_REG="$REG_DIR/$$.mount"
+      ln -sfn "$RUNDIR/mount" "$MOUNT_REG"
+      ln -sfn "$RUNDIR/mount" "$REG_DIR/current.mount"
 
       vlog "mid-session sync: $RUNDIR/sync (also $REG_DIR/current, or llm-custody-sync)"
+      vlog "live mounts: $RUNDIR/mount add|remove|list (also $REG_DIR/current.mount, or llm-custody-mount)"
 
-      # Terminals that understand OSC 1337 SetUserVar get the path as a
-      # variable too, which is what makes a one-key sync binding possible.
+      # Terminals that understand OSC 1337 SetUserVar get both paths as
+      # variables too, which is what makes a one-key binding possible.
       if [ "$USERVAR_ON" = "1" ]; then
         emit_uservar llm_custody_sync "$RUNDIR/sync"
+        emit_uservar llm_custody_mount "$RUNDIR/mount"
         USERVAR_SET=1
       fi
-      publish_state sync
+      # The state names what the launch produced: isolated trees to fold
+      # back, or everything bound straight through. A consumer told
+      # `direct` still gets the sync path, for the mount attached later.
+      if [ -s "$SYNC_MANIFEST" ]; then
+        publish_state sync
+      else
+        publish_state direct
+      fi
 
       # Unsynced-change indicator. The count of paths the jail has changed
       # but not yet synced goes into $RUNDIR/dirty (atomically renamed, so a
@@ -2014,22 +2008,15 @@ pkgs.writeShellApplication {
       # prompt at exit, which is late to learn it.
       #
       # The file exists from the start so a consumer polling it does not
-      # have to special-case "not there yet".
+      # have to special-case "not there yet". Started even over an empty
+      # manifest: it re-reads the manifest on every pass, so a copy mount
+      # attached later is counted from then on.
       if [ "$WATCH_INTERVAL" -gt 0 ]; then
         printf '0\n' > "$RUNDIR/dirty"
         start_dirty_watcher &
         DIRTY_PID=$!
         vlog "watching for unsynced changes every ''${WATCH_INTERVAL}s ($RUNDIR/dirty)"
       fi
-    elif [ "$DRYRUN" != "1" ]; then
-      # No isolated tree in this run (--git full without --overlay-workspace,
-      # or nothing mounted rw at all): the sandbox writes through to the host
-      # trees, so there is nothing to fold back and no sync launcher to
-      # register. The state record still goes out - an operator hitting their
-      # sync key or running llm-custody-sync needs "already on the host" and
-      # "no jail running" told apart, and without it the two look identical
-      # from outside.
-      publish_state direct
     fi
 
     # Session resume: translate the generic -c/--continue (resume most
@@ -2087,7 +2074,7 @@ pkgs.writeShellApplication {
         net_line="''${C_RED}UNFILTERED''${C_RESET} - the sandbox can reach anything"
       fi
 
-      mounts_line="$((''${#MOUNT_TARGETS[@]} - 1)) extra"
+      mounts_line="$EXTRA_MOUNT_COUNT extra, live under ''${DOCK_GUESTS[*]}"
       [ "''${#MASK_PATTERNS[@]}" -gt 0 ] && mounts_line="$mounts_line, ''${#MASK_PATTERNS[@]} mask pattern(s)"
       [ "''${#SYNC_EXCLUDES[@]}" -gt 0 ] && mounts_line="$mounts_line, ''${#SYNC_EXCLUDES[@]} sync exclude(s)"
 
@@ -2156,10 +2143,8 @@ pkgs.writeShellApplication {
     # misreport how long the agent actually ran).
     SECONDS=0
     LAUNCHED=1
-    if [ "$NET_FILTER" = "1" ]; then
-      nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"
-    else
-      bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"
-    fi
+    # Always through the holder, filter or not: its mount namespace is what
+    # live mounts propagate through.
+    nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"
   '';
 }

@@ -103,7 +103,7 @@ llm-custody-<tool> [options] [-- tool-args...]
 | `--toolbox-dir PATH` | Operator package profile, bound read-only at `/toolbox` and prepended to the jail's PATH (see [Providing packages](#providing-packages)) | `--state-dir/toolbox` |
 | `--same-path` | Mount the workspace and every `--mount` at their host paths instead of under `/workspace` | off |
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
-| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable). Isolated like the workspace: copy + sync-back under `--git limited/none`, copy-on-write with `--overlay-workspace`, real tree with `--git full`. A single file is always bound directly | `/workspace/<basename HOSTPATH>` |
+| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable). Isolated like the workspace: copy + sync-back under `--git limited/none`, copy-on-write with `--overlay-workspace`, real tree with `--git full`. A single file is always bound directly. Detachable while the session runs when GUESTPATH is directly under `/workspace` or `/mnt`, see [Live mounts](#live-mounts) | `/workspace/<basename HOSTPATH>` |
 | `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | `/workspace/<basename HOSTPATH>` |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
@@ -241,8 +241,28 @@ ID      PACKAGE     AGE  JAIL               REASON
 $ llm-custody-toolbox approve 41207.1
 ```
 
-Approval goes through the same `add` the host CLI uses, so the package is
-installed, leased, and on the PATH by the time the client unblocks. It
+The same channel carries a request for a host directory:
+
+```bash
+custody-request --mount /srv/datasets/2024 --reason "The task reads the raw exports"
+```
+
+```console
+$ llm-custody-toolbox requests
+ID      REQUEST                    AGE  JAIL               REASON
+41207.2 mount /srv/datasets/2024   1m   pi /workspace/foo  The task reads the raw exports
+$ llm-custody-toolbox approve 41207.2 --mode ro
+```
+
+The agent names a path and a reason, nothing else; how the tree is attached
+is the operator's choice at approval (`--mode ro|full|limited|none|overlay`,
+default read-only, and the interactive `answer` asks for it). Approval runs
+the session's own mount launcher, the same one a keybinding runs - see
+[Live mounts](#live-mounts) - and the client is told where the tree landed
+(`/workspace/2024` here).
+
+Approval of a package goes through the same `add` the host CLI uses, so the
+package is installed, leased, and on the PATH by the time the client unblocks. It
 appears in every jail sharing that **toolbox**, which is not the same as
 every jail: a runner starts its broker with its own `--toolbox-dir`, so a
 session under a different `--state-dir` has a different profile and will not
@@ -266,7 +286,7 @@ Each jail runner starts its own broker (`llm-custody-toolbox serve`) and binds
 
 | Socket | Bound into the jail | Verbs |
 |--------|--------------------|-------|
-| `request.sock` | yes, at `/run/custody-request.sock` | `request` |
+| `request.sock` | yes, at `/run/custody-request.sock` | `request` (a package or a mount) |
 | `control.sock` | **never** | `list`, `approve`, `deny` |
 
 That split is the whole authorization model, and it is the reason there are
@@ -276,7 +296,10 @@ connection from a human's. The jail-facing socket parses no other verb at all.
 Requests from it are additionally restricted to **bare nixpkgs attributes** -
 `ripgrep`, `python3Packages.black` - because a flake reference is a URL, and
 choosing a URL to fetch with the host's network and the host's nix is the
-operator's call. Host-side `add` still takes full refs.
+operator's call. Host-side `add` still takes full refs. A mount request is
+restricted the same way to an absolute path with no `..` in it, and carries
+no mode: read-write access to a real host tree is never something the jail
+gets to ask for by name.
 
 ### Being told, instead of polling
 
@@ -623,6 +646,73 @@ resume sessions started inside the sandbox (host pi state stays untouched).
 The per-tool translation table lives in `tools.nix` (`resumeFlags`), so a
 future tool with different flag names just declares its own there.
 
+### Live mounts
+
+A session's extra mounts are not fixed at launch. Any tree whose guest path
+is directly under `/workspace` or `/mnt` (which is every `--mount` and
+`--ro-mount` without an explicit target) can be detached while the agent
+runs, and more can be attached there, by the operator from a second
+terminal or by the agent asking through `custody-request --mount` and the
+operator approving. The CLI parameters are unchanged; what changed is
+that every extra mount, launch-time ones included, now goes through one
+controller.
+
+```bash
+llm-custody-mount add /srv/datasets/2024                     # read-only, at /workspace/2024
+llm-custody-mount add --mode limited /devel/other-checkout   # synced copy, like --git limited
+llm-custody-mount add --mode full --guest /mnt/scratch /tmp/scratch
+llm-custody-mount list
+llm-custody-mount remove 2024                                # by name or by guest path
+```
+
+`add` takes the same modes the workspace has (`ro`, `full`, `limited`,
+`none`, `overlay`; `copy` is an alias for `limited`), defaulting to
+read-only. A copy or overlay mount joins the session's sync manifest the
+moment it is attached, so the dirty indicator counts it, `llm-custody-sync`
+folds it back, and the exit trap reviews it like one from launch. `remove`
+of such a mount offers the sync-back first (`--auto` syncs a copy without
+asking, `--discard` skips it), then detaches.
+
+`llm-custody-mount` is a front end over the session registry, like
+`llm-custody-sync`: it finds the most recent session's launcher
+(`$XDG_RUNTIME_DIR/llm-custody/current.mount`, `--pid` for another one), and
+with no command at all it prompts for a path and mounts it read-only - the
+shape a terminal keybinding wants. The launcher path is also published as
+the `llm_custody_mount` user var next to `llm_custody_sync`, and `--pause`
+keeps a spawned pane open over the output. A session started by a runner
+from before live mounts existed has no launcher and is reported as such.
+
+How it works without touching the jail: the namespace holder the runner
+starts (`unshare --user --mount --propagation shared`, plus `--net` with
+the filter on) owns a mount namespace in which every mount is `shared`,
+and bwrap, started inside it, marks the jail's tree `slave` to it. The
+runner binds two empty directories from the runtime dir into the jail,
+`/workspace` and `/mnt` (the "docks", read-only inside the jail so the
+agent cannot populate them); a bind the holder makes
+on a subdirectory of one of them propagates into the jail at the same
+relative path, and an umount in the holder propagates the same way. The
+jail's own namespaces are never entered, nothing in the jail can do any of
+this (`CAP_SYS_ADMIN` is dropped there), and the holder's mounts are
+invisible to the host - a slave never propagates upward - and die with it.
+Read-only arrives read-only because the controller's `mount` (util-linux
+from nixpkgs) sets the flag through the new mount API before attaching,
+rather than remounting after the propagation has already copied the mount.
+
+Two consequences worth knowing. A guest path *not* directly under a dock
+(`--mount /a:/data`, or anything under `--same-path`) is still honoured at
+launch, through a bwrap bind of the holder-side mountpoint, but such a
+mount is **fixed**: `list` says so and `remove` refuses it, because the
+clone bwrap made has no parent in the holder's propagation tree for an
+umount to reach. And detaching a tree something in the jail still has open
+(a shell with its cwd inside is enough) falls back to a lazy umount: the
+mount is gone from the jail's view, and that process keeps a dangling cwd.
+
+Mode `full` on a live mount is the same host-mutation surface `--git
+full` is for the workspace, minus the safety snapshot - the controller
+binds `.git/hooks` read-only on top and in-jail git keeps its forced
+`core.hooksPath`, but the tree is the real one. Prefer `limited` unless the
+agent needs to see the host's edits as they happen.
+
 ### Repo history exposure (`--git`)
 
 By default (`--git limited`) the sandbox does **not** see your `.git`. The
@@ -790,7 +880,9 @@ var `llm_custody_state`.
 | `workspace` | host path of the workspace |
 | `git` | `full` / `limited` / `none` |
 | `overlay` | `1` with `--overlay-workspace`, `0` otherwise |
-| `sync` | the mid-session sync command - present only when `state=sync` |
+| `sync` | the mid-session sync command. Always present now that a copy mount can be attached after launch; `state=direct` means nothing was isolated *at launch* |
+| `manifest` | the sync manifest the command reads, empty for a session with nothing isolated |
+| `mount` | the session's mount launcher (`add` / `remove` / `list`), see [Live mounts](#live-mounts) |
 
 A record rather than more single-purpose variables, or magic values stuffed
 into existing ones: the questions a consumer asks keep growing (is there
@@ -976,11 +1068,15 @@ bound paths are visible inside it:
   bound read-only instead, so system-installed tools are available there
   too)
 - `/nix/store` (read-only)
+- `/workspace` and `/mnt` themselves are empty directories from the runtime
+  dir, bound read-only: the docks a live mount propagates into (see
+  [Live mounts](#live-mounts)). Read-only so the agent cannot populate them
 - Any directories added via `--mount` / `--ro-mount`, by default under
-  `/workspace` next to the workspace itself. A read-write one is isolated
-  the same way the workspace is (copy, overlay or real tree, per `--git` /
-  `--overlay-workspace`) and reviewed on the way back out - see
-  [Syncing changes back](#syncing-changes-back)
+  `/workspace` next to the workspace itself, and anything attached later
+  with `llm-custody-mount` or an approved `custody-request --mount`. A
+  read-write one is isolated the same way the workspace is (copy, overlay
+  or real tree, per `--git` / `--overlay-workspace`) and reviewed on the way
+  back out - see [Syncing changes back](#syncing-changes-back)
 
 The sandboxed process runs without `CAP_SYS_ADMIN` (bwrap
 `--cap-drop CAP_SYS_ADMIN`), so it cannot create bind mounts or remount
@@ -1141,18 +1237,24 @@ whitelisted domains unless you pass `--no-net-filter`.
 |    - parses CLI args                                     |
 |    - runs launchers/<tool>.nix's bootstrapScript         |
 |      directly against the real host state dir            |
-|    - unshare --user --net (+ newuidmap/newgidmap) holder  |
+|    - unshare --user --mount --propagation shared [--net]  |
+|      (+ newuidmap/newgidmap) namespace holder             |
 |    - slirp4netns for outbound connectivity                |
 |    - dnsmasq (domain whitelist) + nftables (IP gate)      |
 |    - opens seccomp fd (lib/seccomp-denylist.nix)          |
-|    - starts the package-request broker (toolbox/, serve)  |
-|    - nsenter's into the netns holder, execs bwrap ...     |
+|    - attaches every --mount in the holder (lib/mount-ctl) |
+|    - starts the request broker (toolbox/, serve)          |
+|    - nsenter's into the holder, execs bwrap ...           |
+|    - on demand (lib/mount-ctl.sh): attaches/detaches      |
+|      trees under /workspace and /mnt by propagation       |
 |    - on exit (and on demand, lib/sync-back.sh): reviews   |
 |      the jail copies/overlays back into the host trees    |
 |                                                            |
 |  +-- bwrap sandbox (mount/pid/ipc/uts/user ns) --------+ |
 |  |  /nix/store         <- ro-bind                        | |
+|  |  /workspace, /mnt   <- ro-bind docks (live mounts)    | |
 |  |  /workspace/<name>  <- bind (rw, cwd)                 | |
+|  |  /workspace/<other> <- propagated from the holder     | |
 |  |  /home/user/<cfg>   <- bind (rw, jail-private state)  | |
 |  |  /toolbox           <- ro-bind (operator packages)    | |
 |  |  /run/llmcustody-bin <- ro-bind (git wrapper,          | |

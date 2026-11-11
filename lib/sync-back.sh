@@ -286,6 +286,15 @@ sync_overlay() {
   fi
 }
 
+# A manifest with no entries is the normal state of a session that bound
+# everything straight through (and of any session before its first copy
+# mount). The exit trap skips those; a mid-session run deserves an answer
+# rather than silence.
+if [ "$MODE" = "prompt" ] && ! grep -q '^[a-z]' "$MANIFEST" 2>/dev/null; then
+  printf 'llm-custody: nothing to sync - no tree in this session is isolated from the host\n' >&2
+  exit 0
+fi
+
 # fd 3 for the manifest so the prompts above keep stdin/the tty to
 # themselves.
 while IFS=$'\t' read -r type src track host label <&3; do

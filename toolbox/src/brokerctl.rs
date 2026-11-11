@@ -22,10 +22,28 @@ const ANSWER_TIMEOUT: Option<Duration> = None;
 /// One pending request, flattened across brokers for display.
 struct Row {
     id: String,
+    kind: String,
     attr: String,
     reason: String,
     age: u64,
     jail: String,
+}
+
+/// A row from a broker built before mounts existed carries no kind.
+fn kind_of(r: &Json) -> String {
+    match r.str_field("kind") {
+        "" => proto::KIND_PACKAGE.to_string(),
+        k => k.to_string(),
+    }
+}
+
+/// How a request reads in a listing: the attribute, or `mount PATH`.
+fn describe(kind: &str, attr: &str) -> String {
+    if kind == proto::KIND_MOUNT {
+        format!("mount {attr}")
+    } else {
+        attr.to_string()
+    }
 }
 
 fn collect(layout: &Layout, quiet: bool) -> (Vec<Row>, usize) {
@@ -49,6 +67,7 @@ fn collect(layout: &Layout, quiet: bool) -> (Vec<Row>, usize) {
         for r in reply.get("requests").and_then(Json::as_arr).unwrap_or(&[]) {
             rows.push(Row {
                 id: r.str_field("id").to_string(),
+                kind: kind_of(r),
                 attr: r.str_field("attr").to_string(),
                 reason: r.str_field("reason").to_string(),
                 age: r.get("age").and_then(Json::as_u64).unwrap_or(0),
@@ -77,6 +96,7 @@ pub fn requests_json(layout: &Layout) -> Result<()> {
         arr.push_str(
             &json::Obj::new()
                 .str("id", &r.id)
+                .str("kind", &r.kind)
                 .str("attr", &r.attr)
                 .str("reason", &r.reason)
                 .num("age", r.age)
@@ -117,7 +137,7 @@ pub fn requests(layout: &Layout) -> Result<()> {
         for r in list {
             rows.push((
                 r.str_field("id").to_string(),
-                r.str_field("attr").to_string(),
+                describe(&kind_of(r), r.str_field("attr")),
                 util::human_duration(std::time::Duration::from_secs(
                     r.get("age").and_then(Json::as_u64).unwrap_or(0),
                 )),
@@ -144,12 +164,12 @@ pub fn requests(layout: &Layout) -> Result<()> {
     let w_jail = rows.iter().map(|r| r.3.len()).max().unwrap_or(4).max(4);
     println!(
         "{:<w_id$}  {:<w_attr$}  {:<w_age$}  {:<w_jail$}  REASON",
-        "ID", "PACKAGE", "AGE", "JAIL"
+        "ID", "REQUEST", "AGE", "JAIL"
     );
     for (id, attr, age, jail, reason) in &rows {
         println!("{id:<w_id$}  {attr:<w_attr$}  {age:<w_age$}  {jail:<w_jail$}  {reason}");
     }
-    util::note("approve <id> to install it, deny <id> to refuse");
+    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|none|overlay, default ro), deny <id> to refuse");
     Ok(())
 }
 
@@ -192,13 +212,25 @@ fn check(reply: &Json) -> Result<()> {
     }
 }
 
-pub fn approve(layout: &Layout, id: &str) -> Result<()> {
-    let msg = json::Obj::new().str("op", "approve").str("id", id).finish();
+/// `mode` only means something for a mount request; the broker ignores it
+/// for a package and defaults it to read-only when empty.
+pub fn approve(layout: &Layout, id: &str, mode: &str) -> Result<()> {
+    if !mode.is_empty() {
+        proto::validate_mount_mode(mode)?;
+    }
+    let msg = json::Obj::new()
+        .str("op", "approve")
+        .str("id", id)
+        .str("mode", mode)
+        .finish();
     let reply = dispatch(layout, id, msg)?;
     check(&reply)?;
     let attr = reply.str_field("attr");
     let commands = reply.str_field("commands");
-    if commands.is_empty() {
+    let guest = reply.str_field("guest");
+    if !guest.is_empty() {
+        util::note(format!("{attr} mounted at {guest} ({})", reply.str_field("mode")));
+    } else if commands.is_empty() {
         util::note(format!(
             "{attr} installed (no new commands - already present, or it ships no bin/)"
         ));
@@ -221,8 +253,35 @@ pub fn deny(layout: &Layout, id: &str, reason: &str) -> Result<()> {
         .finish();
     let reply = dispatch(layout, id, msg)?;
     check(&reply)?;
-    util::note(format!("{} denied, the profile is unchanged", reply.str_field("attr")));
+    util::note(format!("{} denied, nothing changed", reply.str_field("attr")));
     Ok(())
+}
+
+/// The mode question for a mount approval. Empty answer means read-only;
+/// `q` backs out without answering the request at all.
+fn ask_mode(path: &str) -> Result<Option<String>> {
+    loop {
+        if std::io::stdout().is_terminal() {
+            print!(
+                "  mode for {path} [{}] (ro=read-only, full=real tree rw, limited/none=synced copy, overlay=cow; q=back): ",
+                proto::DEFAULT_MOUNT_MODE
+            );
+            let _ = std::io::stdout().flush();
+        }
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let ans = line.trim().to_ascii_lowercase();
+        match ans.as_str() {
+            "" => return Ok(Some(proto::DEFAULT_MOUNT_MODE.to_string())),
+            "q" | "quit" => return Ok(None),
+            m => match proto::validate_mount_mode(m) {
+                Ok(()) => return Ok(Some(m.to_string())),
+                Err(e) => util::note(e.msg),
+            },
+        }
+    }
 }
 
 /// What a typed line at the `answer` prompt meant.
@@ -270,7 +329,7 @@ fn render(rows: &[Row], colour: bool) {
     let (bold, dim, off) = if colour { ("\x1b[1m", "\x1b[2m", "\x1b[0m") } else { ("", "", "") };
     // Sized to the content, so the age and jail columns line up without
     // padding every row out to a guessed width.
-    let w_attr = rows.iter().map(|r| r.attr.len()).max().unwrap_or(0);
+    let w_attr = rows.iter().map(|r| describe(&r.kind, &r.attr).len()).max().unwrap_or(0);
     let ages: Vec<String> =
         rows.iter().map(|r| util::human_duration(Duration::from_secs(r.age))).collect();
     let w_age = ages.iter().map(|a| a.len()).max().unwrap_or(0);
@@ -286,7 +345,7 @@ fn render(rows: &[Row], colour: bool) {
         println!(
             "  {bold}{:>2}{off}  {bold}{:<w_attr$}{off}  {dim}{:>w_age$}  {}{off}",
             i + 1,
-            r.attr,
+            describe(&r.kind, &r.attr),
             ages[i],
             r.jail
         );
@@ -348,7 +407,19 @@ pub fn answer(layout: &Layout) -> Result<()> {
             // has changed either way, and the operator is probably about to
             // answer the next one.
             Choice::Approve(i) => {
-                if let Err(e) = approve(layout, &rows[i].id) {
+                // A mount is the one approval with a second question in it.
+                // Asked here, at the moment of approving, rather than encoded
+                // into the row syntax: the mode is a decision about this
+                // path, and read-only has to stay the answer of least effort.
+                let mode = if rows[i].kind == proto::KIND_MOUNT {
+                    match ask_mode(&rows[i].attr)? {
+                        Some(m) => m,
+                        None => continue,
+                    }
+                } else {
+                    String::new()
+                };
+                if let Err(e) = approve(layout, &rows[i].id, &mode) {
                     util::note(e.msg);
                 }
             }

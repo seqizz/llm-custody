@@ -73,5 +73,22 @@
 
     Leave a line out rather than writing it empty, and leave the whole block
     out when nothing is missing.
+
+    ## Sandbox: asking for a host directory
+
+    Only the workspace and what the operator mounted are visible here. If the
+    task needs another host path (a sibling checkout, a dataset, a config
+    directory), ask for it the same way:
+
+        custody-request --mount /absolute/host/path --reason "<why you need it>"
+
+    That blocks like a package request and uses the same exit codes. The
+    operator decides whether it is attached and how: read-only by default, or
+    as a synced copy, or as the real tree. On approval the command prints
+    where the tree landed (under `/workspace` or `/mnt`) and you can use it
+    immediately. Name the path you need, not a mode, and ask for the narrowest
+    directory that covers the task rather than a home directory or a secrets
+    store. If `custody-request` is missing, name the path in your reply
+    instead and carry on with what does not depend on it.
   '';
 }

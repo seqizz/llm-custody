@@ -69,6 +69,9 @@
         # running, so a second terminal needs no path from the first.
         // {
           sync = import ./lib/sync-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+          # Host-side front end for attaching a tree to a running jail (or
+          # detaching one), over the same registry.
+          mount = import ./lib/mount-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
           # Host-side provisioning of the package profile the jail sees on
           # its PATH - the sandbox cannot realize a derivation itself, so this
           # is where a tool it asked for actually gets built. Also the request
@@ -87,6 +90,10 @@
           sync = {
             type = "app";
             program = "${self.packages.${system}.sync}/bin/llm-custody-sync";
+          };
+          mount = {
+            type = "app";
+            program = "${self.packages.${system}.mount}/bin/llm-custody-mount";
           };
           toolbox = {
             type = "app";
