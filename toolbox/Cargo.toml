@@ -1,0 +1,23 @@
+[package]
+name = "llm-custody-toolbox"
+version = "0.1.0"
+edition = "2021"
+# std::fs::File::lock, which the toolbox mutation lock is built on.
+rust-version = "1.89"
+
+# No dependencies, on purpose. The jail has no binary cache in its domain
+# whitelist and the host builds this through nixpkgs, so every crate added here
+# is another thing to vendor and another thing that has to be present offline.
+# Everything below is std: the JSON this parses is small, the protocol is one
+# line per message, and the sockets are blocking.
+[dependencies]
+
+[[bin]]
+name = "llm-custody-toolbox"
+path = "src/main.rs"
+
+[profile.release]
+# A CLI that mostly waits on nix; size and build time matter more than the
+# last few percent of speed.
+opt-level = "s"
+strip = true

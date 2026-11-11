@@ -26,13 +26,13 @@ let
   # another terminal.
   syncBack = pkgs.lib.getExe (import ./sync-back.nix { inherit pkgs; });
   # Guest path and symlink names of the operator-managed package profile
-  # (lib/toolbox.nix), shared with lib/toolbox-cli.nix and the launchers.
+  # (lib/toolbox.nix), shared with ../toolbox and the launchers.
   toolbox = import ./toolbox.nix;
   # Store path of the host-side provisioning CLI, published as a user var so
   # a terminal keybinding can run it without llm-custody being installed on
   # the host at all - `nix run .#pi` is the documented quick start, and it
   # puts nothing on PATH.
-  toolboxCli = pkgs.lib.getExe (import ./toolbox-cli.nix { inherit pkgs; });
+  toolboxCli = pkgs.lib.getExe (import ./toolbox-rs.nix { inherit pkgs; });
   selftestDomain = builtins.head toolDefaults.allowedDomains;
   selftestUnshare = "${pkgs.util-linux}/bin/unshare";
   # Optional per-tool data: a tool with no dangerous-mode CLI flag (pi) just
@@ -607,6 +607,11 @@ pkgs.writeShellApplication {
     SYNC_REG=""
     STATE_REG=""
     TOOLBOX_REG=""
+    # The per-session package-request broker: its pid, so cleanup() can stop
+    # it, and its runtime directory, so cleanup() can remove the registration
+    # even when the broker was killed hard enough to skip its own handler.
+    BROKER_PID=""
+    BROKER_DIR=""
     USERVAR_SET=0
     TITLE_SET=0
     # Set right before handing control to the tool. The exit summary keys off
@@ -690,6 +695,13 @@ pkgs.writeShellApplication {
       printf 'overlay=%s\n' "$OVERLAY"
       if [ "$1" = "sync" ]; then
         printf 'sync=%s\n' "$RUNDIR/sync"
+      fi
+      # Lets a consumer find this session's request queue and control socket
+      # without knowing how broker ids are formed. Absent when the broker
+      # failed to start, which is exactly when a consumer should not offer to
+      # answer requests.
+      if [ -n "$BROKER_DIR" ]; then
+        printf 'broker=%s\n' "$BROKER_DIR"
       fi
     }
 
@@ -826,11 +838,21 @@ pkgs.writeShellApplication {
 
       # Session is over: drop the mid-session sync handles so nothing points
       # at a $RUNDIR that is about to disappear.
+      # Stopped before the clearing pass below, for the same reason the dirty
+      # watcher is: it publishes llm_custody_requests whenever its queue
+      # changes, and a request timing out here would re-set a variable this is
+      # about to clear.
+      if [ -n "$BROKER_PID" ]; then
+        kill "$BROKER_PID" 2>/dev/null || true
+        wait "$BROKER_PID" 2>/dev/null || true
+      fi
+
       if [ "$USERVAR_SET" = "1" ]; then
         emit_uservar llm_custody_sync ""
         emit_uservar llm_custody_state ""
         emit_uservar llm_custody_jail ""
         emit_uservar llm_custody_dirty ""
+        emit_uservar llm_custody_requests ""
         emit_uservar llm_custody_toolbox ""
         emit_uservar llm_custody_toolbox_cmd ""
       fi
@@ -843,6 +865,14 @@ pkgs.writeShellApplication {
           rm -f "$(dirname "$SYNC_REG")/current"
         fi
       fi
+      # The broker itself was stopped above. Any request still waiting on it
+      # was answered by the socket closing, which the jail-side client reports
+      # as "the broker went away" rather than hanging - the jail is gone by
+      # this point anyway.
+      if [ -n "$BROKER_DIR" ]; then
+        rm -rf "$BROKER_DIR"
+      fi
+
       # The `current.toolbox` pointer only belongs to this run while it still
       # names this run's directory - a session started later has already
       # claimed it, and removing it then would strand that one.
@@ -1494,6 +1524,21 @@ pkgs.writeShellApplication {
     BWRAP_ARGS+=(--ro-bind "$TOOLBOX_DIR" ${toolbox.guestDir})
     JAIL_PATH="${toolbox.binDir}:$JAIL_PATH"
 
+    # One directory at the very front of the jail's PATH, holding everything
+    # the runner puts there itself: the git wrapper below, and the
+    # `custody-request` entry point an agent asks for a package with. Created
+    # and bound unconditionally - the git shadow is conditional on the host
+    # having a git the sandbox can see, and custody-request must not disappear
+    # along with it.
+    JAIL_BIN_DIR="$RUNDIR/bin"
+    mkdir -p "$JAIL_BIN_DIR"
+    # The same binary as the host-side CLI, reached under another name: it
+    # dispatches on argv[0]. A symlink into /nix/store resolves inside the
+    # sandbox because the store is bound wholesale.
+    ln -sfn "${toolboxCli}" "$JAIL_BIN_DIR/custody-request"
+    BWRAP_ARGS+=(--ro-bind "$JAIL_BIN_DIR" /run/llmcustody-bin)
+    JAIL_PATH="/run/llmcustody-bin:$JAIL_PATH"
+
     # Shadow `git` ahead of everything else on PATH with a wrapper that
     # always forces -c core.hooksPath at the real, read-only-bound hooks
     # dir. .git/hooks is already ro-bound above, but .git/config is not -
@@ -1525,14 +1570,10 @@ pkgs.writeShellApplication {
         warn "git resolves to $REAL_GIT_RESOLVED, not visible inside the jail (needs /nix/store or a bound /usr/bin) - skipping in-jail git hooks shadow"
       fi
       if [ -n "$REAL_GIT" ]; then
-        GIT_WRAPPER_DIR="$RUNDIR/bin"
-        mkdir -p "$GIT_WRAPPER_DIR"
         printf '#!%s\nexec "%s" -c core.hooksPath="%s" "$@"\n' \
           "${pkgs.bash}/bin/sh" "$REAL_GIT" "$HOOKS_GUEST" \
-          > "$GIT_WRAPPER_DIR/git"
-        chmod +x "$GIT_WRAPPER_DIR/git"
-        BWRAP_ARGS+=(--ro-bind "$GIT_WRAPPER_DIR" /run/llmcustody-bin)
-        JAIL_PATH="/run/llmcustody-bin:$JAIL_PATH"
+          > "$JAIL_BIN_DIR/git"
+        chmod +x "$JAIL_BIN_DIR/git"
       fi
     fi
 
@@ -1871,6 +1912,49 @@ pkgs.writeShellApplication {
         # no llm-custody-toolbox on PATH to run. The store path always works.
         emit_uservar llm_custody_toolbox_cmd "${toolboxCli}"
         USERVAR_SET=1
+      fi
+
+      # Package-request broker for this session. The jail gets one socket,
+      # which speaks exactly one verb; approval runs on a second socket that
+      # is never bound into the sandbox, so an agent cannot answer its own
+      # request. See lib/toolbox-rs.nix and the crate's proto.rs.
+      BROKER_DIR="$REG_DIR/brokers/$$"
+      rm -rf "$BROKER_DIR"
+      # Into a log file, never the terminal: the jailed tool owns the
+      # terminal for the whole session, and a line of broker chatter landing
+      # inside one of its frames corrupts the display (the same reason the
+      # dirty-count user var is only emitted on change). The operator
+      # discovers requests with `llm-custody-toolbox requests`, not by
+      # watching this.
+      ${toolboxCli} --dir "$TOOLBOX_DIR" serve \
+        --broker-id "$$" --label "${name} $WORKSPACE_HOST" \
+        --uservar "$USERVAR_ON" \
+        >"$RUNDIR/broker.log" 2>&1 &
+      BROKER_PID=$!
+      # Readiness is observed, not slept for (same reason as slirp4netns and
+      # dnsmasq above): the socket has to exist before bwrap binds it, and a
+      # fixed sleep is the thing that holds on an idle laptop and not on a
+      # loaded one. Breaks early if the broker died, so a failure surfaces on
+      # its own terms rather than after the full timeout.
+      BROKER_SOCK="$BROKER_DIR/request.sock"
+      for _ in $(seq 1 100); do
+        [ -S "$BROKER_SOCK" ] && break
+        kill -0 "$BROKER_PID" 2>/dev/null || break
+        sleep 0.05
+      done
+      if [ -S "$BROKER_SOCK" ]; then
+        # A socket is an inode, so bwrap binds it like any other file.
+        BWRAP_ARGS+=(--bind "$BROKER_SOCK" /run/custody-request.sock)
+        BWRAP_ARGS+=(--setenv CUSTODY_REQUEST_SOCKET /run/custody-request.sock)
+        vlog "broker: $BROKER_SOCK -> /run/custody-request.sock (${toolboxCli} requests)"
+      else
+        # Not fatal: the session is still perfectly usable, the agent just has
+        # to ask in its reply the way it did before there was a broker.
+        warn "package-request broker did not start - custody-request will not work in this jail"
+        hint "see $RUNDIR/broker.log"
+        kill "$BROKER_PID" 2>/dev/null || true
+        BROKER_PID=""
+        BROKER_DIR=""
       fi
     fi
 

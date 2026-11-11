@@ -164,16 +164,44 @@ tool worth provisioning once is worth having everywhere and none of it is
 session state.
 
 ```bash
-nix run .#toolbox -- add lua5_4 shellcheck   # install, host-side
+nix run .#toolbox -- add lua5_4 shellcheck   # install (or renew), host-side
 nix run .#toolbox -- list                    # what is in there
-nix run .#toolbox -- rm shellcheck
+nix run .#toolbox -- leases                  # ... and how long it stays
+nix run .#toolbox -- renew shellcheck        # push its lease out, install nothing
+nix run .#toolbox -- remove shellcheck       # (alias: rm)
+nix run .#toolbox -- pin shellcheck          # never expire this one
+nix run .#toolbox -- upgrade                 # re-resolve every installed ref
+nix run .#toolbox -- upgrade ripgrep         # or just one of them
+nix run .#toolbox -- prune                   # drop what nobody asked for lately
 nix run .#toolbox -- gc                      # drop the old generations
 nix run .#toolbox                            # prompt for a line of names
+
+nix run .#toolbox -- requests                # what the running jails asked for
+nix run .#toolbox -- approve 41207.1         # install it and unblock the jail
+nix run .#toolbox -- deny 41207.1 --reason X # refuse, profile untouched
 ```
+
+`llm-custody-toolbox` is a Rust binary (`toolbox/`) with no dependencies
+outside std, so it builds offline. It calls `nix` and `nix-store` with argv
+arrays and reads `nix profile list --json`: nothing an agent can influence -
+an attribute name, a reason string - is ever assembled into a shell command,
+and no output is scraped out of human-readable text. `nix` itself is
+deliberately not in the package's closure, because the host's own nix
+(possibly Lix) is the one that matches the running daemon.
 
 A bare name resolves against `nixpkgs` (override with
 `LLMCUSTODY_TOOLBOX_FLAKE`); anything containing `#` or `:` is handed to nix
 verbatim as a flake reference.
+
+`upgrade` rebuilds the installed entries from the flake refs they were
+installed with, so what it picks up depends on what those refs resolve to
+now: the registry's `nixpkgs` moves on its own (subject to `tarball-ttl`),
+while an `LLMCUSTODY_TOOLBOX_FLAKE` pointing at a pinned nixpkgs only moves
+when that pin does. It goes through the same lock and `current` retarget as
+`add`, which is why it is a subcommand - a bare `nix profile upgrade
+--profile ...` builds a generation that no running jail sees and that nothing
+holds a GC root on. Like `add`, it leaves the previous generation pinned
+behind it; see [Garbage collection](#garbage-collection).
 
 **Additions apply to a running session.** The bind is live: `nix profile
 install` writes a new generation, `llm-custody-toolbox` retargets the
@@ -196,9 +224,169 @@ A second var, `llm_custody_toolbox_cmd`, carries the CLI's own store path.
 on the host, so a keybinding that called `llm-custody-toolbox` by name would
 find no such command; the store path always resolves.
 
-Each launcher appends a short section to the jailed tool's user-level memory
-file (pi: `AGENTS.md`, claude: `CLAUDE.md`) telling the agent it cannot
-install anything and asking it to end its reply with:
+### Asking from inside the jail
+
+An agent that needs a tool runs, in the sandbox:
+
+```bash
+custody-request shellcheck --reason "Validate scripts"
+```
+
+and blocks there. The request shows up on the host:
+
+```console
+$ llm-custody-toolbox requests
+ID      PACKAGE     AGE  JAIL               REASON
+41207.1 shellcheck  2m   pi /workspace/foo  Validate scripts
+$ llm-custody-toolbox approve 41207.1
+```
+
+Approval goes through the same `add` the host CLI uses, so the package is
+installed, leased, and on the PATH by the time the client unblocks. It
+appears in every jail sharing that **toolbox**, which is not the same as
+every jail: a runner starts its broker with its own `--toolbox-dir`, so a
+session under a different `--state-dir` has a different profile and will not
+see the package (see [Providing packages](#providing-packages)). Check which
+toolbox a broker serves with `cat
+$XDG_RUNTIME_DIR/llm-custody/brokers/*/meta`.
+
+Denial (`deny ID [--reason TEXT]`) leaves the profile untouched and the
+client exits 3, which the agent is told to read as a final answer rather than
+a retry. Nothing happens without an operator: there is no auto-approval and
+no timer that approves.
+
+A request that nobody answers before `--timeout` exits **4**, not 3, and says
+"unanswered" rather than "refused". The distinction is the whole reason exit 4
+exists: a denial is an answer and the agent is told to accept it, while an
+operator who was away from the terminal has decided nothing, and an agent that
+recorded that as a refusal would be reporting a decision that was never made.
+
+Each jail runner starts its own broker (`llm-custody-toolbox serve`) and binds
+**one** of its two sockets into the sandbox:
+
+| Socket | Bound into the jail | Verbs |
+|--------|--------------------|-------|
+| `request.sock` | yes, at `/run/custody-request.sock` | `request` |
+| `control.sock` | **never** | `list`, `approve`, `deny` |
+
+That split is the whole authorization model, and it is the reason there are
+two sockets rather than one with an `approve` verb on it: the jail runs as the
+same uid as the operator, so peer credentials cannot tell an agent's
+connection from a human's. The jail-facing socket parses no other verb at all.
+Requests from it are additionally restricted to **bare nixpkgs attributes** -
+`ripgrep`, `python3Packages.black` - because a flake reference is a URL, and
+choosing a URL to fetch with the host's network and the host's nix is the
+operator's call. Host-side `add` still takes full refs.
+
+### Being told, instead of polling
+
+A request blocks the agent, so the operator needs to find out without running
+`requests` on a timer. The broker publishes every queue change three ways,
+all of them best-effort and none of them able to affect the request itself:
+
+| Sink | When | Notes |
+|------|------|-------|
+| `<broker>/pending` | every change | the count, atomically rewritten; what a second terminal can read at any time |
+| `llm_custody_requests` user var | on change | OSC 1337, empty when the queue drains |
+| `--notify-hook` | every change | your command, argv only |
+
+`requests --json` prints the queue flattened across every broker, oldest
+first - the one that has been blocking an agent longest is the one to answer
+first, and a stable order keeps a picker's entries from jumping around.
+
+**The tab badge** in `llm-custody.lua` recolours rather than growing: the
+same `▥` at the same width, orange when a request is pending, green when
+there is unsynced work, plain otherwise. Orange wins because the two states
+differ in who has to act - unsynced work waits on nothing, a pending request
+has stopped the agent until you answer.
+
+**`llm-custody-toolbox answer`** is the queue, interactively:
+
+```console
+2 pending package request(s)
+
+   1  pdftocairo  2s  pi ~/devel/llm-custody
+      needs pdftocairo for the thing
+   2  shellcheck  1s  pi ~/devel/llm-custody
+      needs shellcheck for the thing
+
+  type 1-2 to approve, 1d-2d to deny, r to refresh, q to quit
+> 
+```
+
+Rows are numbered because a request id is a broker pid and a counter
+(`171481.2`) - fine for routing, hopeless to type. It redraws after each
+answer and leaves when the queue empties.
+
+That picker lives in the CLI rather than in the terminal integration, which
+is what `Ctrl+Shift+r` runs in a split. WezTerm has a selector widget, but it
+is a full-window overlay with no size control, and it would have made the
+feature WezTerm-only; a command in a pane is sized by the pane and works the
+same over ssh, under tmux and in a terminal with no picker widget at all.
+`requests --json` remains for anything that does want to build its own, with
+a short read timeout on the CLI side so a wedged broker cannot freeze a
+caller that is blocking on it.
+
+The broker writes that user variable straight to the terminal, mid-session,
+while the jailed tool owns it. That is safe for a narrow reason worth
+recording: the kernel serialises tty writes, so a single `write()` of a
+complete sequence cannot interleave with the tool's output, and `SetUserVar`
+moves no cursor and changes no SGR state, so nothing renders. The emission is
+therefore one `write_all` of one buffer, deliberately, and only on a change
+of count. Whether to emit at all is decided by the runner and passed in with
+`serve --uservar 0|1`, never re-derived - several processes publish these
+variables and they have to agree.
+
+The hook gets six separate argv values and no shell:
+
+```
+<hook> <event> <id> <attr> <reason> <count> <label>
+```
+
+`event` is `start`, `request`, `approved`, `denied` or `dropped`, and
+`dropped` fires only for a request that really left the queue unanswered (a
+client that hung up, or the hold time running out) - never as a second event
+for one that was approved or denied. `reason` is whatever explains that
+event: the agent's justification everywhere except `denied`, where it is the
+operator's refusal, which is the half the operator has not already read.
+
+The attr and reason come from inside a jail, so the one thing that must never
+happen to them is being pasted into a command line for something to re-parse;
+a reason of `Validate scripts; rm -rf /` arrives as one argument, and
+`toolbox/src/broker.rs` has tests asserting exactly that - one on the argv the
+broker builds, one running a real hook that reports what it was handed and
+checking that nothing in the reason executed on the way. Set it with
+`--notify-hook PATH` or
+`$LLMCUSTODY_NOTIFY_HOOK`. A hook that is missing, unexecutable, slow or
+failing is logged to `broker.log` and changes nothing: it is spawned, never
+waited on (a reaper thread collects it), so a hook that sleeps for a minute
+does not delay the approval by a millisecond. `notify-send` is the obvious
+one to put there if you want a desktop popup as well.
+
+Both sockets live under `$XDG_RUNTIME_DIR/llm-custody/brokers/<pid>/`, so
+several jails broker in parallel and `requests` aggregates across all of them;
+a request id is `<broker>.<n>`, which is how `approve` finds the broker
+holding it. Requests are bounded (8 KiB per message, 128 characters of
+attribute, 512 of reason, 32 pending per broker) and held until approved,
+denied, disconnected, or timed out (`serve --timeout`, default 30m). A client
+that dies is dropped from the queue within a poll interval rather than
+occupying it until the timeout, and killing a broker unblocks whatever was
+waiting on it with exit 4.
+
+A broker also asks the kernel to SIGTERM it when its parent dies
+(`PR_SET_PDEATHSIG`, re-checked immediately for the case where the parent was
+already gone). The runner's exit trap covers every ordinary end of a session;
+this covers the runner being SIGKILLed or its terminal going away, which would
+otherwise leave a live broker serving a jail that no longer exists - and a
+live one is exactly what the pid check below refuses to prune.
+
+The runner removes the broker's registration on exit; the broker also removes
+it on SIGTERM/SIGINT itself, and the host CLI prunes any registration whose
+pid is gone. Three layers, because the only thing worse than a stale socket is
+a `requests` list the operator cannot act on.
+
+If no broker is running - an older runner, or `serve` failed to start - the
+launcher notice tells the agent to fall back to ending its reply with:
 
 ```
 required packages: lua5_4, shellcheck
@@ -206,13 +394,34 @@ good-to-have packages: ripgrep
 ```
 
 `llm-custody-toolbox add` accepts that line pasted verbatim - the labels and
-commas are stripped - so answering a request is a copy, a paste and a return.
-`, -p <command>` still works inside the jail (nix-index's database is local)
-and is how the agent turns a command name into a nixpkgs attribute.
+commas are stripped - so answering it is a copy, a paste and a return.
+`, -p <command>` works inside the jail (nix-index's database is local) and is
+how the agent turns a command name into a nixpkgs attribute.
 
 The toolbox is bound **read-only**. A writable one would put the front of the
 jail's own PATH under the agent's control, which is worth rather more to a
 misbehaving agent than any single package.
+
+**A tool that prepends its own PATH entries sits ahead of the toolbox.** The
+runner sets `PATH` once, with `/run/llmcustody-bin` and then
+`/toolbox/current/bin` at the front, but that is only the PATH the tool
+*starts* with. pi, for one, prepends `$PI_CODING_AGENT_DIR/bin` plus the store
+paths of the fd and ripgrep it ships with, so a toolbox `fd` is installed,
+leased and completely invisible to it. Check before provisioning something a
+tool may already carry:
+
+```bash
+# in the jail
+echo "$PATH" | tr : '\n' | head -5
+command -v fd
+```
+
+The same ordering means the `git` hooks wrapper in `/run/llmcustody-bin` can
+be shadowed by a tool that prepends a directory the agent can write - pi's
+`$PI_CODING_AGENT_DIR/bin` is inside the rw-bound state dir. That is a known
+limit rather than a hole to plug: the wrapper defends against a rewritten
+`.git/config`, and an agent set on avoiding it can invoke git by its store
+path regardless (see [Repo history exposure](#repo-history-exposure-git)).
 
 One toolbox is shared by every jail under the same `--state-dir` - both
 tools, every `--profile`, any number of concurrent sessions. That is the
@@ -223,6 +432,75 @@ profile for its own generation switch, but `current` is retargeted after that
 lock drops, so two interleaved adds could otherwise leave it on the older
 generation.
 
+### Package leases
+
+Provisioning is a one-way ratchet without something to expire it: a package
+added for one afternoon's task stays on every future jail's PATH, and keeps
+its whole closure pinned, until somebody remembers its name and removes it.
+
+Every `add` therefore stamps a lease: one file per package under
+`<toolbox-dir>/leases/`, named and filled with the package's nix profile
+element name, its mtime being the last time an operator asked for it.
+`prune` removes the elements whose lease has gone 30 days unrenewed, deletes
+those lease files, retargets `current` and wipes the generations that held
+them.
+
+```bash
+llm-custody-toolbox add shellcheck       # install, 30-day lease starts
+llm-custody-toolbox add shellcheck       # ... and that is also how you renew
+llm-custody-toolbox renew shellcheck     # renew without reinstalling
+llm-custody-toolbox pin shellcheck       # drop the lease: permanent
+llm-custody-toolbox leases               # package, lease age, expiry
+llm-custody-toolbox prune --older-than 30d
+llm-custody-toolbox prune --dry-run      # report what would go
+```
+
+**`add` is also the renewal.** The thing an operator does naturally - answer
+the same request again when an agent asks for a tool it last used two months
+ago - is the thing that keeps the tool alive. Re-adding something already
+installed skips the install (nix would refuse a second element under an
+existing name anyway) and only pushes the lease out.
+
+`renew` does that half on its own, for the two cases `add` cannot express:
+pushing a lease out without naming a flake reference, and putting a
+*permanent* package back under a lease. It never touches the profile.
+
+`prune`'s period defaults to 30 days and is spelled like `gc`'s:
+`--older-than 30d`, or a bare count of days. `LLMCUSTODY_TOOLBOX_LEASE_DAYS`
+moves that default for a host that wants a different one, and `leases` takes
+the same flag so its expiry column can be read against another lifetime.
+
+`leases` lists the leased packages with the age of each lease and what is
+left of it, then the installed elements that hold no lease at all:
+
+```
+ripgrep                  leased 3d ago, expires in 27d
+shellcheck               leased 45d ago, EXPIRED
+git                      permanent (no lease)
+```
+
+**A package with no lease file is permanent.** That covers everything
+provisioned before leases existed and anything installed with a plain `nix
+profile install --profile ...`, neither of which anyone agreed to have
+expire. `pin` puts a package into that state by deleting its lease, so
+permanence stays the *absence* of state rather than a second flag that could
+disagree with the first; `add` puts it back under one.
+
+`pin` and `prune` take the same lock as `add` and `upgrade`, and `prune`'s
+effect is live: a command a running jail had a moment ago can be gone from
+its next PATH lookup. That is the deal a lease makes, and the session carries
+on without it.
+
+What `prune` does **not** do is collect garbage. It unpins - the profile
+elements first, then the generations that held them - and leaves reclaiming
+the store to the `nix-collect-garbage` that runs next, which is where the
+policy for the rest of the store already lives. The pairing to put in a
+cleanup alias is therefore:
+
+```bash
+nix run .#toolbox -- prune && sudo nix-collect-garbage
+```
+
 ### Garbage collection
 
 A profile outside `/nix/var/nix/profiles` is not a GC root on its own, so
@@ -231,16 +509,22 @@ and the toolbox survives `nix-collect-garbage`. If that call fails it falls
 back to a plain symlink and says so - the contents then last until the next
 GC, and a re-`add` restores them.
 
-Only the *current* generation is rooted that way. Every `add` leaves the one
-before it behind as a `profile-N-link` symlink, and nothing cleans those up:
-a custom profile path gets no automatic generation pruning, and
-`nix-collect-garbage -d` does not know about this profile at all.
+Only the *current* generation is rooted that way. Every `add` or `upgrade`
+leaves the one before it behind as a `profile-N-link` symlink, and nothing
+cleans those up: a custom profile path gets no automatic generation pruning,
+and `nix-collect-garbage -d` does not know about this profile at all. An
+upgraded toolbox is the expensive case, since each stale generation pins a
+whole old closure of everything in it.
 
 ```bash
 nix run .#toolbox -- gc                      # drop every generation but the current one
 nix run .#toolbox -- gc --older-than 30d     # keep the recent ones
 nix run .#toolbox -- gc --dry-run            # report first
 ```
+
+`prune` already does the unconditional form of this for the generations it
+creates, so `gc` is for the ones `add` and `upgrade` leave behind between
+prunes.
 
 `gc` only unpins; it frees nothing by itself. Run `nix-collect-garbage`
 afterwards to actually reclaim the store paths. To check what is holding a
@@ -849,6 +1133,7 @@ whitelisted domains unless you pass `--no-net-filter`.
 |    - slirp4netns for outbound connectivity                |
 |    - dnsmasq (domain whitelist) + nftables (IP gate)      |
 |    - opens seccomp fd (lib/seccomp-denylist.nix)          |
+|    - starts the package-request broker (toolbox/, serve)  |
 |    - nsenter's into the netns holder, execs bwrap ...     |
 |    - on exit (and on demand, lib/sync-back.sh): reviews   |
 |      the jail copies/overlays back into the host trees    |
@@ -858,6 +1143,9 @@ whitelisted domains unless you pass `--no-net-filter`.
 |  |  /workspace/<name>  <- bind (rw, cwd)                 | |
 |  |  /home/user/<cfg>   <- bind (rw, jail-private state)  | |
 |  |  /toolbox           <- ro-bind (operator packages)    | |
+|  |  /run/llmcustody-bin <- ro-bind (git wrapper,          | |
+|  |                         custody-request), first on PATH| |
+|  |  /run/custody-request.sock <- bind (broker, ask only)  | |
 |  |  seccomp denylist applied at the final execve         | |
 |  |  exec the tool                                        | |
 |  +-------------------------------------------------------+ |

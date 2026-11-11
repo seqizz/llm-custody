@@ -69,10 +69,12 @@
         # running, so a second terminal needs no path from the first.
         // {
           sync = import ./lib/sync-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
-          # Host-side provisioning of the package profile the jail sees on its
-          # PATH - the sandbox cannot realize a derivation itself, so this is
-          # where a tool it asked for actually gets built.
-          toolbox = import ./lib/toolbox-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+          # Host-side provisioning of the package profile the jail sees on
+          # its PATH - the sandbox cannot realize a derivation itself, so this
+          # is where a tool it asked for actually gets built. Also the request
+          # broker (`serve`) each runner starts, and the `custody-request`
+          # entry point the jail reaches it through.
+          toolbox = import ./lib/toolbox-rs.nix { pkgs = nixpkgs.legacyPackages.${system}; };
         }
       );
 
