@@ -871,6 +871,12 @@ pub fn discover(layout: &Layout) -> Vec<BrokerHandle> {
             continue;
         }
         let id = entry.file_name().to_string_lossy().into_owned();
+        // Scoped to one session by `--pid`: the others are left exactly as
+        // they are, stale registrations included, because an unscoped command
+        // is the one that owns that cleanup.
+        if matches!(&layout.broker_filter, Some(want) if *want != id) {
+            continue;
+        }
         let meta = match fs::read_to_string(dir.join(proto::META_FILE)) {
             Ok(m) => m,
             Err(_) => continue,

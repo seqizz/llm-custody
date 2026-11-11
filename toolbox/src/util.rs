@@ -50,7 +50,19 @@ pub fn usage_err<T>(msg: impl Into<String>) -> Result<T> {
 /// Everything diagnostic goes to stderr so a piped `list` or `requests` keeps
 /// stdout machine-readable, the same split the shell implementation had.
 pub fn note(msg: impl AsRef<str>) {
-    eprintln!("llm-custody-toolbox: {}", msg.as_ref());
+    eprintln!("llm-custody: {}", msg.as_ref());
+}
+
+/// Become `exe`, passing `args` as an argv array. Returns only when the exec
+/// itself failed, which is why the signature is a Result and not `!`.
+///
+/// argv array, never a command line: a mount path, a package name or a tool
+/// argument can come from a jailed agent, and the only reliable way to keep
+/// one of those from being re-read as shell is for no shell to be involved.
+pub fn exec_argv(exe: &Path, args: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let e = std::process::Command::new(exe).args(args).exec();
+    fail(format!("running {}: {e}", exe.display()))
 }
 
 /// Adds context to an io error without losing the original message - "No such

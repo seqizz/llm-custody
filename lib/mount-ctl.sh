@@ -3,7 +3,7 @@
 # Attaches a host tree to a running jail, and detaches it again, without
 # restarting anything. One implementation for three callers: the runner at
 # launch (every --mount/--ro-mount goes through here), the operator from a
-# second terminal ($RUNDIR/mount, llm-custody-mount, or a terminal
+# second terminal ($RUNDIR/mount, `llm-custody mount`, or a terminal
 # keybinding), and the request broker when the operator approves an agent's
 # `custody-request --mount`.
 #

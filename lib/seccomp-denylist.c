@@ -14,6 +14,7 @@
 #include <seccomp.h>
 #include <errno.h>
 #include <stddef.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 static const int denied[] = {
@@ -56,6 +57,24 @@ int main(void) {
 
   for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) {
     if (seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), denied[i], 0) < 0) {
+      seccomp_release(ctx);
+      return 1;
+    }
+  }
+
+  /* Terminal input injection: TIOCSTI pushes bytes into the terminal's
+   * input queue as if typed, TIOCLINUX can paste a console selection. The
+   * sandboxed tool keeps the controlling terminal (no bwrap --new-session),
+   * because a tool detached from it never receives SIGWINCH and keeps
+   * painting at the launch width after the pane is resized or split; this
+   * is the protection that replaces the detachment, and the one bwrap's
+   * own documentation names for that case. Masked compare, as flatpak does:
+   * the request number is an int that may arrive sign-extended in the
+   * 64-bit argument register. */
+  static const unsigned long tty_inject[] = { TIOCSTI, TIOCLINUX };
+  for (size_t i = 0; i < sizeof(tty_inject) / sizeof(tty_inject[0]); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1,
+                         SCMP_A1(SCMP_CMP_MASKED_EQ, 0xFFFFFFFFul, tty_inject[i])) < 0) {
       seccomp_release(ctx);
       return 1;
     }

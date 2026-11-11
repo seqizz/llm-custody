@@ -34,6 +34,11 @@ pub struct Layout {
     /// Flake a bare attribute resolves against.
     pub flake: String,
     pub lease_period: Duration,
+    /// When set, only this broker is visible. `--pid` scopes an answer to one
+    /// session while several jails are running; broker ids are the runner's
+    /// pid (the runner starts `serve --broker-id "$$"`), so the flag and the
+    /// id are the same string.
+    pub broker_filter: Option<String>,
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -88,7 +93,15 @@ impl Layout {
             Ok(v) if !v.is_empty() => util::parse_duration(&v, 'd')?,
             _ => Duration::from_secs(DEFAULT_LEASE_DAYS * 86400),
         };
-        Ok(Layout { dir, runtime, flake, lease_period })
+        Ok(Layout { dir, runtime, flake, lease_period, broker_filter: None })
+    }
+
+    /// Restrict every broker lookup to one session. Separate from `resolve`
+    /// because a toolbox dir and a session are independent choices: `--dir`
+    /// says which profile, `--pid` says which jail.
+    pub fn with_broker_filter(mut self, pid: Option<String>) -> Layout {
+        self.broker_filter = pid;
+        self
     }
 
     pub fn profile(&self) -> PathBuf {

@@ -12,8 +12,10 @@ rust-version = "1.89"
 # line per message, and the sockets are blocking.
 [dependencies]
 
+# One binary, several front ends: `custody-request` is this same file
+# under another name (argv[0] dispatch), symlinked into the jail by the runner.
 [[bin]]
-name = "llm-custody-toolbox"
+name = "llm-custody"
 path = "src/main.rs"
 
 [profile.release]

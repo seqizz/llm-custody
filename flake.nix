@@ -42,7 +42,7 @@
               name = toolName;
               toolDefaults = toolDef.defaults;
             };
-            completions = import ./lib/completions.nix { inherit pkgs; name = toolName; };
+            completions = (import ./lib/completions.nix { inherit pkgs; }).runner { name = toolName; };
           in
           # The runner script plus its shell completions. Assembled here
           # rather than inside mkBwrapRunner.nix because writeShellApplication
@@ -64,20 +64,24 @@
 
     in {
       packages = forAllSystems (system:
-        nixpkgs.lib.mapAttrs (name: def: mkTool system name def) (toolsForSystem system)
-        # Host-side front end for the mid-session sync of whichever jail is
-        # running, so a second terminal needs no path from the first.
-        // {
-          sync = import ./lib/sync-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
-          # Host-side front end for attaching a tree to a running jail (or
-          # detaching one), over the same registry.
-          mount = import ./lib/mount-cli.nix { pkgs = nixpkgs.legacyPackages.${system}; };
-          # Host-side provisioning of the package profile the jail sees on
-          # its PATH - the sandbox cannot realize a derivation itself, so this
-          # is where a tool it asked for actually gets built. Also the request
-          # broker (`serve`) each runner starts, and the `custody-request`
-          # entry point the jail reaches it through.
-          toolbox = import ./lib/toolbox-rs.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+        let
+          runners = nixpkgs.lib.mapAttrs (name: def: mkTool system name def) (toolsForSystem system);
+          # One host-side command over the whole sandbox: launching a tool,
+          # the live mounts and the mid-session sync of a running session, the
+          # package profile the jail sees on its PATH, and the request broker
+          # (`serve`) each runner starts plus the `custody-request` entry point
+          # the jail reaches it through.
+          umbrella = import ./lib/umbrella.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+          cli = umbrella { inherit runners; };
+        in
+        # The per-tool runners stay exposed by name: they are what an operator
+        # overrides (`packages.pi.override { pi-coding-agent = ...; }`) and
+        # what `nix run .#pi` is a shortcut for.
+        runners // {
+          default = cli;
+          # Same derivation under its own name, for a consumer that lists
+          # packages rather than taking the default.
+          llm-custody = cli;
         }
       );
 
@@ -87,17 +91,9 @@
           program = "${self.packages.${system}.${name}}/bin/llm-custody-${name}";
         }) (toolsForSystem system)
         // {
-          sync = {
+          default = {
             type = "app";
-            program = "${self.packages.${system}.sync}/bin/llm-custody-sync";
-          };
-          mount = {
-            type = "app";
-            program = "${self.packages.${system}.mount}/bin/llm-custody-mount";
-          };
-          toolbox = {
-            type = "app";
-            program = "${self.packages.${system}.toolbox}/bin/llm-custody-toolbox";
+            program = "${self.packages.${system}.default}/bin/llm-custody";
           };
         }
       );

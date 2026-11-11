@@ -26,19 +26,29 @@ let
   # another terminal.
   syncBack = pkgs.lib.getExe (import ./sync-back.nix { inherit pkgs; });
   # Mount controller (lib/mount-ctl.sh): every extra mount goes through it,
-  # at launch and while the session runs ($RUNDIR/mount, llm-custody-mount,
+  # at launch and while the session runs ($RUNDIR/mount, `llm-custody mount`,
   # the broker's approval of an agent's mount request).
   mountCtl = pkgs.lib.getExe (import ./mount-ctl.nix { inherit pkgs; });
   # Guest path and symlink names of the operator-managed package profile
   # (lib/toolbox.nix), shared with ../toolbox and the launchers.
   toolbox = import ./toolbox.nix;
-  # Store path of the host-side provisioning CLI, published as a user var so
-  # a terminal keybinding can run it without llm-custody being installed on
-  # the host at all - `nix run .#pi` is the documented quick start, and it
-  # puts nothing on PATH.
-  toolboxCli = pkgs.lib.getExe (import ./toolbox-rs.nix { inherit pkgs; });
+  # Store path of the host-side CLI, published as a user var so a terminal
+  # keybinding can run it without llm-custody being installed on the host at
+  # all - `nix run .#pi` is the documented quick start, and it puts nothing on
+  # PATH.
+  #
+  # Deliberately the *unwrapped* binary (lib/toolbox-rs.nix), not the umbrella
+  # from lib/umbrella.nix: the umbrella is built from the runners, so a runner
+  # referring back to it would be a cycle. Everything this runner and its
+  # consumers call (`toolbox`, `request`, `serve`, `custody-request`) is the
+  # same binary and behaves identically; only `llm-custody launch` needs the
+  # umbrella's LLMCUSTODY_RUNNER_DIR, and nothing here launches a tool.
+  custodyCli = pkgs.lib.getExe (import ./toolbox-rs.nix { inherit pkgs; });
   selftestDomain = builtins.head toolDefaults.allowedDomains;
   selftestUnshare = "${pkgs.util-linux}/bin/unshare";
+  # Store path, not a bind: /nix/store is bound wholesale, so the probe
+  # resolves inside the jail as-is.
+  selftestTiocsti = "${import ./tiocsti-probe.nix { inherit pkgs; }}/bin/tiocsti-probe";
   # Optional per-tool data: a tool with no dangerous-mode CLI flag (pi) just
   # omits it and --dangerous then errors out instead of passing something
   # the tool would reject.
@@ -153,8 +163,8 @@ pkgs.writeShellApplication {
                              (default: --state-dir/toolbox). The sandbox cannot
                              realize a derivation itself, so this is how a tool
                              that is not on the host's PATH gets in; add to it
-                             from the host with llm-custody-toolbox, including
-                             while a session is running
+                             from the host with 'llm-custody toolbox add PKG',
+                             including while a session is running
       --same-path           Mount workspace and every --mount at their host
                              paths instead of under /workspace (lets tools
                              like 'claude --resume' match sessions started
@@ -174,7 +184,7 @@ pkgs.writeShellApplication {
                              Mounts directly under /workspace or /mnt can be
                              detached while the session runs, and more can be
                              attached there: RUNDIR/mount (printed at launch),
-                             llm-custody-mount, or the agent's own
+                             'llm-custody mount add', or the agent's own
                              custody-request --mount once you approve it.
                              Any other GUESTPATH is fixed for the session.
       --ro-mount HOSTPATH[:GUESTPATH]
@@ -481,7 +491,7 @@ pkgs.writeShellApplication {
     # host path the sandbox does not have. `current` short-circuits it to the
     # resolved /nix/store profile, which resolves identically inside the jail
     # because the store is bound wholesale. Refreshed here as well as by
-    # llm-custody-toolbox, so a profile edited with plain `nix profile`
+    # `llm-custody toolbox`, so a profile edited with plain `nix profile`
     # commands is still picked up at the next launch.
     toolbox_refresh() {
       local real
@@ -1063,12 +1073,49 @@ pkgs.writeShellApplication {
     # namespace when the filter is on. -m is what lets a bind made here reach
     # the jail: bwrap is started through this too, so the jail's mount tree
     # is a slave copy of the holder's rather than of the host's.
-    nsenter_holder() {
+    holder_ns_args() {
       if [ "$NET_FILTER" = "1" ]; then
-        nsenter -U -m -n -t "$HOLDER_PID" --preserve-credentials -- "$@"
+        printf '%s\n' -U -m -n -t "$HOLDER_PID" --preserve-credentials --
       else
-        nsenter -U -m -t "$HOLDER_PID" --preserve-credentials -- "$@"
+        printf '%s\n' -U -m -t "$HOLDER_PID" --preserve-credentials --
       fi
+    }
+    nsenter_holder() {
+      local -a ns
+      mapfile -t ns < <(holder_ns_args)
+      nsenter "''${ns[@]}" "$@"
+    }
+
+    # The sandboxed command itself, in the foreground. On a terminal it is
+    # run with job control on (set -m), which puts it in a process group of
+    # its own and makes that the terminal's foreground group: SIGWINCH then
+    # reaches the tool (it keeps the controlling terminal, see the bwrap
+    # arguments), while kill(0) from inside the jail reaches only the jail
+    # and not this shell's group, where the broker, the dirty watcher and
+    # the network helpers all run. `set -m` here rather than a `bash -m -c`
+    # wrapper: bash may exec its single -c command without forking, and the
+    # fork is what creates the group.
+    #
+    # The group's leader is `timeout --foreground 0` (0 disables the
+    # timeout, so it only waits and forwards signals and the exit status).
+    # Terminal multiplexers and WezTerm's split decide the cwd of a new
+    # pane from the foreground leader's /proc cwd, and bwrap, the leader
+    # otherwise, sits at `/` after its pivot_root - every split would open
+    # at the root. timeout keeps this shell's cwd, the host workspace.
+    #
+    # Without a terminal there is nothing to resize and no foreground to
+    # take, so a plain call does.
+    run_jail() {
+      local -a ns
+      local status=0
+      mapfile -t ns < <(holder_ns_args)
+      if [ -t 0 ]; then
+        set -m
+        timeout --foreground 0 nsenter "''${ns[@]}" "$@" || status=$?
+        set +m
+        return "$status"
+      fi
+      nsenter "''${ns[@]}" "$@"
     }
 
     # Host preflight. Nothing here is NixOS-specific support (anything else
@@ -1432,7 +1479,15 @@ pkgs.writeShellApplication {
 
     BWRAP_ARGS=(
       --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
-      --die-with-parent --new-session
+      # No --new-session: setsid() would detach the tool from the controlling
+      # terminal, and a process with no controlling terminal never receives
+      # SIGWINCH - pi/claude then keep painting at the launch width after the
+      # pane is resized or split (a mount/sync split in the terminal is enough)
+      # and the redraw lands as garbage. The input injection --new-session
+      # guards against (TIOCSTI/TIOCLINUX) is denied by the seccomp filter
+      # below instead, which is the alternative bwrap's own documentation
+      # names for this case.
+      --die-with-parent
       # Drop CAP_SYS_ADMIN from the sandboxed process. Every mount-creation
       # syscall (mount(2), open_tree/move_mount, mount_setattr, umount2,
       # pivot_root, ...) requires it, so this closes the whole class at once
@@ -1545,7 +1600,7 @@ pkgs.writeShellApplication {
     # The same binary as the host-side CLI, reached under another name: it
     # dispatches on argv[0]. A symlink into /nix/store resolves inside the
     # sandbox because the store is bound wholesale.
-    ln -sfn "${toolboxCli}" "$JAIL_BIN_DIR/custody-request"
+    ln -sfn "${custodyCli}" "$JAIL_BIN_DIR/custody-request"
     BWRAP_ARGS+=(--ro-bind "$JAIL_BIN_DIR" /run/llmcustody-bin)
     JAIL_PATH="/run/llmcustody-bin:$JAIL_PATH"
 
@@ -1675,9 +1730,6 @@ pkgs.writeShellApplication {
         [ -S "$WAYLAND_SOCK" ] && BWRAP_ARGS+=(--ro-bind "$WAYLAND_SOCK" "$WAYLAND_SOCK")
       fi
     fi
-    if STTY_SIZE=$(stty size 2>/dev/null); then
-      BWRAP_ARGS+=(--setenv LINES "''${STTY_SIZE%% *}" --setenv COLUMNS "''${STTY_SIZE##* }")
-    fi
 
     # Everything the mount controller needs about this session, for the
     # launch-time mounts below and for every later attach/detach: the holder
@@ -1786,10 +1838,11 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv SELFTEST_NET "$NET_FILTER")
       BWRAP_ARGS+=(--setenv SELFTEST_CONFIGDIR "/home/user/${toolDefaults.configDirName}")
       BWRAP_ARGS+=(--setenv SELFTEST_UNSHARE "${selftestUnshare}")
+      BWRAP_ARGS+=(--setenv SELFTEST_TIOCSTI "${selftestTiocsti}")
       BWRAP_ARGS+=(--setenv SELFTEST_DOMAIN "${selftestDomain}")
       BWRAP_ARGS+=(--setenv SELFTEST_GITMODE "$GIT_MODE")
       BWRAP_ARGS+=(--ro-bind "${selftestProbe}" /selftest.sh)
-      nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
+      run_jail bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
       exit $?
     fi
 
@@ -1884,13 +1937,15 @@ pkgs.writeShellApplication {
       TOOLBOX_REG="$REG_DIR/$$.toolbox"
       ln -sfn "$TOOLBOX_DIR" "$TOOLBOX_REG"
       ln -sfn "$TOOLBOX_DIR" "$REG_DIR/current.toolbox"
-      vlog "toolbox: $TOOLBOX_DIR -> ${toolbox.guestDir} (${toolboxCli} add PKG)"
+      vlog "toolbox: $TOOLBOX_DIR -> ${toolbox.guestDir} (${custodyCli} toolbox add PKG)"
       if [ "$USERVAR_ON" = "1" ]; then
         emit_uservar llm_custody_toolbox "$TOOLBOX_DIR"
         # The CLI's own store path alongside the directory: a consumer of the
         # var above still has to *run* something, and with `nix run` there is
-        # no llm-custody-toolbox on PATH to run. The store path always works.
-        emit_uservar llm_custody_toolbox_cmd "${toolboxCli}"
+        # no llm-custody on PATH to run. The store path always works. The var
+        # keeps its name because consumers key on it; its value is the whole
+        # CLI now, so a keybinding runs `"$cmd" --dir "$dir" toolbox add PKG`.
+        emit_uservar llm_custody_toolbox_cmd "${custodyCli}"
         USERVAR_SET=1
       fi
 
@@ -1904,11 +1959,11 @@ pkgs.writeShellApplication {
       # terminal for the whole session, and a line of broker chatter landing
       # inside one of its frames corrupts the display (the same reason the
       # dirty-count user var is only emitted on change). The operator
-      # discovers requests with `llm-custody-toolbox requests`, not by
+      # discovers requests with `llm-custody request list`, not by
       # watching this.
       # --mount-cmd: an approved mount request runs this session's mount
       # launcher, so the broker never grows a second way of attaching a tree.
-      ${toolboxCli} --dir "$TOOLBOX_DIR" serve \
+      ${custodyCli} --dir "$TOOLBOX_DIR" serve \
         --broker-id "$$" --label "${name} $WORKSPACE_HOST" \
         --uservar "$USERVAR_ON" --mount-cmd "$RUNDIR/mount" \
         >"$RUNDIR/broker.log" 2>&1 &
@@ -1928,7 +1983,7 @@ pkgs.writeShellApplication {
         # A socket is an inode, so bwrap binds it like any other file.
         BWRAP_ARGS+=(--bind "$BROKER_SOCK" /run/custody-request.sock)
         BWRAP_ARGS+=(--setenv CUSTODY_REQUEST_SOCKET /run/custody-request.sock)
-        vlog "broker: $BROKER_SOCK -> /run/custody-request.sock (${toolboxCli} requests)"
+        vlog "broker: $BROKER_SOCK -> /run/custody-request.sock (${custodyCli} request list)"
       else
         # Not fatal: the session is still perfectly usable, the agent just has
         # to ask in its reply the way it did before there was a broker.
@@ -1980,8 +2035,8 @@ pkgs.writeShellApplication {
       ln -sfn "$RUNDIR/mount" "$MOUNT_REG"
       ln -sfn "$RUNDIR/mount" "$REG_DIR/current.mount"
 
-      vlog "mid-session sync: $RUNDIR/sync (also $REG_DIR/current, or llm-custody-sync)"
-      vlog "live mounts: $RUNDIR/mount add|remove|list (also $REG_DIR/current.mount, or llm-custody-mount)"
+      vlog "mid-session sync: $RUNDIR/sync (also $REG_DIR/current, or llm-custody sync)"
+      vlog "live mounts: $RUNDIR/mount add|remove|list (also $REG_DIR/current.mount, or llm-custody mount)"
 
       # Terminals that understand OSC 1337 SetUserVar get both paths as
       # variables too, which is what makes a one-key binding possible.
@@ -2145,6 +2200,6 @@ pkgs.writeShellApplication {
     LAUNCHED=1
     # Always through the holder, filter or not: its mount namespace is what
     # live mounts propagate through.
-    nsenter_holder bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"
+    run_jail bwrap "''${BWRAP_ARGS[@]}" -- ${toolExe} "''${TOOL_ARGS[@]+"''${TOOL_ARGS[@]}"}"
   '';
 }

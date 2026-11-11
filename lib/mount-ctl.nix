@@ -1,5 +1,5 @@
 # Mount controller, shared by the runner (launch-time mounts), the operator's
-# $RUNDIR/mount / llm-custody-mount, and the request broker (approving an
+# $RUNDIR/mount / `llm-custody mount`, and the request broker (approving an
 # agent's `custody-request --mount`). The shell lives in mount-ctl.sh and the
 # tree helpers it shares with the runner in jail-tree.sh - both plain files
 # with no Nix interpolation; this only joins them and bakes in the store path

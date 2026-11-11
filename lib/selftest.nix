@@ -71,6 +71,18 @@ pkgs.writeText "llm-custody-selftest.sh" ''
   else
     echo "SKIP: unshare binary not present"
   fi
+  # Terminal input injection: the tool keeps the controlling terminal (no
+  # bwrap --new-session), so this seccomp rule is what stands in for it.
+  if [ -x "$SELFTEST_TIOCSTI" ]; then
+    if out=$("$SELFTEST_TIOCSTI"); then
+      echo "OK: ioctl(TIOCSTI) blocked by seccomp"
+    else
+      echo "FAIL: $out - seccomp rule for TIOCSTI not in effect"
+      exit 1
+    fi
+  else
+    echo "SKIP: tiocsti probe not present"
+  fi
   if [ "$SELFTEST_NET" = "1" ]; then
     if command -v getent >/dev/null 2>&1; then
       # getent ahostsv4 is broken/empty in this glibc (rc=2 even for names

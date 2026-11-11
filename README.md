@@ -54,6 +54,19 @@ nix run .#pi -- -p "Refactor the auth module"
 nix run .#claude -- --dangerous -- -p "Refactor the auth module"
 ```
 
+Everything else on the host - the package profile the jail sees, the
+requests it blocks on, the trees attached to a running session - is one
+command, `llm-custody`, which is the flake's default package:
+
+```bash
+nix run . -- launch pi -p "Refactor the auth module"      # same as .#pi
+nix run . -- session list                                 # what is running
+nix run . -- toolbox add ripgrep                          # provision a tool
+nix run . -- request answer                               # answer what a jail asked
+```
+
+See [One command on the host](#one-command-on-the-host) for the whole tree.
+
 ## First run & authentication
 
 Tool state lives in a jail-private directory on the host -
@@ -88,10 +101,59 @@ you can point `--state-dir` at a directory that itself contains a
 credentials independently). Do not point it directly at a directory the host
 tool also writes to.
 
+## One command on the host
+
+Everything host-side is one binary with a subcommand per feature, so the
+sandbox has a single entry point to discover:
+
+```
+llm-custody [--dir TOOLBOX] [--pid PID] [--pause] <command> [ARG...]
+
+  launch TOOL ...   start a sandboxed tool, no TOOL lists them
+  mount ...         attach a host tree to a live session, or detach one
+  sync ...          fold a live session's isolated trees back to the host
+  session list      the live sessions and what each one has outstanding
+  request ...       the package and mount requests jailed agents wait on
+  toolbox ...       the package profile every jail sees on its PATH
+  lease ...         how long an added package survives without being used
+  serve             the per-jail request broker, started by the runner
+```
+
+`--dir` picks the toolbox profile to act on, `--pid` the session (default:
+the most recently started one), and `--pause` waits for a keypress before
+exiting, so a pane a terminal keybinding spawned does not close over the
+output. `llm-custody help <command>` and `llm-custody <command> --help` are
+the same page.
+
+The package is `packages.default`, also exposed as `packages.llm-custody`,
+so `nix run . -- session list` works straight from a checkout. The per-tool
+runners stay what `nix run .#pi` and `nix run .#claude` run, and
+`llm-custody launch pi` is the same runner reached through the umbrella.
+
+`session list` is the overview of what is running, and needs no terminal
+integration to read:
+
+```console
+$ llm-custody session list
+pid 48213  pi  /home/user/devel/llm-custody
+    git limited, no overlay, 7 unsynced path(s), 1 mount(s), 0 request(s) pending
+    sync   /tmp/tmp.T4dWf4vSKz/sync
+    mount  /tmp/tmp.T4dWf4vSKz/mount
+```
+
+The two launcher paths in that block are what `sync` and `mount` exec for
+that session; they are the session's own, so a second terminal needs nothing
+from the first.
+
+`custody-request` is the same binary under another name, on the jail's PATH,
+and is the only part of this an agent can reach - see [Asking from inside the
+jail](#asking-from-inside-the-jail).
+
 ## Usage
 
 ```
 llm-custody-<tool> [options] [-- tool-args...]
+llm-custody launch <tool> [options] [-- tool-args...]
 ```
 
 ### Options
@@ -164,24 +226,27 @@ tool worth provisioning once is worth having everywhere and none of it is
 session state.
 
 ```bash
-nix run .#toolbox -- add lua5_4 shellcheck   # install (or renew), host-side
-nix run .#toolbox -- list                    # what is in there
-nix run .#toolbox -- leases                  # ... and how long it stays
-nix run .#toolbox -- renew shellcheck        # push its lease out, install nothing
-nix run .#toolbox -- remove shellcheck       # (alias: rm)
-nix run .#toolbox -- pin shellcheck          # never expire this one
-nix run .#toolbox -- upgrade                 # re-resolve every installed ref
-nix run .#toolbox -- upgrade ripgrep         # or just one of them
-nix run .#toolbox -- prune                   # drop what nobody asked for lately
-nix run .#toolbox -- gc                      # drop the old generations
-nix run .#toolbox                            # prompt for a line of names
+llm-custody toolbox add lua5_4 shellcheck   # install (or renew), host-side
+llm-custody toolbox list                    # what is in there
+llm-custody lease list                      # ... and how long it stays
+llm-custody lease renew shellcheck          # push its lease out, install nothing
+llm-custody toolbox remove shellcheck       # (alias: rm)
+llm-custody lease pin shellcheck            # never expire this one
+llm-custody toolbox upgrade                 # re-resolve every installed ref
+llm-custody toolbox upgrade ripgrep         # or just one of them
+llm-custody lease prune                     # drop what nobody asked for lately
+llm-custody lease gc                        # drop the old generations
+llm-custody toolbox                         # prompt for a line of names
 
-nix run .#toolbox -- requests                # what the running jails asked for
-nix run .#toolbox -- approve 41207.1         # install it and unblock the jail
-nix run .#toolbox -- deny 41207.1 --reason X # refuse, profile untouched
+llm-custody request list                    # what the running jails asked for
+llm-custody request approve 41207.1         # install it and unblock the jail
+llm-custody request deny 41207.1 --reason X # refuse, profile untouched
 ```
 
-`llm-custody-toolbox` is a Rust binary (`toolbox/`) with no dependencies
+Without the command on the host's PATH, every one of those reads
+`nix run . -- toolbox add lua5_4 shellcheck` and so on.
+
+`llm-custody` is a Rust binary (`toolbox/`) with no dependencies
 outside std, so it builds offline. It calls `nix` and `nix-store` with argv
 arrays and reads `nix profile list --json`: nothing an agent can influence -
 an attribute name, a reason string - is ever assembled into a shell command,
@@ -204,7 +269,7 @@ holds a GC root on. Like `add`, it leaves the previous generation pinned
 behind it; see [Garbage collection](#garbage-collection).
 
 **Additions apply to a running session.** The bind is live: `nix profile
-install` writes a new generation, `llm-custody-toolbox` retargets the
+install` writes a new generation, `llm-custody toolbox` retargets the
 `current` symlink the sandbox resolves through, and the next PATH lookup
 inside the jail finds the new binary. Nothing has to be restarted, which is
 the point - the agent asks for a tool mid-task and keeps going once you have
@@ -221,8 +286,9 @@ pane.
 
 A second var, `llm_custody_toolbox_cmd`, carries the CLI's own store path.
 `nix run .#pi` is the documented way to start a jail and it installs nothing
-on the host, so a keybinding that called `llm-custody-toolbox` by name would
-find no such command; the store path always resolves.
+on the host, so a keybinding that called `llm-custody` by name would find no
+such command; the store path always resolves. The var keeps the name it was
+introduced with, because consumers key on it.
 
 ### Asking from inside the jail
 
@@ -235,10 +301,10 @@ custody-request shellcheck --reason "Validate scripts"
 and blocks there. The request shows up on the host:
 
 ```console
-$ llm-custody-toolbox requests
+$ llm-custody request list
 ID      PACKAGE     AGE  JAIL               REASON
 41207.1 shellcheck  2m   pi /workspace/foo  Validate scripts
-$ llm-custody-toolbox approve 41207.1
+$ llm-custody request approve 41207.1
 ```
 
 The same channel carries a request for a host directory:
@@ -248,16 +314,17 @@ custody-request --mount /srv/datasets/2024 --reason "The task reads the raw expo
 ```
 
 ```console
-$ llm-custody-toolbox requests
+$ llm-custody request list
 ID      REQUEST                    AGE  JAIL               REASON
 41207.2 mount /srv/datasets/2024   1m   pi /workspace/foo  The task reads the raw exports
-$ llm-custody-toolbox approve 41207.2 --mode ro
+$ llm-custody request approve 41207.2 --mode ro
 ```
 
 The agent names a path and a reason, nothing else; how the tree is attached
 is the operator's choice at approval (`--mode ro|full|limited|none|overlay`,
-default read-only, and the interactive `answer` asks for it). Approval runs
-the session's own mount launcher, the same one a keybinding runs - see
+default read-only, and the interactive `request answer` asks for it).
+Approval runs the session's own mount launcher, the same one a keybinding
+runs - see
 [Live mounts](#live-mounts) - and the client is told where the tree landed
 (`/workspace/2024` here).
 
@@ -270,9 +337,9 @@ see the package (see [Providing packages](#providing-packages)). Check which
 toolbox a broker serves with `cat
 $XDG_RUNTIME_DIR/llm-custody/brokers/*/meta`.
 
-Denial (`deny ID [--reason TEXT]`) leaves the profile untouched and the
-client exits 3, which the agent is told to read as a final answer rather than
-a retry. Nothing happens without an operator: there is no auto-approval and
+Denial (`request deny ID [--reason TEXT]`) leaves the profile untouched and
+the client exits 3, which the agent is told to read as a final answer rather
+than a retry. Nothing happens without an operator: there is no auto-approval and
 no timer that approves.
 
 A request that nobody answers before `--timeout` exits **4**, not 3, and says
@@ -281,7 +348,7 @@ exists: a denial is an answer and the agent is told to accept it, while an
 operator who was away from the terminal has decided nothing, and an agent that
 recorded that as a refusal would be reporting a decision that was never made.
 
-Each jail runner starts its own broker (`llm-custody-toolbox serve`) and binds
+Each jail runner starts its own broker (`llm-custody serve`) and binds
 **one** of its two sockets into the sandbox:
 
 | Socket | Bound into the jail | Verbs |
@@ -304,8 +371,9 @@ gets to ask for by name.
 ### Being told, instead of polling
 
 A request blocks the agent, so the operator needs to find out without running
-`requests` on a timer. The broker publishes every queue change three ways,
-all of them best-effort and none of them able to affect the request itself:
+`request list` on a timer. The broker publishes every queue change three
+ways, all of them best-effort and none of them able to affect the request
+itself:
 
 | Sink | When | Notes |
 |------|------|-------|
@@ -313,7 +381,7 @@ all of them best-effort and none of them able to affect the request itself:
 | `llm_custody_requests` user var | on change | OSC 1337, empty when the queue drains |
 | `--notify-hook` | every change | your command, argv only |
 
-`requests --json` prints the queue flattened across every broker, oldest
+`request list --json` prints the queue flattened across every broker, oldest
 first - the one that has been blocking an agent longest is the one to answer
 first, and a stable order keeps a picker's entries from jumping around.
 
@@ -323,7 +391,7 @@ there is unsynced work, plain otherwise. Orange wins because the two states
 differ in who has to act - unsynced work waits on nothing, a pending request
 has stopped the agent until you answer.
 
-**`llm-custody-toolbox answer`** is the queue, interactively:
+**`llm-custody request answer`** is the queue, interactively:
 
 ```console
 2 pending package request(s)
@@ -346,8 +414,8 @@ is what `Ctrl+Shift+r` runs in a split. WezTerm has a selector widget, but it
 is a full-window overlay with no size control, and it would have made the
 feature WezTerm-only; a command in a pane is sized by the pane and works the
 same over ssh, under tmux and in a terminal with no picker widget at all.
-`requests --json` remains for anything that does want to build its own, with
-a short read timeout on the CLI side so a wedged broker cannot freeze a
+`request list --json` remains for anything that does want to build its own,
+with a short read timeout on the CLI side so a wedged broker cannot freeze a
 caller that is blocking on it.
 
 The broker writes that user variable straight to the terminal, mid-session,
@@ -387,9 +455,9 @@ does not delay the approval by a millisecond. `notify-send` is the obvious
 one to put there if you want a desktop popup as well.
 
 Both sockets live under `$XDG_RUNTIME_DIR/llm-custody/brokers/<pid>/`, so
-several jails broker in parallel and `requests` aggregates across all of them;
-a request id is `<broker>.<n>`, which is how `approve` finds the broker
-holding it. Requests are bounded (8 KiB per message, 128 characters of
+several jails broker in parallel and `request list` aggregates across all of
+them; a request id is `<broker>.<n>`, which is how `approve` finds the
+broker holding it. Requests are bounded (8 KiB per message, 128 characters of
 attribute, 512 of reason, 32 pending per broker) and held until approved,
 denied, disconnected, or timed out (`serve --timeout`, default 30m). A client
 that dies is dropped from the queue within a poll interval rather than
@@ -406,7 +474,7 @@ live one is exactly what the pid check below refuses to prune.
 The runner removes the broker's registration on exit; the broker also removes
 it on SIGTERM/SIGINT itself, and the host CLI prunes any registration whose
 pid is gone. Three layers, because the only thing worse than a stale socket is
-a `requests` list the operator cannot act on.
+a request list the operator cannot act on.
 
 If no broker is running - an older runner, or `serve` failed to start - the
 launcher notice tells the agent to fall back to ending its reply with:
@@ -416,7 +484,7 @@ required packages: lua5_4, shellcheck
 good-to-have packages: ripgrep
 ```
 
-`llm-custody-toolbox add` accepts that line pasted verbatim - the labels and
+`llm-custody toolbox add` accepts that line pasted verbatim - the labels and
 commas are stripped - so answering it is a copy, a paste and a return.
 `, -p <command>` works inside the jail (nix-index's database is local) and is
 how the agent turns a command name into a nixpkgs attribute.
@@ -470,13 +538,13 @@ them. Every jail start runs it (see below), so this happens whether or not
 anyone thinks about it.
 
 ```bash
-llm-custody-toolbox add shellcheck       # install, 30-day lease starts
-llm-custody-toolbox add shellcheck       # ... and that is also how you renew
-llm-custody-toolbox renew shellcheck     # renew without reinstalling
-llm-custody-toolbox pin shellcheck       # drop the lease: permanent
-llm-custody-toolbox leases               # package, lease age, expiry
-llm-custody-toolbox prune --older-than 30d
-llm-custody-toolbox prune --dry-run      # report what would go
+llm-custody toolbox add shellcheck     # install, 30-day lease starts
+llm-custody toolbox add shellcheck     # ... and that is also how you renew
+llm-custody lease renew shellcheck     # renew without reinstalling
+llm-custody lease pin shellcheck       # drop the lease: permanent
+llm-custody lease list                 # package, lease age, expiry
+llm-custody lease prune --older-than 30d
+llm-custody lease prune --dry-run      # report what would go
 ```
 
 **`add` is also the renewal.** The thing an operator does naturally - answer
@@ -491,10 +559,11 @@ pushing a lease out without naming a flake reference, and putting a
 
 `prune`'s period defaults to 30 days and is spelled like `gc`'s:
 `--older-than 30d`, or a bare count of days. `LLMCUSTODY_TOOLBOX_LEASE_DAYS`
-moves that default for a host that wants a different one, and `leases` takes
-the same flag so its expiry column can be read against another lifetime.
+moves that default for a host that wants a different one, and `lease list`
+takes the same flag so its expiry column can be read against another
+lifetime.
 
-`leases` lists the leased packages with the age of each lease and what is
+`lease list` lists the leased packages with the age of each lease and what is
 left of it, then the installed elements that hold no lease at all:
 
 ```
@@ -537,7 +606,7 @@ by the time it runs, the expired paths are already unreferenced.
 ### Garbage collection
 
 A profile outside `/nix/var/nix/profiles` is not a GC root on its own, so
-`llm-custody-toolbox` writes `current` with `nix-store --indirect --add-root`
+`llm-custody` writes `current` with `nix-store --indirect --add-root`
 and the toolbox survives `nix-collect-garbage`. If that call fails it falls
 back to a plain symlink and says so - the contents then last until the next
 GC, and a re-`add` restores them.
@@ -550,9 +619,9 @@ upgraded toolbox is the expensive case, since each stale generation pins a
 whole old closure of everything in it.
 
 ```bash
-nix run .#toolbox -- gc                      # drop every generation but the current one
-nix run .#toolbox -- gc --older-than 30d     # keep the recent ones
-nix run .#toolbox -- gc --dry-run            # report first
+llm-custody lease gc                     # drop every generation but the current one
+llm-custody lease gc --older-than 30d    # keep the recent ones
+llm-custody lease gc --dry-run           # report first
 ```
 
 Both of these run on their own at every jail start (see [Package
@@ -658,29 +727,31 @@ that every extra mount, launch-time ones included, now goes through one
 controller.
 
 ```bash
-llm-custody-mount add /srv/datasets/2024                     # read-only, at /workspace/2024
-llm-custody-mount add --mode limited /devel/other-checkout   # synced copy, like --git limited
-llm-custody-mount add --mode full --guest /mnt/scratch /tmp/scratch
-llm-custody-mount list
-llm-custody-mount remove 2024                                # by name or by guest path
+llm-custody mount add /srv/datasets/2024                     # read-only, at /workspace/2024
+llm-custody mount add --mode limited /devel/other-checkout   # synced copy, like --git limited
+llm-custody mount add --mode full --guest /mnt/scratch /tmp/scratch
+llm-custody mount list
+llm-custody mount remove 2024                                # by name or by guest path
 ```
 
 `add` takes the same modes the workspace has (`ro`, `full`, `limited`,
 `none`, `overlay`; `copy` is an alias for `limited`), defaulting to
 read-only. A copy or overlay mount joins the session's sync manifest the
-moment it is attached, so the dirty indicator counts it, `llm-custody-sync`
+moment it is attached, so the dirty indicator counts it, `llm-custody sync`
 folds it back, and the exit trap reviews it like one from launch. `remove`
 of such a mount offers the sync-back first (`--auto` syncs a copy without
 asking, `--discard` skips it), then detaches.
 
-`llm-custody-mount` is a front end over the session registry, like
-`llm-custody-sync`: it finds the most recent session's launcher
-(`$XDG_RUNTIME_DIR/llm-custody/current.mount`, `--pid` for another one), and
-with no command at all it prompts for a path and mounts it read-only - the
-shape a terminal keybinding wants. The launcher path is also published as
-the `llm_custody_mount` user var next to `llm_custody_sync`, and `--pause`
-keeps a spawned pane open over the output. A session started by a runner
-from before live mounts existed has no launcher and is reported as such.
+`llm-custody mount` is a front end over the session registry, like
+`llm-custody sync`: it finds the most recent session's launcher
+(`$XDG_RUNTIME_DIR/llm-custody/current.mount`; `llm-custody --pid N mount`
+for another one, the flag being global and therefore written before the
+command), and with no command at all it prompts for a path and mounts it
+read-only - the shape a terminal keybinding wants. The launcher path is also
+published as the `llm_custody_mount` user var next to `llm_custody_sync`,
+and `--pause` keeps a spawned pane open over the output. A session started
+by a runner from before live mounts existed has no launcher and is reported
+as such.
 
 How it works without touching the jail: the namespace holder the runner
 starts (`unshare --user --mount --propagation shared`, plus `--net` with
@@ -827,12 +898,12 @@ same sync-back out as a standalone command, runnable from a second terminal
 as often as you like while the session keeps going:
 
 ```bash
-nix run .#sync                            # the most recently started run
-nix run .#sync -- --list                  # live sessions, with their pids
-nix run .#sync -- 48213                   # a specific run, for concurrent sessions
+llm-custody sync                          # the most recently started run
+llm-custody session list                  # live sessions, with their pids
+llm-custody --pid 48213 sync              # a specific run, for concurrent sessions
 ```
 
-`llm-custody-sync` is a front end over a registry of live runs:
+`llm-custody sync` is a front end over a registry of live runs:
 
 ```bash
 $XDG_RUNTIME_DIR/llm-custody/current      # the most recently started run
@@ -847,10 +918,10 @@ to ask about for the parts already synced.
 Alongside those, every run registers `$XDG_RUNTIME_DIR/llm-custody/<pid>.state`
 describing itself (see the state record below). A run with no isolated tree
 (`--git full` without `--overlay-workspace`) has no sync-back to register, so
-the record is all it leaves: `--list` still shows it, and syncing it reports
-that there is nothing to fold back and exits 0. "Your changes are already on
-the host" and "no jail is running" are opposite answers, and without the
-record they looked identical from outside.
+the record is all it leaves: `session list` still shows it, and syncing it
+reports that there is nothing to fold back and exits 0. "Your changes are
+already on the host" and "no jail is running" are opposite answers, and
+without the record they looked identical from outside.
 
 Every prompt takes `d` as well as `y`/`N`: `d` pages the full diff of what
 is about to be written to the host (through `$PAGER`) and asks again.
@@ -972,7 +1043,7 @@ wezterm.action_callback(function(window, pane)
   local dir = vars.llm_custody_toolbox
   if not dir or dir == '' then return end
   -- store path, because `nix run .#pi` installs nothing on the host
-  local cmd = vars.llm_custody_toolbox_cmd or 'llm-custody-toolbox'
+  local cmd = vars.llm_custody_toolbox_cmd or 'llm-custody'
   window:perform_action(wezterm.action.PromptInputLine {
     description = 'package(s) to add to the jail',
     action = wezterm.action_callback(function(w, p, line)
@@ -980,7 +1051,7 @@ wezterm.action_callback(function(window, pane)
       -- the line is user input: pass it as an argument, never concatenated
       -- into a shell string
       w:perform_action(wezterm.action.SpawnCommandInNewTab {
-        args = { cmd, '--dir', dir, '--pause', 'add', line },
+        args = { cmd, '--dir', dir, '--pause', 'toolbox', 'add', line },
       }, p)
     end),
   }, pane)
@@ -1030,13 +1101,16 @@ end)
 ```
 
 The count itself is better placed somewhere with room to vary - a status
-line, or just `llm-custody-sync --list`.
+line, or just `llm-custody session list`.
 
-`llm-custody-sync --list` reports the same count per live session, which
+`llm-custody session list` reports the same count per live session, which
 needs no terminal support at all:
 
 ```
-/tmp/tmp.T4dWf4vSKz/sync  (pid 48213, 7 unsynced path(s))
+pid 48213  pi  /home/user/devel/llm-custody
+    git limited, no overlay, 7 unsynced path(s), 1 mount(s), 0 request(s) pending
+    sync   /tmp/tmp.T4dWf4vSKz/sync
+    mount  /tmp/tmp.T4dWf4vSKz/mount
 ```
 
 ## What's isolated
@@ -1073,10 +1147,24 @@ bound paths are visible inside it:
   [Live mounts](#live-mounts)). Read-only so the agent cannot populate them
 - Any directories added via `--mount` / `--ro-mount`, by default under
   `/workspace` next to the workspace itself, and anything attached later
-  with `llm-custody-mount` or an approved `custody-request --mount`. A
+  with `llm-custody mount add` or an approved `custody-request --mount`. A
   read-write one is isolated the same way the workspace is (copy, overlay
   or real tree, per `--git` / `--overlay-workspace`) and reviewed on the way
   back out - see [Syncing changes back](#syncing-changes-back)
+
+The sandboxed tool keeps the controlling terminal (no bwrap
+`--new-session`): a process detached from it never receives SIGWINCH, so
+pi/claude would keep painting at the launch width after a pane resize or a
+split and the redraw lands as garbage. The input injection that flag guards
+against is closed by the seccomp denylist instead, which refuses
+`ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` with EPERM (the alternative bwrap's
+own documentation names for this case; `--selftest` probes it). On a
+terminal the tool also runs in a process group of its own (job control in
+the runner), so a `kill(0)` from inside the jail cannot reach the runner's
+helpers (broker, dirty watcher, network) and SIGWINCH has one unambiguous
+foreground group to go to. That group's leader is a `timeout --foreground
+0` sitting in the host workspace, because terminal splits take a new
+pane's cwd from the foreground leader and bwrap itself sits at `/`.
 
 The sandboxed process runs without `CAP_SYS_ADMIN` (bwrap
 `--cap-drop CAP_SYS_ADMIN`), so it cannot create bind mounts or remount
@@ -1121,7 +1209,9 @@ holder process (not the host's), so the sandbox gets a private network too.
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`
 - `OPENAI_API_KEY`, `OPENAI_BASE_URL`
 - `AWS_*`
-- `TERM`, `COLORTERM`, `LINES`, `COLUMNS`, `LANG`, `LC_ALL`, `LC_CTYPE`
+- `TERM`, `COLORTERM`, `LANG`, `LC_ALL`, `LC_CTYPE` (not `LINES`/`COLUMNS`:
+  the terminal size comes from the pty and follows resizes, a fixed value
+  in the environment would pin ncurses-style tools to the launch size)
 - Anything passed via `--env KEY=VAL`
 
 `DISPLAY`, `XAUTHORITY`, and `WAYLAND_DISPLAY` are explicitly stripped by
@@ -1243,7 +1333,7 @@ whitelisted domains unless you pass `--no-net-filter`.
 |    - dnsmasq (domain whitelist) + nftables (IP gate)      |
 |    - opens seccomp fd (lib/seccomp-denylist.nix)          |
 |    - attaches every --mount in the holder (lib/mount-ctl) |
-|    - starts the request broker (toolbox/, serve)          |
+|    - starts the request broker (llm-custody serve)        |
 |    - nsenter's into the holder, execs bwrap ...           |
 |    - on demand (lib/mount-ctl.sh): attaches/detaches      |
 |      trees under /workspace and /mnt by propagation       |
@@ -1287,6 +1377,16 @@ in
 Useful for pinning a specific version, applying local patches, or testing an
 unreleased build.
 
+`llm-custody launch` execs whichever runner the umbrella was built with, so a
+consumer that overrides a runner has to hand the result back to the umbrella
+for `launch` to see it:
+
+```nix
+llm-custody.default.override {
+  runners = { pi = my-pi; claude = my-claude; };
+}
+```
+
 ## Adding a new tool
 
 1. Add `launchers/<tool>.nix`: a plain function
@@ -1295,7 +1395,9 @@ unreleased build.
    `configEnvVar`, `skillsDir`, `allowedDomains`, `resumeFlags`, plus
    optional `dangerousFlag` and `mergeSkipKeys`).
 3. Wire the tool's package into `flake.nix`'s `defaultArgs`.
-4. `nix run .#your-tool` - the flake generates a runner automatically.
+4. `nix run .#your-tool` - the flake generates a runner automatically, and
+   `llm-custody launch your-tool` finds it too: the umbrella's runner
+   directory and its completions are built from the same attribute set.
 
 A launcher should also append `lib/toolbox.nix`'s `notice` to whatever
 user-level memory file its tool reads, the way `launchers/pi.nix` and

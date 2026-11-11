@@ -1,8 +1,11 @@
-# The toolbox manager and request broker (../toolbox), built from source.
+# The `llm-custody` binary (../toolbox), built from source: toolbox manager,
+# lease keeper, request broker and the front end over the live-session
+# registry, all behind one subcommand tree.
 #
-# Imported by flake.nix as `packages.toolbox` and by lib/mkBwrapRunner.nix,
-# which needs the same store path twice: once to tell the operator what to run,
-# and once to symlink as `custody-request` on the jail's PATH.
+# Imported by lib/umbrella.nix, which wraps it so `llm-custody launch` finds
+# the runner scripts, and by lib/mkBwrapRunner.nix, which needs this store
+# path twice: once to tell the operator what to run, and once to symlink as
+# `custody-request` on the jail's PATH (the binary dispatches on argv[0]).
 #
 # No cargoHash and no vendor directory: the crate has no dependencies (see
 # ../toolbox/Cargo.toml for why), so `cargoLock.lockFile` has nothing to fetch
@@ -20,7 +23,9 @@ pkgs.rustPlatform.buildRustPackage {
   # running daemon, so it has to be found on PATH at run time rather than
   # pinned here to whatever nixpkgs happens to carry.
   meta = {
-    description = "Host-side package toolbox and request broker for llm-custody jails";
-    mainProgram = "llm-custody-toolbox";
+    description = "Host-side CLI for llm-custody jails: toolbox, leases, request broker, sessions";
+    # The unwrapped binary. lib/umbrella.nix wraps it under the same name and
+    # is what the flake exposes; only `launch` depends on that wrapper.
+    mainProgram = "llm-custody";
   };
 }
