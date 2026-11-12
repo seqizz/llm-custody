@@ -3,18 +3,21 @@
 //!
 //! The runner publishes every run under `$XDG_RUNTIME_DIR/llm-custody` as
 //! `<pid>.state` (a `key=value` record describing the session), plus the
-//! `<pid>.sync` / `<pid>.mount` launcher symlinks and a `current` /
-//! `current.mount` pair naming the most recently started run.
+//! `<pid>.sync` / `<pid>.mount` / `<pid>.domain` launcher symlinks and a
+//! `current` / `current.mount` / `current.domain` set naming the most recently
+//! started run. The domain pair exists only for a run with a network filter.
 //!
 //! All of this stays host-side: `$RUNDIR` is never mounted into a sandbox,
 //! which is what keeps a jailed agent from folding its own work out to the
 //! host unreviewed or attaching another tree to itself.
 
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use crate::domain;
 use crate::paths;
 use crate::proto;
 use crate::util::{self, fail, Error, Result, EXIT_ERROR};
@@ -91,9 +94,16 @@ pub struct Session {
     pub sync: String,
     pub reason: String,
     pub mount: String,
+    /// The domain launcher; empty when the session has no network filter.
+    pub domain: String,
     pub dirty: u64,
     pub mounts: usize,
     pub pending: usize,
+    /// Domains added to the whitelist after launch, and distinct names the
+    /// filter has blocked so far. None when there is no domain launcher or it
+    /// did not answer in time.
+    pub domains: Option<usize>,
+    pub blocked: Option<usize>,
 }
 
 pub struct Registry {
@@ -131,6 +141,56 @@ impl Registry {
             return Ok(target);
         }
         no_such_session(&target)
+    }
+
+    /// The session's domain launcher, and the pid of the session it belongs
+    /// to when that can be told (always with `--pid`; for `current.domain`
+    /// only when a live state record names the same launcher).
+    pub fn resolve_domain(&self, pid: Option<&str>) -> Result<(PathBuf, Option<String>)> {
+        let target = self.target(pid, "current.domain", ".domain")?;
+        if target.exists() {
+            let owner = match pid {
+                Some(p) => Some(p.to_string()),
+                None => self.owner_of("domain", &target),
+            };
+            return Ok((target, owner));
+        }
+        // A live session without a launcher is one started without a network
+        // filter, which deserves its own answer rather than "no such session".
+        // Without --pid the current session is found through current.mount,
+        // which every run registers whatever its network setup.
+        let owner = match pid {
+            Some(p) => Some(p.to_string()),
+            None => self.owner_of("mount", &self.dir.join("current.mount")),
+        };
+        let rec = owner.and_then(|p| Record::read(&self.dir.join(format!("{p}.state"))));
+        if let Some(rec) = rec {
+            if rec.get("domain").is_empty() {
+                return fail(format!(
+                    "session {} runs without a network filter, every domain is reachable",
+                    rec.get("pid")
+                ));
+            }
+        }
+        no_such_session(&target)
+    }
+
+    /// Which live session registered this launcher under `key` in its state
+    /// record. Compared after resolving symlinks on both sides, because the
+    /// registry links and the record may spell the same $RUNDIR differently.
+    fn owner_of(&self, key: &str, launcher: &Path) -> Option<String> {
+        let want = fs::canonicalize(launcher).ok()?;
+        for (pid, path) in self.live_state_files() {
+            let rec = match Record::read(&path) {
+                Some(r) => r,
+                None => continue,
+            };
+            let l = rec.get(key);
+            if !l.is_empty() && fs::canonicalize(l).ok().as_deref() == Some(want.as_path()) {
+                return Some(pid.to_string());
+            }
+        }
+        None
     }
 
     pub fn resolve_sync(&self, pid: Option<&str>) -> Result<SyncTarget> {
@@ -220,6 +280,8 @@ impl Registry {
             };
             let sync = rec.get("sync").to_string();
             let mount = rec.get("mount").to_string();
+            let domain = rec.get("domain").to_string();
+            let (domains, blocked) = domain_counts(&domain);
             // Both launchers live in the session's $RUNDIR, which is also
             // where the dirty counter and the mount records are, so one of
             // them is enough to find the rest.
@@ -241,9 +303,12 @@ impl Registry {
                 reason: rec.reason(),
                 sync,
                 mount,
+                domain,
                 dirty: rundir.as_deref().map(dirty_count).unwrap_or(0),
                 mounts: rundir.as_deref().map(mount_count).unwrap_or(0),
                 pending: pending_count(&broker),
+                domains,
+                blocked,
             });
         }
         for (pid, path) in self.legacy_sync_links() {
@@ -257,9 +322,12 @@ impl Registry {
                 sync: path.display().to_string(),
                 reason: String::new(),
                 mount: String::new(),
+                domain: String::new(),
                 dirty: 0,
                 mounts: 0,
                 pending: 0,
+                domains: None,
+                blocked: None,
             });
         }
         out.sort_by(|a, b| a.pid.cmp(&b.pid));
@@ -294,6 +362,16 @@ impl Registry {
                 s.mounts,
                 s.pending
             );
+            if s.domain.is_empty() {
+                println!("    net    no network filter");
+            } else {
+                let n = |v: Option<usize>| v.map_or("?".to_string(), |n| n.to_string());
+                println!(
+                    "    net    {} domain(s) added live, {} name(s) blocked",
+                    n(s.domains),
+                    n(s.blocked)
+                );
+            }
             if s.sync.is_empty() {
                 println!("    sync   nothing to sync - {}", s.reason);
             } else {
@@ -301,6 +379,9 @@ impl Registry {
             }
             if !s.mount.is_empty() {
                 println!("    mount  {}", s.mount);
+            }
+            if !s.domain.is_empty() {
+                println!("    domain {}", s.domain);
             }
         }
         Ok(())
@@ -359,6 +440,66 @@ fn pending_count(broker: &Path) -> usize {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// How long `session list` waits on one domain launcher call. Listing must
+/// not hang on one wedged session (the launcher reads dnsmasq's log, and a
+/// huge one is slow), and a count that is late is shown as unknown.
+const DOMAIN_COUNT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Live-added domain count and distinct blocked-name count, both through
+/// the session's own launcher so there is one parser of its files: the
+/// shell side's.
+fn domain_counts(launcher: &str) -> (Option<usize>, Option<usize>) {
+    if launcher.is_empty() || !Path::new(launcher).exists() {
+        return (None, None);
+    }
+    let exe = Path::new(launcher);
+    let live = launcher_output(exe, &["list"], DOMAIN_COUNT_TIMEOUT)
+        .map(|out| domain::parse_list(&out).iter().filter(|(_, src)| src == "live").count());
+    let blocked = launcher_output(exe, &["blocked"], DOMAIN_COUNT_TIMEOUT)
+        .map(|out| domain::parse_blocked(&out).len());
+    (live, blocked)
+}
+
+/// Run a launcher with a deadline and return its stdout, or None when it
+/// failed, could not start, or ran past `timeout` (it is killed then).
+/// stderr is dropped: this is for counts in a listing, where a launcher's
+/// diagnostics would only interleave with the table.
+pub fn launcher_output(exe: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Drained on a thread so a launcher with more output than a pipe holds
+    // cannot block on the write while this waits for it to exit.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let out = reader.join().ok()?;
+    if status.success() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Hand the session's own launcher the rest of the command line.
@@ -468,6 +609,10 @@ mod tests {
         assert_eq!(reg.resolve_mount(None).unwrap(), dir.join("current.mount"));
         // A pid with nothing registered is an error, not the current session.
         assert!(reg.resolve_mount(Some("999999999")).is_err());
+        // No domain launcher registered: this fixture has no state record,
+        // so it is an unknown session rather than one without a filter.
+        assert!(reg.resolve_domain(Some(&pid)).is_err());
+        assert!(reg.resolve_domain(Some("../etc")).is_err());
         // Never joined onto the registry path.
         assert_eq!(reg.resolve_mount(Some("../etc")).unwrap_err().code, util::EXIT_USAGE);
 
@@ -530,6 +675,82 @@ mod tests {
         assert_eq!(s.mounts, 2);
         assert_eq!(s.pending, 2);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn domain_launcher_resolution_and_counts() {
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("SKIP: no /bin/sh to write a launcher with");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("domain");
+        let rundir = dir.join("run");
+        fs::create_dir_all(&rundir).unwrap();
+        let launcher = rundir.join("domain");
+        // Speaks the domain-ctl stdout contract for list and blocked.
+        fs::write(
+            &launcher,
+            "#!/bin/sh\ncase \"$1\" in\n\
+             list) printf 'api.anthropic.com\\tdefault\\nfoo.dev\\tlive\\nbar.dev\\tlive\\nbaz.dev\\tfile\\n' ;;\n\
+             blocked) printf '7\\tregistry.npmjs.org\\n2\\tgithub.com\\n' ;;\n\
+             *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(rundir.join("mount"), "#!/bin/sh\n").unwrap();
+        symlink(&launcher, dir.join(format!("{}.domain", me()))).unwrap();
+        symlink(&launcher, dir.join("current.domain")).unwrap();
+        fs::write(
+            dir.join(format!("{}.state", me())),
+            format!(
+                "state=sync\ntool=pi\npid={}\nworkspace=/w\ngit=limited\noverlay=0\nsync=\nmount={}\ndomain={}\n",
+                me(),
+                rundir.join("mount").display(),
+                launcher.display()
+            ),
+        )
+        .unwrap();
+
+        let reg = Registry::new(dir.clone());
+        // current.domain is traced back to the session that registered it.
+        let (exe, owner) = reg.resolve_domain(None).unwrap();
+        assert_eq!(exe, dir.join("current.domain"));
+        assert_eq!(owner, Some(me().to_string()));
+
+        let sessions = reg.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].domains, Some(2));
+        assert_eq!(sessions[0].blocked, Some(2));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_without_a_filter_says_so() {
+        let dir = scratch("nofilter");
+        let rundir = dir.join("run");
+        fs::create_dir_all(&rundir).unwrap();
+        fs::write(rundir.join("mount"), "#!/bin/sh\n").unwrap();
+        symlink(rundir.join("mount"), dir.join("current.mount")).unwrap();
+        fs::write(
+            dir.join(format!("{}.state", me())),
+            format!(
+                "state=direct\ntool=pi\npid={}\nworkspace=/w\ngit=full\noverlay=0\nsync=\nmount={}\n",
+                me(),
+                rundir.join("mount").display()
+            ),
+        )
+        .unwrap();
+        let reg = Registry::new(dir.clone());
+        for pid in [None, Some(me().to_string())] {
+            let err = reg.resolve_domain(pid.as_deref()).unwrap_err();
+            assert!(err.msg.contains("without a network filter"), "{}", err.msg);
+        }
+        let s = &reg.sessions()[0];
+        assert!(s.domain.is_empty());
+        assert_eq!((s.domains, s.blocked), (None, None));
         let _ = fs::remove_dir_all(&dir);
     }
 

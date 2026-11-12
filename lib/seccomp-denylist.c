@@ -1,5 +1,5 @@
 /* Emits a seccomp BPF program (SCMP_ACT_ALLOW default, EPERM on the denied
- * list) to stdout, for bwrap's `--seccomp FD`. bwrap applies this filter
+ * list, ENOSYS for clone3) to stdout, for bwrap's `--seccomp FD`. bwrap applies this filter
  * right before the final execve of the sandboxed command - its own setup
  * (unshare/mount/pivot_root to build the sandbox) runs unfiltered beforehand,
  * same as upstream bwrap's own --seccomp semantics.
@@ -10,9 +10,25 @@
  * subprocesses - rg/git/jq/etc) has a legitimate reason to call. If the
  * sandboxed process calls one anyway, that's the escape attempt this exists
  * to catch, not a false positive to work around.
+ *
+ * Nested user namespaces are closed here, and only here. unshare is denied
+ * outright, clone with any CLONE_NEW* flag gets EPERM, and clone3 gets
+ * ENOSYS (see the rule below for why not EPERM). Denying unshare alone is
+ * not enough: a jailed process reaches the same fresh userns, with a full
+ * capability set inside it, through clone or clone3.
+ *
+ * bwrap's --disable-userns is passed as well but carries no weight: on
+ * bwrap 0.13.1 it leaves /proc/sys/user/max_user_namespaces at INT_MAX in
+ * the sandbox instead of the documented 1, measured both inside this jail
+ * and from a plain bwrap on the host. The runner's --cap-drop ALL is what
+ * backs these rules up, by taking away the CAP_SYS_RESOURCE that would let
+ * the sandboxed process rewrite that limit anyway.
  */
+/* For the CLONE_NEW* constants in sched.h. */
+#define _GNU_SOURCE
 #include <seccomp.h>
 #include <errno.h>
+#include <sched.h>
 #include <stddef.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -42,9 +58,9 @@ static const int denied[] = {
   /* The modern mount API calls that util-linux's `mount` actually uses
    * (open_tree + move_mount; mount_setattr for attr changes) - without
    * these, `mount --bind` silently bypasses the mount(2) deny above. The
-   * real gate is bwrap's --cap-drop CAP_SYS_ADMIN (all mount syscalls
-   * need it); this list is the belt for when that cap isn't dropped (e.g.
-   * --no-net-filter paths or future --cap-add use). */
+   * real gate is bwrap's --cap-drop ALL (every mount syscall needs
+   * CAP_SYS_ADMIN); this list is the belt for when that cap isn't dropped
+   * (e.g. a future --cap-add use). */
   SCMP_SYS(open_tree), SCMP_SYS(move_mount), SCMP_SYS(mount_setattr),
   SCMP_SYS(userfaultfd),
 };
@@ -60,6 +76,32 @@ int main(void) {
       seccomp_release(ctx);
       return 1;
     }
+  }
+
+  /* clone with a namespace-creating flag: the same set unshare would give,
+   * refused per flag with a masked compare (one rule per bit, libseccomp
+   * ORs rules on the same syscall). Arg 0 is the flags word on x86_64 and
+   * aarch64. Plain fork/thread clones carry none of these bits and pass. */
+  static const unsigned long clone_ns[] = {
+    CLONE_NEWUSER, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID,
+    CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWCGROUP,
+  };
+  for (size_t i = 0; i < sizeof(clone_ns) / sizeof(clone_ns[0]); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(clone), 1,
+                         SCMP_A0(SCMP_CMP_MASKED_EQ, clone_ns[i], clone_ns[i])) < 0) {
+      seccomp_release(ctx);
+      return 1;
+    }
+  }
+
+  /* clone3 keeps its flags in a userspace struct seccomp cannot read, so it
+   * is refused as a whole. ENOSYS, not EPERM: glibc (pthread_create,
+   * posix_spawn) treats ENOSYS as "kernel too old" and falls back to clone,
+   * where the rules above apply; EPERM would make thread creation fail.
+   * Same pattern as flatpak and Docker's default profile. */
+  if (seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0) < 0) {
+    seccomp_release(ctx);
+    return 1;
   }
 
   /* Terminal input injection: TIOCSTI pushes bytes into the terminal's

@@ -20,13 +20,13 @@ const LIST_TIMEOUT: Option<Duration> = Some(Duration::from_secs(5));
 const ANSWER_TIMEOUT: Option<Duration> = None;
 
 /// One pending request, flattened across brokers for display.
-struct Row {
-    id: String,
-    kind: String,
-    attr: String,
-    reason: String,
-    age: u64,
-    jail: String,
+pub struct Row {
+    pub id: String,
+    pub kind: String,
+    pub attr: String,
+    pub reason: String,
+    pub age: u64,
+    pub jail: String,
 }
 
 /// A row from a broker built before mounts existed carries no kind.
@@ -37,13 +37,21 @@ fn kind_of(r: &Json) -> String {
     }
 }
 
-/// How a request reads in a listing: the attribute, or `mount PATH`.
+/// How a request reads in a listing: the attribute, `mount PATH` or
+/// `domain NAME`.
 fn describe(kind: &str, attr: &str) -> String {
-    if kind == proto::KIND_MOUNT {
-        format!("mount {attr}")
-    } else {
-        attr.to_string()
+    match kind {
+        proto::KIND_MOUNT => format!("mount {attr}"),
+        proto::KIND_DOMAIN => format!("domain {attr}"),
+        _ => attr.to_string(),
     }
+}
+
+/// The pending requests of one kind, oldest first, for a front end that only
+/// deals with that kind (`llm-custody domain`). Same collection and order as
+/// `answer`, so the two never disagree about what is waiting.
+pub fn pending_of_kind(layout: &Layout, kind: &str) -> Vec<Row> {
+    collect(layout, true).0.into_iter().filter(|r| r.kind == kind).collect()
 }
 
 fn collect(layout: &Layout, quiet: bool) -> (Vec<Row>, usize) {
@@ -169,7 +177,7 @@ pub fn requests(layout: &Layout) -> Result<()> {
     for (id, attr, age, jail, reason) in &rows {
         println!("{id:<w_id$}  {attr:<w_attr$}  {age:<w_age$}  {jail:<w_jail$}  {reason}");
     }
-    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|none|overlay, default ro), deny <id> to refuse");
+    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|none|overlay, default ro; a domain: --mode session|persist, default session), deny <id> to refuse");
     Ok(())
 }
 
@@ -212,11 +220,20 @@ fn check(reply: &Json) -> Result<()> {
     }
 }
 
-/// `mode` only means something for a mount request; the broker ignores it
-/// for a package and defaults it to read-only when empty.
+/// `mode` only means something for a mount or a domain request; the broker
+/// ignores it for a package and defaults it (read-only, session) when empty.
+/// Which vocabulary applies depends on the request, which only the broker
+/// knows, so this checks for either and the broker checks the right one.
 pub fn approve(layout: &Layout, id: &str, mode: &str) -> Result<()> {
-    if !mode.is_empty() {
-        proto::validate_mount_mode(mode)?;
+    if !mode.is_empty()
+        && proto::validate_mount_mode(mode).is_err()
+        && proto::validate_domain_mode(mode).is_err()
+    {
+        return util::usage_err(format!(
+            "mode must be one of {} for a mount, {} for a domain (got: {mode})",
+            proto::MOUNT_MODES.join("|"),
+            proto::DOMAIN_MODES.join("|")
+        ));
     }
     let msg = json::Obj::new()
         .str("op", "approve")
@@ -228,7 +245,10 @@ pub fn approve(layout: &Layout, id: &str, mode: &str) -> Result<()> {
     let attr = reply.str_field("attr");
     let commands = reply.str_field("commands");
     let guest = reply.str_field("guest");
-    if !guest.is_empty() {
+    let scope = reply.str_field("scope");
+    if !scope.is_empty() {
+        util::note(format!("{attr} allowed for the jail ({scope})"));
+    } else if !guest.is_empty() {
         util::note(format!("{attr} mounted at {guest} ({})", reply.str_field("mode")));
     } else if commands.is_empty() {
         util::note(format!(
@@ -284,9 +304,42 @@ fn ask_mode(path: &str) -> Result<Option<String>> {
     }
 }
 
+/// The scope question for a domain change: `s` (or an empty line) for this
+/// session only, `p` to also change the persisted domains file, `q` to back
+/// out without doing anything. `verb` is what is being done (allow, remove).
+/// Returns the broker's mode word.
+pub fn ask_scope(verb: &str, name: &str) -> Result<Option<String>> {
+    loop {
+        if std::io::stdout().is_terminal() {
+            print!("  {verb} {name} for [s]ession / [p]ersist / [q] back: ");
+            let _ = std::io::stdout().flush();
+        }
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        match parse_scope(&line) {
+            Some(Some(m)) => return Ok(Some(m.to_string())),
+            Some(None) => return Ok(None),
+            None => util::note(format!("not a choice: {} (want s, p or q)", line.trim())),
+        }
+    }
+}
+
+/// `Some(Some(mode))` for an answer, `Some(None)` for backing out, `None`
+/// for something that is neither.
+fn parse_scope(line: &str) -> Option<Option<&'static str>> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "session" => Some(Some("session")),
+        "p" | "persist" => Some(Some("persist")),
+        "q" | "quit" => Some(None),
+        _ => None,
+    }
+}
+
 /// What a typed line at the `answer` prompt meant.
 #[derive(Debug, PartialEq)]
-enum Choice {
+pub enum Choice {
     Approve(usize),
     Deny(usize),
     Refresh,
@@ -297,7 +350,7 @@ enum Choice {
 /// `3` approves the third row, `3d` denies it, `r` re-reads the queue, an
 /// empty line or `q` leaves. Indexes rather than request ids: an id is a
 /// broker pid and a counter, fine for routing and hopeless to type.
-fn parse_choice(line: &str, rows: usize) -> Choice {
+pub fn parse_choice(line: &str, rows: usize) -> Choice {
     let line = line.trim().to_ascii_lowercase();
     match line.as_str() {
         "" | "q" | "quit" => return Choice::Quit,
@@ -321,7 +374,7 @@ fn parse_choice(line: &str, rows: usize) -> Choice {
 }
 
 /// Colour only for a terminal that wants it, decided once.
-fn colour() -> bool {
+pub fn colour() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
@@ -335,7 +388,7 @@ fn render(rows: &[Row], colour: bool) {
     let w_age = ages.iter().map(|a| a.len()).max().unwrap_or(0);
 
     println!();
-    println!("{bold}{} pending package request(s){off}", rows.len());
+    println!("{bold}{} pending request(s){off}", rows.len());
     println!();
     for (i, r) in rows.iter().enumerate() {
         // Number and package on one line, the agent's own justification
@@ -407,17 +460,19 @@ pub fn answer(layout: &Layout) -> Result<()> {
             // has changed either way, and the operator is probably about to
             // answer the next one.
             Choice::Approve(i) => {
-                // A mount is the one approval with a second question in it.
-                // Asked here, at the moment of approving, rather than encoded
-                // into the row syntax: the mode is a decision about this
-                // path, and read-only has to stay the answer of least effort.
-                let mode = if rows[i].kind == proto::KIND_MOUNT {
-                    match ask_mode(&rows[i].attr)? {
-                        Some(m) => m,
-                        None => continue,
-                    }
-                } else {
-                    String::new()
+                // A mount and a domain are the approvals with a second
+                // question in them (mode, scope). Asked here, at the moment
+                // of approving, rather than encoded into the row syntax: the
+                // answer is a decision about this one request, and read-only
+                // or session-only has to stay the answer of least effort.
+                let asked = match rows[i].kind.as_str() {
+                    proto::KIND_MOUNT => ask_mode(&rows[i].attr)?,
+                    proto::KIND_DOMAIN => ask_scope("allow", &rows[i].attr)?,
+                    _ => Some(String::new()),
+                };
+                let mode = match asked {
+                    Some(m) => m,
+                    None => continue,
                 };
                 if let Err(e) = approve(layout, &rows[i].id, &mode) {
                     util::note(e.msg);
@@ -455,5 +510,19 @@ mod tests {
         assert_eq!(parse_choice("4", 3), Choice::Unknown);
         assert_eq!(parse_choice("4d", 3), Choice::Unknown);
         assert_eq!(parse_choice("yes", 3), Choice::Unknown);
+    }
+
+    #[test]
+    fn scope_answers_parse() {
+        // Session is the answer of least effort, like read-only for a mount.
+        assert_eq!(parse_scope("\n"), Some(Some("session")));
+        assert_eq!(parse_scope("s"), Some(Some("session")));
+        assert_eq!(parse_scope(" P \n"), Some(Some("persist")));
+        assert_eq!(parse_scope("q"), Some(None));
+        assert_eq!(parse_scope("yes"), None);
+        // Every answer is a mode the broker accepts.
+        for line in ["s", "p"] {
+            assert!(proto::validate_domain_mode(parse_scope(line).unwrap().unwrap()).is_ok());
+        }
     }
 }

@@ -29,6 +29,10 @@ let
   # at launch and while the session runs ($RUNDIR/mount, `llm-custody mount`,
   # the broker's approval of an agent's mount request).
   mountCtl = pkgs.lib.getExe (import ./mount-ctl.nix { inherit pkgs; });
+  # Domain controller (lib/domain-ctl.sh): live changes to the network
+  # whitelist ($RUNDIR/domain, `llm-custody domain`, the broker's approval of
+  # an agent's domain request). Only wired up when the filter is on.
+  domainCtl = pkgs.lib.getExe (import ./domain-ctl.nix { inherit pkgs; });
   # Guest path and symlink names of the operator-managed package profile
   # (lib/toolbox.nix), shared with ../toolbox and the launchers.
   toolbox = import ./toolbox.nix;
@@ -49,6 +53,7 @@ let
   # Store path, not a bind: /nix/store is bound wholesale, so the probe
   # resolves inside the jail as-is.
   selftestTiocsti = "${import ./tiocsti-probe.nix { inherit pkgs; }}/bin/tiocsti-probe";
+  selftestUserns = "${import ./userns-probe.nix { inherit pkgs; }}/bin/userns-probe";
   # Optional per-tool data: a tool with no dangerous-mode CLI flag (pi) just
   # omits it and --dangerous then errors out instead of passing something
   # the tool would reject.
@@ -89,6 +94,9 @@ pkgs.writeShellApplication {
     NET_FILTER=1
     LLMCUSTODY_TMPDIR="''${TMPDIR:-/tmp}"
     EXTRA_DOMAINS=()
+    # The subset of EXTRA_DOMAINS read from --state-dir/domains, so the
+    # session's whitelist can tag each name with where it came from.
+    FILE_DOMAINS=()
     EXTRA_MOUNTS=()
     MASK_PATTERNS=()
     ENV_PAIRS=()
@@ -111,11 +119,17 @@ pkgs.writeShellApplication {
     # the watcher entirely - worth it on a tree big enough for `git status`
     # to cost real time.
     WATCH_INTERVAL=15
+    # Opt-in resource limits (--max-mem/--max-cpu/--max-pids), applied to a
+    # transient systemd user scope around the jail. Empty means no limit.
+    MAX_MEM=""
+    MAX_CPU=""
+    MAX_PIDS=""
     # 0 = warnings and errors only, 1 = normal, 2 = verbose.
     VERBOSITY=1
     DANGEROUS_FLAG="${dangerousFlag}"
     # Root-level settings.json keys --merge-config never offers, because the
-    # bootstrapScript owns them (tools.nix mergeSkipKeys).
+    # bootstrapScript owns them or the jail cannot honour them (tools.nix
+    # mergeSkipKeys explains each).
     MERGE_SKIP_KEYS=(
       ${builtins.concatStringsSep "\n      " (map (k: "\"${k}\"") (toolDefaults.mergeSkipKeys or [ ]))}
     )
@@ -191,7 +205,10 @@ pkgs.writeShellApplication {
                              Extra read-only mount (repeatable). Same GUESTPATH
                              rules as --mount.
       --allow-domain DOMAIN Add domain to network whitelist (repeatable;
-                             persistent ones can live in --state-dir/domains)
+                             persistent ones can live in --state-dir/domains).
+                             While the session runs: RUNDIR/domain or
+                             'llm-custody domain', or the agent's own
+                             custody-request --domain once you approve it
       --env KEY=VAL         Pass environment variable into the sandbox (repeatable)
       --x11                 Allow X11/Wayland clipboard access by passing
                              DISPLAY/XAUTHORITY/WAYLAND_DISPLAY and binding
@@ -219,6 +236,18 @@ pkgs.writeShellApplication {
                              session (default 15, 0 disables). The count is
                              written to RUNDIR/dirty and published as the
                              llm_custody_dirty user var whenever it changes
+      --max-mem SIZE        Memory limit for everything inside the jail
+                             (SIZE: digits with an optional K, M, G or T
+                             suffix). Swap is disabled for the jail too, so
+                             the limit cannot be dodged by swapping
+      --max-cpu PCT         CPU quota in percent of one core (200 = two cores)
+      --max-pids N          Maximum number of tasks (processes and threads).
+                             The three limits apply to a systemd user scope
+                             holding the jail only; the runner, its network
+                             helpers and the sync-back stay outside it. Any
+                             of them refuses to launch without a usable
+                             systemd user manager and delegated cgroup v2
+                             controllers
       --selftest            Run a sandbox self-check (full chain incl. netns +
                              seccomp + git wrapper) and exit without launching
                              the tool; no in-jail /login needed
@@ -318,6 +347,25 @@ pkgs.writeShellApplication {
             ""|*[!0-9]*) die "--watch-interval expects whole seconds (0 disables), got: $2" ;;
           esac
           WATCH_INTERVAL="$2"; shift 2 ;;
+        # The limit values end up as systemd property assignments, so they
+        # are held to the plain forms systemd parses the same everywhere.
+        # Zero is refused: a zero memory or task limit kills the jail before
+        # it starts, which is never what the operator meant.
+        --max-mem)
+          need_arg "$@"
+          [[ "$2" =~ ^0*[1-9][0-9]*[KMGT]?$ ]] ||
+            die "--max-mem expects a size like 512M or 8G (suffix K, M, G or T), got: $2"
+          MAX_MEM="$2"; shift 2 ;;
+        --max-cpu)
+          need_arg "$@"
+          [[ "$2" =~ ^0*[1-9][0-9]*%?$ ]] ||
+            die "--max-cpu expects a percentage of one core like 200 or 200%, got: $2"
+          MAX_CPU="''${2%\%}%"; shift 2 ;;
+        --max-pids)
+          need_arg "$@"
+          [[ "$2" =~ ^0*[1-9][0-9]*$ ]] ||
+            die "--max-pids expects a positive whole number, got: $2"
+          MAX_PIDS="$2"; shift 2 ;;
         --no-net-filter) NET_FILTER=0; shift ;;
         --merge-config)      MERGE_CONFIG=1; shift ;;
         --merge-config-from) need_arg "$@"; MERGE_CONFIG=1; MERGE_CONFIG_SRC="$2"; shift 2 ;;
@@ -446,6 +494,111 @@ pkgs.writeShellApplication {
       exit 0
     fi
 
+    # Resource limits. The jail command runs inside a transient systemd
+    # user scope (run_jail puts SCOPE_PREFIX in front of it) whose cgroup
+    # carries the limits, so a runaway build or fork bomb in the jail hits
+    # the scope and nothing else. The runner, the broker, dnsmasq,
+    # slirp4netns and the watchers stay outside on purpose: a limit hit must
+    # not take down the helpers, and the sync-back at exit runs from the
+    # runner, unaffected by whatever the scope did.
+    #
+    # MemoryMax is charged for every page the jail's processes own,
+    # including tmpfs pages they write: the copies this runner makes under
+    # --tmpdir at launch are charged to the runner, but whatever the agent
+    # writes into a tmpfs-backed workspace copy afterwards counts against
+    # the jail. MemorySwapMax=0 keeps the limit from being dodged by
+    # swapping out.
+    LIMIT_PROPS=()
+    LIMITS_DESC=""
+    if [ -n "$MAX_MEM" ]; then
+      LIMIT_PROPS+=(-p "MemoryMax=$MAX_MEM" -p MemorySwapMax=0)
+      LIMITS_DESC="$LIMITS_DESC mem=$MAX_MEM"
+    fi
+    if [ -n "$MAX_CPU" ]; then
+      LIMIT_PROPS+=(-p "CPUQuota=$MAX_CPU")
+      LIMITS_DESC="$LIMITS_DESC cpu=$MAX_CPU"
+    fi
+    if [ -n "$MAX_PIDS" ]; then
+      LIMIT_PROPS+=(-p "TasksMax=$MAX_PIDS")
+      LIMITS_DESC="$LIMITS_DESC pids=$MAX_PIDS"
+    fi
+    LIMITS_DESC="''${LIMITS_DESC# }"
+    SCOPE_PREFIX=()
+    SCOPE_UNIT=""
+    if [ "''${#LIMIT_PROPS[@]}" -gt 0 ]; then
+      SCOPE_UNIT="llm-custody-${name}-$$"
+      # --scope makes systemd-run exec the command in place once the scope
+      # exists, so it keeps the pid, process group and cwd run_jail sets up
+      # for it. --collect drops the unit even when the jail exits non-zero,
+      # otherwise every failed session would leave a unit behind.
+      SCOPE_PREFIX=(systemd-run --user --scope --quiet --collect
+        "--unit=$SCOPE_UNIT" "''${LIMIT_PROPS[@]}" --)
+    fi
+
+    # The operator asked for a limit, so running without one would silently
+    # downgrade the policy: every missing piece is fatal here. Checked
+    # before anything is copied or started, and skipped by --dry-run, which
+    # only reports what would run.
+    limits_preflight() {
+      local ctl_file ctl_have c missing=""
+      local -a want=()
+      if ! command -v systemd-run >/dev/null 2>&1; then
+        err "resource limits need systemd-run, which is not on PATH"
+        hint "run on a host with a systemd user manager, or drop --max-mem/--max-cpu/--max-pids"
+        exit 1
+      fi
+      if [ -z "''${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ ! -S "''${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; then
+        err "resource limits need the systemd user bus, but neither DBUS_SESSION_BUS_ADDRESS nor XDG_RUNTIME_DIR/bus is set up"
+        hint "no systemd user session here; run from a login session (or enable lingering: loginctl enable-linger)"
+        exit 1
+      fi
+      if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        err "resource limits need the cgroup v2 unified hierarchy at /sys/fs/cgroup"
+        hint "boot with systemd.unified_cgroup_hierarchy=1"
+        exit 1
+      fi
+      # systemd does not reliably fail a scope whose controller is missing,
+      # it just leaves the property without effect, so the delegation is
+      # checked by hand. These are the controllers the user manager is
+      # allowed to hand down to the scopes it creates.
+      ctl_file="/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/cgroup.controllers"
+      if [ ! -r "$ctl_file" ]; then
+        err "resource limits need a systemd user manager, $ctl_file is missing"
+        hint "no user@$UID.service running; run from a login session"
+        exit 1
+      fi
+      ctl_have=" $(cat "$ctl_file") "
+      [ -n "$MAX_MEM" ] && want+=(memory)
+      [ -n "$MAX_CPU" ] && want+=(cpu)
+      [ -n "$MAX_PIDS" ] && want+=(pids)
+      for c in "''${want[@]}"; do
+        case "$ctl_have" in
+          *" $c "*) ;;
+          *) missing="$missing $c" ;;
+        esac
+      done
+      if [ -n "$missing" ]; then
+        err "cgroup controller(s)''${missing} not delegated to user@$UID.service"
+        hint "enable Delegate= for user@.service, e.g. Delegate=cpu memory pids in a drop-in"
+        exit 1
+      fi
+      # One throwaway scope with the same properties. It is what catches
+      # the rest: a property this systemd rejects, or a shell outside the
+      # user manager's tree that it may not move into a scope (common for
+      # ssh sessions), both of which would otherwise only surface after the
+      # whole sandbox setup.
+      local out
+      if ! out=$(systemd-run --user --scope --quiet --collect \
+          "--unit=$SCOPE_UNIT-preflight" "''${LIMIT_PROPS[@]}" -- true 2>&1); then
+        err "systemd-run could not create a limited scope"
+        [ -n "$out" ] && hint "$out"
+        exit 1
+      fi
+    }
+    if [ "''${#LIMIT_PROPS[@]}" -gt 0 ] && [ "$DRYRUN" != "1" ]; then
+      limits_preflight
+    fi
+
     # Safety net for two ways a jailed agent's git usage could bite the host
     # later: (1) it rewrites core.hooksPath in the still-writable
     # .git/config to point at somewhere it controls - the read-only
@@ -515,6 +668,7 @@ pkgs.writeShellApplication {
       while IFS= read -r d; do
         case "$d" in ""|\#*) continue ;; esac
         EXTRA_DOMAINS+=("$d")
+        FILE_DOMAINS+=("''${d,,}")
       done < "$STATE_ROOT/domains"
     fi
 
@@ -628,6 +782,7 @@ pkgs.writeShellApplication {
     : > "$SYNC_MANIFEST"
     SYNC_REG=""
     MOUNT_REG=""
+    DOMAIN_REG=""
     STATE_REG=""
     TOOLBOX_REG=""
     # Guest directories a mount can be attached under while the session runs,
@@ -722,6 +877,11 @@ pkgs.writeShellApplication {
       printf 'sync=%s\n' "$RUNDIR/sync"
       printf 'manifest=%s\n' "$SYNC_MANIFEST"
       printf 'mount=%s\n' "$RUNDIR/mount"
+      # Only with the network filter on: without it there is no whitelist
+      # to change, and the launcher is never written.
+      if [ -n "$DOMAIN_REG" ]; then
+        printf 'domain=%s\n' "$RUNDIR/domain"
+      fi
       # Lets a consumer find this session's request queue and control socket
       # without knowing how broker ids are formed. Absent when the broker
       # failed to start, which is exactly when a consumer should not offer to
@@ -774,6 +934,14 @@ pkgs.writeShellApplication {
         fi ;;
     esac
 
+    # Whitelist helpers (domain validation, the dnsmasq config, the nftables
+    # pre-arm, the blocked-name count) come from lib/net-filter.sh, shared
+    # with the domain controller so a domain allowed at launch and one
+    # allowed mid-session go through the same code. Interpolated like
+    # lib/jail-tree.sh further down, and ahead of cleanup() because the exit
+    # trap's collect_net_stats calls into it.
+    ${builtins.readFile ./net-filter.sh}
+
     # What the sandbox tried to reach and didn't get. Both halves have to be
     # collected before cleanup() kills the holder: the nftables counter
     # lives in that namespace, and the dnsmasq log is under $RUNDIR, which
@@ -783,9 +951,10 @@ pkgs.writeShellApplication {
     # produces: a request to a non-whitelisted domain just fails somewhere
     # inside the tool, with no indication that the jail is why.
     DROPPED_PACKETS=0
+    # COUNT<TAB>NAME lines, most often blocked first (net_blocked_counts).
     BLOCKED_DOMAINS=""
     collect_net_stats() {
-      local line n dom ip
+      local line n
       [ "$NET_FILTER" = "1" ] || return 0
       if [ -n "$HOLDER_PID" ] && kill -0 "$HOLDER_PID" 2>/dev/null; then
         while IFS= read -r line; do
@@ -799,29 +968,13 @@ pkgs.writeShellApplication {
         done < <(nsenter_holder nft list chain inet filter output 2>/dev/null || true)
       fi
       if [ -f "$RUNDIR/dnsmasq.log" ]; then
-        # dnsmasq logs its own answer as "<source> <name> is <address>", so
-        # a name that landed on the address=/#/ catch-all reads as
-        # "... is 0.0.0.0" / "... is ::". Parsed from the right, like the
-        # whitelist watcher does, because the log line also carries a
-        # timestamp and a pid prefix.
+        # Names allowed live since they were blocked are left out (the
+        # second argument), so the summary lists only what is still blocked.
         # `|| true` on the whole pipeline: this runs first thing in the exit
         # trap with errexit active, and `head` closing the pipe early would
         # otherwise abort cleanup before the sync-back below ever runs.
         BLOCKED_DOMAINS=$(
-          { while IFS= read -r line; do
-            case "$line" in
-              *" is "*) ;;
-              *) continue ;;
-            esac
-            ip="''${line##* is }"
-            case "$ip" in
-              0.0.0.0|::) ;;
-              *) continue ;;
-            esac
-            dom="''${line% is *}"
-            dom="''${dom##* }"
-            [ -n "$dom" ] && printf '%s\n' "$dom"
-          done < "$RUNDIR/dnsmasq.log" | sort -u | head -n 20; } || true
+          { net_blocked_counts "$RUNDIR/dnsmasq.log" "$RUNDIR/domains.active" | head -n 20; } || true
         )
       fi
     }
@@ -834,7 +987,12 @@ pkgs.writeShellApplication {
       [ -n "$DIRTY_PID" ] && kill "$DIRTY_PID" 2>/dev/null || true
       collect_net_stats
       [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null || true
-      [ -n "$DNSMASQ_PID" ] && kill "$DNSMASQ_PID" 2>/dev/null || true
+      # The pid file first: the domain controller restarts dnsmasq on every
+      # whitelist change, after which $DNSMASQ_PID names a process that is
+      # long gone. Both are checked to still be a dnsmasq before the signal.
+      DNSMASQ_LIVE=$(net_dnsmasq_pid "$RUNDIR")
+      [ -n "$DNSMASQ_LIVE" ] && kill "$DNSMASQ_LIVE" 2>/dev/null || true
+      net_dnsmasq_alive "$DNSMASQ_PID" && kill "$DNSMASQ_PID" 2>/dev/null || true
       [ -n "$SLIRP_PID" ] && kill "$SLIRP_PID" 2>/dev/null || true
       [ -n "$HOLDER_PID" ] && kill "$HOLDER_PID" 2>/dev/null || true
       # backstop for the nsenter'd tail/dnsmasq children the PIDs above don't
@@ -878,6 +1036,7 @@ pkgs.writeShellApplication {
       if [ "$USERVAR_SET" = "1" ]; then
         emit_uservar llm_custody_sync ""
         emit_uservar llm_custody_mount ""
+        emit_uservar llm_custody_domain ""
         emit_uservar llm_custody_state ""
         emit_uservar llm_custody_jail ""
         emit_uservar llm_custody_dirty ""
@@ -898,6 +1057,12 @@ pkgs.writeShellApplication {
         rm -f "$MOUNT_REG"
         if [ "$(readlink "$(dirname "$MOUNT_REG")/current.mount" 2>/dev/null || true)" = "$RUNDIR/mount" ]; then
           rm -f "$(dirname "$MOUNT_REG")/current.mount"
+        fi
+      fi
+      if [ -n "$DOMAIN_REG" ]; then
+        rm -f "$DOMAIN_REG"
+        if [ "$(readlink "$(dirname "$DOMAIN_REG")/current.domain" 2>/dev/null || true)" = "$RUNDIR/domain" ]; then
+          rm -f "$(dirname "$DOMAIN_REG")/current.domain"
         fi
       fi
       # The broker itself was stopped above. Any request still waiting on it
@@ -937,8 +1102,8 @@ pkgs.writeShellApplication {
           "$C_DIM" "$JAIL_MARK" "$((SECONDS / 60))" "$((SECONDS % 60))" "$C_RESET" >&2
         if [ -n "$BLOCKED_DOMAINS" ]; then
           warn "the sandbox tried to reach domains that are not whitelisted:"
-          while IFS= read -r d; do
-            [ -n "$d" ] && hint "$d"
+          while IFS=$'\t' read -r n d; do
+            [ -n "$d" ] && hint "$d ($n lookup(s))"
           done <<< "$BLOCKED_DOMAINS"
           hint "allow one with --allow-domain DOMAIN, or permanently via $STATE_ROOT/domains"
         fi
@@ -1105,17 +1270,23 @@ pkgs.writeShellApplication {
     #
     # Without a terminal there is nothing to resize and no foreground to
     # take, so a plain call does.
+    #
+    # With resource limits, SCOPE_PREFIX (systemd-run --scope) comes first.
+    # It execs the rest in place after creating the scope, so the process
+    # that becomes the group leader is still timeout, with the same pid and
+    # cwd, and the scope holds timeout, nsenter, bwrap and everything the
+    # jail starts.
     run_jail() {
       local -a ns
       local status=0
       mapfile -t ns < <(holder_ns_args)
       if [ -t 0 ]; then
         set -m
-        timeout --foreground 0 nsenter "''${ns[@]}" "$@" || status=$?
+        "''${SCOPE_PREFIX[@]+"''${SCOPE_PREFIX[@]}"}" timeout --foreground 0 nsenter "''${ns[@]}" "$@" || status=$?
         set +m
         return "$status"
       fi
-      nsenter "''${ns[@]}" "$@"
+      "''${SCOPE_PREFIX[@]+"''${SCOPE_PREFIX[@]}"}" nsenter "''${ns[@]}" "$@"
     }
 
     # Host preflight. Nothing here is NixOS-specific support (anything else
@@ -1153,6 +1324,21 @@ pkgs.writeShellApplication {
         [ -n "$domain" ] && EXTRA_DOMAINS+=("$domain")
       fi
     done
+
+    # Every whitelist name ends up in a dnsmasq server=/NAME/ line, where a
+    # `/`, `#` or whitespace from a hand-edited domains file would corrupt
+    # the config, so the operator's names pass the same check as an agent's
+    # live request. Lowercased because that is how the live controller
+    # stores and matches them.
+    VALID_DOMAINS=()
+    for d in "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
+      if domain_valid "''${d,,}"; then
+        VALID_DOMAINS+=("''${d,,}")
+      else
+        warn "not a valid domain name, left off the whitelist: $d"
+      fi
+    done
+    EXTRA_DOMAINS=("''${VALID_DOMAINS[@]+"''${VALID_DOMAINS[@]}"}")
 
     if [ "$DRYRUN" != "1" ]; then
       # Long-lived namespace holder. Two jobs:
@@ -1263,24 +1449,31 @@ pkgs.writeShellApplication {
       # address, and the two drifting apart would break every lookup.
       UPSTREAM_DNS="9.9.9.9"
 
+      # The session's whitelist with each name's origin, the one list the
+      # dnsmasq config is generated from, at launch and by every live change
+      # (lib/domain-ctl.sh). First source wins for a name listed twice, in
+      # the order default, file, flag, so `remove --persist` knows when the
+      # Nix-defined list is what put a name there.
+      declare -A SEEN_DOMAIN=()
       {
-        echo "no-resolv"
-        echo "bind-interfaces"
-        echo "listen-address=127.0.0.1"
-        echo "log-queries"
-        echo "log-facility=$RUNDIR/dnsmasq.log"
-        # Most-specific-match wins in dnsmasq, so each allowed domain gets a real
-        # upstream and everything else falls through to the catch-all dead end -
-        # this is the primary block, not just the nftables IP gate below.
-        for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
-          echo "server=/$d/$UPSTREAM_DNS"
+        for d in "''${ALLOWED_DOMAINS[@]}"; do
+          [ -n "''${SEEN_DOMAIN[$d]:-}" ] && continue
+          SEEN_DOMAIN[$d]=1
+          printf '%s\tdefault\n' "$d"
         done
-        # server= above forwards both A and AAAA lookups for allowed domains
-        # to the same (dual-stack) upstream - only the catch-all needs a
-        # separate line per family.
-        echo "address=/#/0.0.0.0"
-        echo "address=/#/::"
-      } > "$RUNDIR/dnsmasq.conf"
+        for d in "''${FILE_DOMAINS[@]+"''${FILE_DOMAINS[@]}"}"; do
+          [ -n "''${SEEN_DOMAIN[$d]:-}" ] && continue
+          domain_valid "$d" || continue
+          SEEN_DOMAIN[$d]=1
+          printf '%s\tfile\n' "$d"
+        done
+        for d in "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
+          [ -n "''${SEEN_DOMAIN[$d]:-}" ] && continue
+          SEEN_DOMAIN[$d]=1
+          printf '%s\tflag\n' "$d"
+        done
+      } > "$RUNDIR/domains.active"
+      net_write_dnsmasq_conf "$RUNDIR" "$UPSTREAM_DNS"
 
       nsenter_holder dnsmasq --conf-file="$RUNDIR/dnsmasq.conf" \
         --keep-in-foreground --pid-file="$RUNDIR/dnsmasq.pid" &
@@ -1340,40 +1533,8 @@ pkgs.writeShellApplication {
         done &
       WATCH_PID=$!
 
-      # First-connect race mitigation: the whitelist only learns an IP from
-      # dnsmasq's post-reply log line, so the first connect after a lookup
-      # can arrive before the set is armed. Pre-arm the sets with a
-      # host-side resolution of every allowed domain before the sandbox
-      # starts (resolved through the holder ns, inside the private netns, so
-      # the queries go out the same slirp link the sandbox will use and the
-      # answers match its resolver). The log watcher still tracks CDN record
-      # drift during the run.
-      #
-      # `getent ahosts`, not the ahostsv4/ahostsv6 pair this used to call:
-      # those two return rc=2 and print nothing on this glibc even for names
-      # that plainly resolve (the same quirk lib/selftest.nix documents),
-      # which made the whole pre-resolve a silent no-op and left the race it
-      # exists to close wide open. `ahosts` returns both families in one
-      # listing, so the family is decided by looking at the address.
-      if command -v getent >/dev/null 2>&1; then
-        PREARMED=0
-        for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
-          while read -r line; do
-            ip="''${line%% *}"
-            case "$ip" in
-              ""|0.0.0.0|::) continue ;;
-              *:*)
-                case "$ip" in *[!0-9a-fA-F:]*) continue ;; esac
-                nsenter_holder nft add element inet filter allowed6 "{ $ip }" 2>/dev/null || true ;;
-              *[!0-9.]*) continue ;;
-              *)
-                nsenter_holder nft add element inet filter allowed "{ $ip }" 2>/dev/null || true ;;
-            esac
-            PREARMED=$((PREARMED+1))
-          done < <(nsenter_holder getent ahosts "$d" 2>/dev/null)
-        done
-        vlog "pre-armed the IP whitelist with $PREARMED address(es)"
-      fi
+      # First-connect race mitigation, see net_prearm in lib/net-filter.sh.
+      net_prearm "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"
 
       # Policy drop, with the whitelisted addresses as the only general exit.
       # The earlier ruleset gated TCP 80/443 only, which left every other
@@ -1408,6 +1569,17 @@ pkgs.writeShellApplication {
     NFT
 
       echo "nameserver 127.0.0.1" > "$RUNDIR/resolv.conf"
+
+      # Everything the domain controller needs to change the whitelist of
+      # this running session, written with declare -p like mount.env (and,
+      # like it, host-side only). The launcher is what a second terminal and
+      # the broker run.
+      {
+        declare -p HOLDER_PID RUNDIR STATE_ROOT UPSTREAM_DNS DNSMASQ_PID VERBOSITY
+      } > "$RUNDIR/domain.env"
+      printf '#!%s\nexec %s %s "$@"\n' \
+        "${pkgs.bash}/bin/sh" "${domainCtl}" "$(printf '%q' "$RUNDIR")" > "$RUNDIR/domain"
+      chmod +x "$RUNDIR/domain"
     fi
 
     # bwrap's --seccomp wants an already-open fd on the BPF program; a real
@@ -1479,6 +1651,17 @@ pkgs.writeShellApplication {
 
     BWRAP_ARGS=(
       --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
+      # No nested user namespaces. A fresh userns hands its creator a full
+      # capability set inside it, which reaches netns-scoped nftables and
+      # the rest of the userns-gated kernel surface (a common LPE route).
+      # The seccomp rules on unshare/clone/clone3 are what actually enforce
+      # this: measured on bwrap 0.13.1, --disable-userns leaves
+      # /proc/sys/user/max_user_namespaces at INT_MAX inside the sandbox
+      # rather than the 1 it documents, with or without this runner's
+      # holder-ns nesting, so nothing here may depend on it. Kept because it
+      # costs nothing and becomes a real second layer if a later bwrap makes
+      # it stick. Requires --unshare-user (above).
+      --disable-userns
       # No --new-session: setsid() would detach the tool from the controlling
       # terminal, and a process with no controlling terminal never receives
       # SIGWINCH - pi/claude then keep painting at the launch width after the
@@ -1488,15 +1671,23 @@ pkgs.writeShellApplication {
       # below instead, which is the alternative bwrap's own documentation
       # names for this case.
       --die-with-parent
-      # Drop CAP_SYS_ADMIN from the sandboxed process. Every mount-creation
-      # syscall (mount(2), open_tree/move_mount, mount_setattr, umount2,
-      # pivot_root, ...) requires it, so this closes the whole class at once
-      # - and it's the one that matters most: modern util-linux `mount` uses
-      # the mount API (open_tree+move_mount), which a seccomp list of the
-      # mount syscall alone misses (the FHS bwrap is denied but the mount
-      # API copy is not). bwrap applies --cap-drop after its own sandbox
-      # setup, so bwrap itself keeps what it needs for unshare/mount.
-      --cap-drop CAP_SYS_ADMIN
+      # Drop every capability from the sandboxed process. CAP_SYS_ADMIN is
+      # the one that matters most - every mount-creation syscall (mount(2),
+      # open_tree/move_mount, mount_setattr, umount2, pivot_root, ...)
+      # requires it, including the mount API modern util-linux `mount` uses,
+      # which a seccomp list of the mount syscall alone misses - but
+      # dropping it alone is not enough. The tool runs as uid 0 in the
+      # sandbox userns (the holder maps inner 0 to the invoking host uid),
+      # and for a uid-0 sandbox bwrap keeps every capability not named in a
+      # --cap-drop. CAP_SYS_RESOURCE among them is write access to the
+      # userns-owned ucount sysctls, i.e. the sandboxed process could raise
+      # user.max_user_namespaces back itself (verified from inside the
+      # jail). Nothing in a coding-agent workload needs a capability here:
+      # the workspace and state are owned by the mapped uid, so owner
+      # permissions cover every write, and the store is world-readable.
+      # bwrap applies --cap-drop after its own sandbox setup, so bwrap
+      # itself keeps what it needs for unshare/mount.
+      --cap-drop ALL
       --seccomp "$SECCOMP_FD"
       --proc /proc
       --dev /dev
@@ -1696,13 +1887,12 @@ pkgs.writeShellApplication {
     # Explicit list of vars every session needs (credentials, terminal)
     # plus the locale vars tool subprocesses (rg/git/compilers) depend on
     # for sane UTF-8 handling. --env covers anything else, e.g. proxy or
-    # custom-endpoint settings.
+    # custom-endpoint settings. Cloud credentials such as AWS_* are not
+    # inherited: a host shell often carries keys for unrelated accounts,
+    # so one reaches the jail only through an explicit --env.
     for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL OPENAI_API_KEY OPENAI_BASE_URL TERM COLORTERM LANG LC_ALL LC_CTYPE; do
       [ -n "''${!var:-}" ] && BWRAP_ARGS+=(--setenv "$var" "''${!var}")
     done
-    while IFS='=' read -r awsvar awsval; do
-      [ -n "$awsvar" ] && BWRAP_ARGS+=(--setenv "$awsvar" "$awsval")
-    done < <(env | grep '^AWS_' || true)
     for spec in "''${ENV_PAIRS[@]+"''${ENV_PAIRS[@]}"}"; do
       key="''${spec%%=*}"
       val="''${spec#*=}"
@@ -1839,8 +2029,20 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv SELFTEST_CONFIGDIR "/home/user/${toolDefaults.configDirName}")
       BWRAP_ARGS+=(--setenv SELFTEST_UNSHARE "${selftestUnshare}")
       BWRAP_ARGS+=(--setenv SELFTEST_TIOCSTI "${selftestTiocsti}")
+      BWRAP_ARGS+=(--setenv SELFTEST_USERNS "${selftestUserns}")
       BWRAP_ARGS+=(--setenv SELFTEST_DOMAIN "${selftestDomain}")
       BWRAP_ARGS+=(--setenv SELFTEST_GITMODE "$GIT_MODE")
+      # With limits, the probe reads the scope's own cgroup files to show
+      # what the kernel enforces. The jail has no /sys and a cgroup
+      # namespace of its own, so the scope directory is bound in directly.
+      # Its path assumes the user manager's default app.slice; -try turns
+      # a different layout into a SKIP in the probe instead of a failure.
+      if [ -n "$SCOPE_UNIT" ]; then
+        BWRAP_ARGS+=(--setenv SELFTEST_LIMITS 1)
+        BWRAP_ARGS+=(--ro-bind-try "/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/app.slice/$SCOPE_UNIT.scope" /sys/fs/cgroup)
+      else
+        BWRAP_ARGS+=(--setenv SELFTEST_LIMITS 0)
+      fi
       BWRAP_ARGS+=(--ro-bind "${selftestProbe}" /selftest.sh)
       run_jail bwrap "''${BWRAP_ARGS[@]}" -- "${pkgs.bash}/bin/sh" /selftest.sh
       exit $?
@@ -1963,9 +2165,17 @@ pkgs.writeShellApplication {
       # watching this.
       # --mount-cmd: an approved mount request runs this session's mount
       # launcher, so the broker never grows a second way of attaching a tree.
+      # --domain-cmd likewise for domain requests, and only with the filter
+      # on: without it the broker answers a domain request at once with "the
+      # filter is off" instead of queueing something nobody needs to approve.
+      BROKER_DOMAIN_ARGS=()
+      if [ "$NET_FILTER" = "1" ]; then
+        BROKER_DOMAIN_ARGS=(--domain-cmd "$RUNDIR/domain")
+      fi
       ${custodyCli} --dir "$TOOLBOX_DIR" serve \
         --broker-id "$$" --label "${name} $WORKSPACE_HOST" \
         --uservar "$USERVAR_ON" --mount-cmd "$RUNDIR/mount" \
+        "''${BROKER_DOMAIN_ARGS[@]+"''${BROKER_DOMAIN_ARGS[@]}"}" \
         >"$RUNDIR/broker.log" 2>&1 &
       BROKER_PID=$!
       # Readiness is observed, not slept for (same reason as slirp4netns and
@@ -2034,15 +2244,28 @@ pkgs.writeShellApplication {
       MOUNT_REG="$REG_DIR/$$.mount"
       ln -sfn "$RUNDIR/mount" "$MOUNT_REG"
       ln -sfn "$RUNDIR/mount" "$REG_DIR/current.mount"
+      # The domain launcher only exists with the filter on (it is written
+      # next to the dnsmasq setup), and so do its handles.
+      if [ -x "$RUNDIR/domain" ]; then
+        DOMAIN_REG="$REG_DIR/$$.domain"
+        ln -sfn "$RUNDIR/domain" "$DOMAIN_REG"
+        ln -sfn "$RUNDIR/domain" "$REG_DIR/current.domain"
+      fi
 
       vlog "mid-session sync: $RUNDIR/sync (also $REG_DIR/current, or llm-custody sync)"
       vlog "live mounts: $RUNDIR/mount add|remove|list (also $REG_DIR/current.mount, or llm-custody mount)"
+      if [ -n "$DOMAIN_REG" ]; then
+        vlog "live domains: $RUNDIR/domain add|remove|list|blocked (also $REG_DIR/current.domain, or llm-custody domain)"
+      fi
 
       # Terminals that understand OSC 1337 SetUserVar get both paths as
       # variables too, which is what makes a one-key binding possible.
       if [ "$USERVAR_ON" = "1" ]; then
         emit_uservar llm_custody_sync "$RUNDIR/sync"
         emit_uservar llm_custody_mount "$RUNDIR/mount"
+        if [ -n "$DOMAIN_REG" ]; then
+          emit_uservar llm_custody_domain "$RUNDIR/domain"
+        fi
         USERVAR_SET=1
       fi
       # The state names what the launch produced: isolated trees to fold
@@ -2145,6 +2368,7 @@ pkgs.writeShellApplication {
       card_row repo "$git_line"
       card_row network "$net_line"
       card_row mounts "$mounts_line"
+      [ -n "$LIMITS_DESC" ] && card_row limits "$LIMITS_DESC"
       # Only when it has something in it: an empty toolbox is the normal case
       # and a row saying so on every launch is noise. No nullglob - an
       # unmatched glob stays literal and the -e test rejects it.
@@ -2172,6 +2396,12 @@ pkgs.writeShellApplication {
       for arg in "''${BWRAP_ARGS[@]}"; do
         hint "$arg"
       done
+      if [ "''${#SCOPE_PREFIX[@]}" -gt 0 ]; then
+        log "resource limit scope (prefixed to the jail command, not checked against systemd for --dry-run):"
+        for arg in "''${SCOPE_PREFIX[@]}"; do
+          hint "$arg"
+        done
+      fi
       if [ "''${#TOOL_ARGS[@]}" -gt 0 ]; then
         log "command: ${toolExe} ''${TOOL_ARGS[*]}"
       else

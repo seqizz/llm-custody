@@ -90,5 +90,21 @@
     directory that covers the task rather than a home directory or a secrets
     store. If `custody-request` is missing, name the path in your reply
     instead and carry on with what does not depend on it.
+
+    ## Sandbox: asking for a network domain
+
+    Outbound network access is limited to a whitelist of domains. A name
+    outside it resolves to `0.0.0.0` / `::`, or the connection fails outright.
+    If the task needs such a domain, ask for it:
+
+        custody-request --domain registry.npmjs.org --reason "<why you need it>"
+
+    That blocks like a package request and uses the same exit codes. On
+    approval the domain and its subdomains resolve and connect immediately.
+    Name a plain hostname (no scheme, port, path, wildcard or IP address), the
+    narrowest one that covers the task. A request that fails at once with "the
+    network filter is off" means every domain is already reachable here, so
+    the cause of the failure is something else. If `custody-request` is
+    missing, name the domain in your reply instead.
   '';
 }

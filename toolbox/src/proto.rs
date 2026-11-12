@@ -48,13 +48,99 @@ pub const MAX_ATTR: usize = 128;
 pub const MAX_REASON: usize = 512;
 /// PATH_MAX; anything longer is not a path the host could mount anyway.
 pub const MAX_PATH: usize = 4096;
+/// The DNS limit for a name in dotted form, without the trailing dot.
+pub const MAX_DOMAIN: usize = 253;
+const MAX_LABEL: usize = 63;
 
 /// What a request asks for. A package goes into the toolbox profile, a mount
-/// attaches a host directory to the jail that asked. Both travel the same
-/// socket, hold the same place in the queue and are answered the same way;
-/// only the approval step differs.
+/// attaches a host directory to the jail that asked, a domain is added to that
+/// jail's network whitelist. All three travel the same socket, hold the same
+/// place in the queue and are answered the same way; only the approval step
+/// differs.
 pub const KIND_PACKAGE: &str = "package";
 pub const KIND_MOUNT: &str = "mount";
+pub const KIND_DOMAIN: &str = "domain";
+
+/// How long an approved domain stays allowed. `session` ends with the jail,
+/// `persist` also appends it to the state root's domains file so the next
+/// launch starts with it. Like a mount mode, only the operator picks this.
+pub const DOMAIN_MODES: [&str; 2] = ["session", "persist"];
+pub const DEFAULT_DOMAIN_MODE: &str = "session";
+
+pub fn validate_domain_mode(mode: &str) -> Result<()> {
+    if DOMAIN_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        fail(format!("domain mode must be one of {} (got: {mode})", DOMAIN_MODES.join("|")))
+    }
+}
+
+/// Validate a domain name and return it lowercased, which is the form every
+/// later step (the queue, the domain launcher, dnsmasq) sees.
+///
+/// The name ends up in a dnsmasq `server=/NAME/IP` line, so anything outside
+/// letters, digits, `-` and `.` would be config injection: a `/` adds a field,
+/// a `#` starts a comment, a newline starts a new directive. The rules are
+/// plain LDH hostname syntax and match `domain_valid` in lib/net-filter.sh,
+/// which the domain launcher applies again on its side.
+///
+/// At least two labels: a bare TLD would whitelist a whole registry. No
+/// wildcard and no trailing dot, because dnsmasq already matches subdomains
+/// and a second spelling of the same name would only confuse list/remove.
+/// Not an IP literal: an address is not something DNS whitelisting can grant,
+/// and inet_aton accepts hex (`0x7f`) and short (`127.1`) forms, so every
+/// label being a number in one of those spellings is what is refused.
+pub fn validate_domain(name: &str) -> Result<String> {
+    let name = name.to_ascii_lowercase();
+    if name.is_empty() {
+        return fail("empty domain name");
+    }
+    if name.len() > MAX_DOMAIN {
+        return fail(format!("domain name longer than {MAX_DOMAIN} characters"));
+    }
+    // Before any check whose message echoes the name: an error is printed
+    // to the operator's terminal too.
+    if name.chars().any(|c| c.is_control()) {
+        return fail("domain name contains control characters");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.') {
+        return fail(format!("domain name may only contain letters, digits, - and . (got: {name})"));
+    }
+    if name.ends_with('.') {
+        return fail(format!("domain name must not end with a dot: {name}"));
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.len() < 2 {
+        return fail(format!("domain name needs at least two labels: {name}"));
+    }
+    for label in &labels {
+        if label.is_empty() {
+            return fail(format!("domain name has an empty label: {name}"));
+        }
+        if label.len() > MAX_LABEL {
+            return fail(format!("domain label longer than {MAX_LABEL} characters: {name}"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return fail(format!("domain label must not start or end with -: {name}"));
+        }
+    }
+    if labels.iter().all(|l| numeric_label(l)) {
+        return fail(format!("an IP address is not a domain name: {name}"));
+    }
+    Ok(name)
+}
+
+/// A label inet_aton would read as a number: decimal, octal (also all
+/// digits) or `0x` hex.
+fn numeric_label(label: &str) -> bool {
+    if label.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    match label.strip_prefix("0x") {
+        Some(hex) => hex.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
+}
 
 /// How an approved mount is attached. The operator picks this at approval
 /// time; a jailed client cannot name one, because `full` hands it the real
@@ -216,6 +302,56 @@ mod tests {
         assert!(validate_mount_path(&format!("/{}", "a".repeat(MAX_PATH))).is_err());
         // A dot-dot inside a name is a name, not a traversal.
         assert!(validate_mount_path("/srv/a..b").is_ok());
+    }
+
+    #[test]
+    fn domains() {
+        assert_eq!(validate_domain("registry.npmjs.org").unwrap(), "registry.npmjs.org");
+        // Lowercased, since that is the form dnsmasq and the domains file use.
+        assert_eq!(validate_domain("GitHub.COM").unwrap(), "github.com");
+        assert!(validate_domain("a-b.c0.io").is_ok());
+        assert!(validate_domain(&format!("{}.com", "a".repeat(63))).is_ok());
+
+        // Config injection into `server=/NAME/IP`.
+        assert!(validate_domain("a/b.com").is_err());
+        assert!(validate_domain("a/b#c").is_err());
+        assert!(validate_domain("x/1.2.3.4").is_err());
+        assert!(validate_domain("evil.com#comment").is_err());
+        assert!(validate_domain("evil.com\nserver=/x/1.1.1.1").is_err());
+        assert!(validate_domain("evil.com\n").is_err());
+        assert!(validate_domain("evil .com").is_err());
+
+        assert!(validate_domain("").is_err());
+        assert!(validate_domain("com").is_err(), "bare TLD");
+        assert!(validate_domain("a..com").is_err());
+        assert!(validate_domain(".a.com").is_err());
+        assert!(validate_domain("a.com.").is_err());
+        assert!(validate_domain("*.a.com").is_err());
+        assert!(validate_domain("-a.com").is_err());
+        assert!(validate_domain("a-.com").is_err());
+        assert!(validate_domain(&format!("{}.com", "a".repeat(64))).is_err());
+        let long = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+        assert!(long.len() > MAX_DOMAIN);
+        assert!(validate_domain(&long).is_err());
+
+        // IP literals, including the spellings inet_aton also accepts.
+        assert!(validate_domain("1.2.3.4").is_err());
+        assert!(validate_domain("127.1").is_err());
+        assert!(validate_domain("0x7f.0.0.1").is_err());
+        assert!(validate_domain("[::1]").is_err());
+        assert!(validate_domain("::1").is_err());
+        // A numeric label among names is fine.
+        assert!(validate_domain("1.2.3.example.com").is_ok());
+        assert!(validate_domain("0xfeed.dev").is_ok());
+    }
+
+    #[test]
+    fn domain_modes() {
+        for m in DOMAIN_MODES {
+            assert!(validate_domain_mode(m).is_ok());
+        }
+        assert!(validate_domain_mode("ro").is_err());
+        assert!(validate_domain_mode("").is_err());
     }
 
     #[test]

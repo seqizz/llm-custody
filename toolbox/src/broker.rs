@@ -6,7 +6,9 @@
 //! exactly the same `Toolbox::add` the host CLI uses - there is no second
 //! install path to keep in step. An approved mount request likewise runs the
 //! session's own mount launcher (`--mount-cmd`), the same command the
-//! operator's keybinding runs.
+//! operator's keybinding runs, and an approved domain request runs the
+//! session's domain launcher (`--domain-cmd`), the same one behind
+//! `llm-custody domain`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -49,12 +51,18 @@ pub struct ServeOpts {
     /// approve a mount request. Absent for a jail started without one, where
     /// a mount request is accepted into the queue but cannot be approved.
     pub mount_cmd: Option<PathBuf>,
+    /// The session's domain launcher, run as `<cmd> add [--persist] -- NAME`
+    /// to approve a domain request. Absent exactly when the jail runs without
+    /// a network filter, where every domain is reachable already and a domain
+    /// request is answered with an error on the spot.
+    pub domain_cmd: Option<PathBuf>,
 }
 
 enum Outcome {
     /// `commands` is what a package approval put on PATH, `guest` where a
-    /// mount approval attached the tree; the other one is empty.
-    Approved { commands: Vec<String>, guest: String },
+    /// mount approval attached the tree, `scope` how long an approved domain
+    /// stays allowed (`session` or `persist`); the others are empty.
+    Approved { commands: Vec<String>, guest: String, scope: String },
     Denied(String),
     /// Nobody answered before the hold time ran out. Separate from `Denied`
     /// because the agent treats a denial as final.
@@ -63,9 +71,10 @@ enum Outcome {
 }
 
 struct Pending {
-    /// `proto::KIND_PACKAGE` or `proto::KIND_MOUNT`.
+    /// `proto::KIND_PACKAGE`, `proto::KIND_MOUNT` or `proto::KIND_DOMAIN`.
     kind: String,
-    /// The nixpkgs attribute, or the host path of a mount request.
+    /// The nixpkgs attribute, the host path of a mount request, or the
+    /// lowercased name of a domain request.
     attr: String,
     reason: String,
     created: u64,
@@ -84,6 +93,7 @@ struct Broker {
     uservar: bool,
     notify_hook: Option<PathBuf>,
     mount_cmd: Option<PathBuf>,
+    domain_cmd: Option<PathBuf>,
     /// Last count published to the terminal. Emission is on change only -
     /// nothing is gained by repeating a count, and an agent that spams
     /// requests should not get to decide how often this writes to a terminal.
@@ -158,6 +168,7 @@ pub fn serve(layout: Layout, opts: ServeOpts) -> Result<()> {
         uservar: opts.uservar,
         notify_hook: opts.notify_hook.clone(),
         mount_cmd: opts.mount_cmd.clone(),
+        domain_cmd: opts.domain_cmd.clone(),
         last_published: Mutex::new(None),
     });
     // Start from a known-empty queue rather than leaving whatever a previous
@@ -277,6 +288,67 @@ fn mount_command(launcher: &Path, mode: &str, path: &str) -> std::process::Comma
     cmd.args(["add", "--mode", mode, "--", path])
         .stdin(std::process::Stdio::null());
     cmd
+}
+
+/// The domain launcher's command line for an approved domain request.
+///
+/// The name was validated (LDH only) before it got here, but it still came
+/// from inside a jail, so it gets the same treatment as a mount path: one argv
+/// entry after a `--`. `persist` is the operator's choice.
+fn domain_command(launcher: &Path, persist: bool, name: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(launcher);
+    cmd.arg("add");
+    if persist {
+        cmd.arg("--persist");
+    }
+    cmd.args(["--", name]).stdin(std::process::Stdio::null());
+    cmd
+}
+
+/// Run the session's domain launcher and return the scope it reports.
+///
+/// The launcher prints `NAME<TAB>session|persist` on stdout and its
+/// diagnostics on stderr. Exit 2 is a name it refused, anything else non-zero
+/// a failure to apply it; either way the last stderr line is what the
+/// operator and the agent get to read.
+fn run_domain(launcher: &Path, persist: bool, name: &str) -> Result<String> {
+    let out = util::ctx(
+        domain_command(launcher, persist, name).output(),
+        format!("running {}", launcher.display()),
+    )?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let why = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("domain launcher failed")
+            .trim()
+            .to_string();
+        return match out.status.code() {
+            Some(2) => fail(format!("domain launcher refused {name}: {why}")),
+            _ => fail(format!("allowing {name} failed: {why}")),
+        };
+    }
+    for line in stderr.lines() {
+        if !line.trim().is_empty() {
+            util::note(format!("domain: {}", line.trim()));
+        }
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let scope = stdout
+        .lines()
+        .last()
+        .and_then(|l| l.split('\t').nth(1))
+        .map(str::trim)
+        .unwrap_or("");
+    // A launcher that printed nothing still applied the name, so the
+    // operator's own choice is the truthful fallback.
+    Ok(if scope.is_empty() {
+        if persist { "persist" } else { proto::DEFAULT_DOMAIN_MODE }.to_string()
+    } else {
+        scope.to_string()
+    })
 }
 
 /// The notification hook's command line.
@@ -429,7 +501,7 @@ impl Broker {
         // This socket has exactly one verb. Approval lives on the control
         // socket, which is never bound into a jail - see proto.rs.
         if msg.str_field("op") != "request" {
-            return fail("this socket only accepts package and mount requests");
+            return fail("this socket only accepts package, mount and domain requests");
         }
 
         // A message with no kind is a package request from a client built
@@ -438,14 +510,25 @@ impl Broker {
             "" => proto::KIND_PACKAGE.to_string(),
             k => k.to_string(),
         };
-        let attr = msg.str_field("attr").to_string();
+        let mut attr = msg.str_field("attr").to_string();
         let reason = msg.str_field("reason").trim().to_string();
         match kind.as_str() {
             proto::KIND_PACKAGE => proto::validate_attr(&attr)?,
             proto::KIND_MOUNT => proto::validate_mount_path(&attr)?,
+            proto::KIND_DOMAIN => attr = proto::validate_domain(&attr)?,
             other => return fail(format!("unknown request kind: {other}")),
         }
         proto::validate_reason(&reason)?;
+        // Answered now rather than queued: without a filter there is nothing
+        // to approve, and an agent blocked for the whole hold time on a
+        // question nobody needs to answer is worse than an instant error. A
+        // plain error, so the client exits 1 rather than "denied" or
+        // "unanswered", neither of which would be true.
+        if kind == proto::KIND_DOMAIN && self.domain_cmd.is_none() {
+            return fail(
+                "network filter is off for this session, every domain is already reachable",
+            );
+        }
 
         let id = format!("{}.{}", self.id, self.seq.fetch_add(1, Ordering::Relaxed) + 1);
         let (tx, rx) = mpsc::channel();
@@ -470,7 +553,11 @@ impl Broker {
         }
         util::note(format!(
             "request {id}: {}{attr} ({})",
-            if kind == proto::KIND_MOUNT { "mount " } else { "" },
+            match kind.as_str() {
+                proto::KIND_MOUNT => "mount ",
+                proto::KIND_DOMAIN => "domain ",
+                _ => "",
+            },
             if reason.is_empty() { "no reason given" } else { &reason }
         ));
         // After the lock above is dropped, so announce() can count the queue.
@@ -492,13 +579,16 @@ impl Broker {
 
         let outcome = self.wait_for_outcome(&id, &rx, &mut reader, stream);
         let reply = match outcome {
-            Some(Outcome::Approved { commands, guest }) => {
+            Some(Outcome::Approved { commands, guest, scope }) => {
                 let mut o = proto::ok_response().str("id", &id).str("attr", &attr);
                 if !commands.is_empty() {
                     o = o.str("commands", &commands.join(" "));
                 }
                 if !guest.is_empty() {
                     o = o.str("guest", &guest);
+                }
+                if !scope.is_empty() {
+                    o = o.str("scope", &scope);
                 }
                 o.finish()
             }
@@ -656,26 +746,51 @@ impl Broker {
     /// retargets `current` - so the package is visible to *every* running jail
     /// the moment this returns, not just the one that asked. A mount request
     /// runs the session's mount launcher instead, with the mode the operator
-    /// chose (`mode`; empty means read-only).
+    /// chose (`mode`; empty means read-only), and a domain request runs the
+    /// session's domain launcher (`mode` is `session` or `persist`, empty
+    /// means `session`).
     fn approve(&self, id: &str, mode: &str) -> Result<String> {
-        let mode = if mode.is_empty() { proto::DEFAULT_MOUNT_MODE } else { mode };
-        proto::validate_mount_mode(mode)?;
-        // Checked before the request leaves the queue: a mount nobody can
-        // perform should stay listed, not be consumed by a failed approval.
-        let launcher = {
+        // Checked before the request leaves the queue: a mount or domain
+        // nobody can perform, or a mode that does not fit the request, should
+        // leave it listed rather than be consumed by a failed approval.
+        let (kind, launcher, mode) = {
             let pending = self.pending.lock().unwrap();
-            match pending.get(id) {
+            let p = match pending.get(id) {
                 None => return fail(format!("no pending request with id {id}")),
-                Some(p) if p.kind == proto::KIND_MOUNT => match &self.mount_cmd {
-                    Some(l) => Some(l.clone()),
-                    None => {
-                        return fail(
-                            "this jail was started without a mount launcher, so the request \
-                             cannot be approved - deny it, or restart the session",
-                        )
+                Some(p) => p,
+            };
+            match p.kind.as_str() {
+                proto::KIND_MOUNT => {
+                    let mode = if mode.is_empty() { proto::DEFAULT_MOUNT_MODE } else { mode };
+                    proto::validate_mount_mode(mode)?;
+                    match &self.mount_cmd {
+                        Some(l) => (p.kind.clone(), Some(l.clone()), mode),
+                        None => {
+                            return fail(
+                                "this jail was started without a mount launcher, so the request \
+                                 cannot be approved - deny it, or restart the session",
+                            )
+                        }
                     }
-                },
-                Some(_) => None,
+                }
+                proto::KIND_DOMAIN => {
+                    let mode = if mode.is_empty() { proto::DEFAULT_DOMAIN_MODE } else { mode };
+                    proto::validate_domain_mode(mode)?;
+                    match &self.domain_cmd {
+                        Some(l) => (p.kind.clone(), Some(l.clone()), mode),
+                        // The request socket already refuses a domain request
+                        // in this case; kept as a check rather than an assert
+                        // so a broker bug cannot turn into a panic.
+                        None => {
+                            return fail(
+                                "this jail runs without a network filter, so there is no \
+                                 domain to allow - deny the request",
+                            )
+                        }
+                    }
+                }
+                // The mode means nothing for a package.
+                _ => (p.kind.clone(), None, ""),
             }
         };
         // Taken out of the map before the install so a second `approve` of the
@@ -690,12 +805,46 @@ impl Broker {
         // would otherwise still be asking for attention.
         self.announce("approved", id, &p.attr, &p.reason);
 
+        if let (proto::KIND_DOMAIN, Some(launcher)) = (kind.as_str(), &launcher) {
+            util::note(format!("request {id}: approved, allowing {} ({mode})", p.attr));
+            return match run_domain(launcher, mode == "persist", &p.attr) {
+                Ok(scope) => {
+                    let delivered = p
+                        .tx
+                        .send(Outcome::Approved {
+                            commands: Vec::new(),
+                            guest: String::new(),
+                            scope: scope.clone(),
+                        })
+                        .is_ok();
+                    let mut o = proto::ok_response()
+                        .str("id", id)
+                        .str("attr", &p.attr)
+                        .str("scope", &scope);
+                    if !delivered {
+                        o = o.str("note", "allowed, but the jail client had already gone away");
+                    }
+                    Ok(o.finish())
+                }
+                Err(e) => {
+                    let _ = p.tx.send(Outcome::Failed(e.msg.clone()));
+                    Err(e)
+                }
+            };
+        }
+
         if let Some(launcher) = launcher {
             util::note(format!("request {id}: approved, mounting {} ({mode})", p.attr));
             return match run_mount(&launcher, mode, &p.attr) {
                 Ok(guest) => {
-                    let delivered =
-                        p.tx.send(Outcome::Approved { commands: Vec::new(), guest: guest.clone() }).is_ok();
+                    let delivered = p
+                        .tx
+                        .send(Outcome::Approved {
+                            commands: Vec::new(),
+                            guest: guest.clone(),
+                            scope: String::new(),
+                        })
+                        .is_ok();
                     let mut o = proto::ok_response()
                         .str("id", id)
                         .str("attr", &p.attr)
@@ -721,7 +870,11 @@ impl Broker {
                 // package is installed and the next jail to look will find it.
                 let delivered = p
                     .tx
-                    .send(Outcome::Approved { commands: commands.clone(), guest: String::new() })
+                    .send(Outcome::Approved {
+                        commands: commands.clone(),
+                        guest: String::new(),
+                        scope: String::new(),
+                    })
                     .is_ok();
                 let mut o = proto::ok_response()
                     .str("id", id)
@@ -969,6 +1122,96 @@ mod tests {
         assert_eq!(args[2], OsStr::new("limited"));
         assert_eq!(args[3], OsStr::new("--"));
         assert_eq!(args[4], OsStr::new("/srv/-weird; rm -rf /"));
+    }
+
+    /// The domain launcher gets `add`, `--persist` only when the operator
+    /// chose it, and the name after a `--`.
+    #[test]
+    fn domain_launcher_gets_separate_arguments() {
+        let cmd = domain_command(Path::new("/run/x/domain"), false, "registry.npmjs.org");
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(cmd.get_program(), OsStr::new("/run/x/domain"));
+        assert_eq!(args, [OsStr::new("add"), OsStr::new("--"), OsStr::new("registry.npmjs.org")]);
+
+        let cmd = domain_command(Path::new("/run/x/domain"), true, "-x.example.com");
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                OsStr::new("add"),
+                OsStr::new("--persist"),
+                OsStr::new("--"),
+                OsStr::new("-x.example.com")
+            ]
+        );
+    }
+
+    /// Writes an executable /bin/sh script into a fresh temp dir. None when
+    /// there is no /bin/sh, for the same reason as the hook test below.
+    fn fake_launcher(tag: &str, body: &str) -> Option<(PathBuf, PathBuf)> {
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("SKIP: no /bin/sh to write a launcher with");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("llm-custody-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let launcher = dir.join("domain");
+        // `@DIR@` rather than dirname "$0": a builtin-only script does not
+        // depend on what PATH the test harness happens to have.
+        let body = body.replace("@DIR@", &dir.display().to_string());
+        fs::write(&launcher, format!("#!/bin/sh\n{body}")).expect("write launcher");
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).expect("chmod launcher");
+        Some((dir, launcher))
+    }
+
+    /// End to end against a launcher that records its argv. The name here
+    /// is one validation refuses (asserted first), so this proves the argv
+    /// form holds on its own, not only because the validator ran.
+    #[test]
+    fn a_hostile_domain_arrives_as_one_inert_argument() {
+        let tmp = std::env::temp_dir().join(format!("llm-custody-dombait-{}", std::process::id()));
+        let bait = tmp.join("executed");
+        let name = format!("x.com; touch {b} $(touch {b}) `touch {b}`", b = bait.display());
+        assert!(proto::validate_domain(&name).is_err());
+        assert!(proto::validate_domain(HOSTILE).is_err());
+
+        let (dir, launcher) = match fake_launcher(
+            "domain-argv",
+            "printf '%s\\n' \"$@\" > '@DIR@/argv'\nprintf 'x.com\\tpersist\\n'\n",
+        ) {
+            Some(v) => v,
+            None => return,
+        };
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("bait dir");
+
+        let scope = run_domain(&launcher, true, &name).expect("launcher ran");
+        assert_eq!(scope, "persist");
+        let got: Vec<String> = fs::read_to_string(dir.join("argv"))
+            .expect("launcher output")
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(got, ["add", "--persist", "--", name.as_str()]);
+        assert!(!bait.exists(), "the name was interpreted, not passed");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Exit 2 is the launcher refusing the name, and its stderr is the reason.
+    #[test]
+    fn a_refused_domain_reports_the_launchers_reason() {
+        let (dir, launcher) =
+            match fake_launcher("domain-refuse", "echo 'domain: invalid name' >&2\nexit 2\n") {
+                Some(v) => v,
+                None => return,
+            };
+        let err = run_domain(&launcher, false, "x.com").unwrap_err();
+        assert!(err.msg.contains("refused x.com"), "{}", err.msg);
+        assert!(err.msg.contains("invalid name"), "{}", err.msg);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

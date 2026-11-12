@@ -83,6 +83,39 @@ pkgs.writeText "llm-custody-selftest.sh" ''
   else
     echo "SKIP: tiocsti probe not present"
   fi
+  # Nested user namespaces: the unshare check above does not cover clone
+  # and clone3, which reach the same fresh userns with full capabilities.
+  # The probe prints one line per call that got through.
+  if [ -x "$SELFTEST_USERNS" ]; then
+    if out=$("$SELFTEST_USERNS"); then
+      echo "OK: nested user namespaces blocked (clone, clone3)"
+    else
+      printf '%s\n' "$out" | while IFS= read -r line; do
+        echo "FAIL: $line - nested user namespace not blocked"
+      done
+      exit 1
+    fi
+  else
+    echo "SKIP: userns probe not present"
+  fi
+
+  # Resource limits (--max-mem/--max-cpu/--max-pids): the runner binds the
+  # systemd scope's cgroup directory at /sys/fs/cgroup when it can. Report
+  # only, the values are the kernel's view of what the flags asked for.
+  if [ "$SELFTEST_LIMITS" = "1" ]; then
+    if [ -r /sys/fs/cgroup/cgroup.procs ]; then
+      for f in memory.max memory.swap.max cpu.max pids.max; do
+        if [ -r "/sys/fs/cgroup/$f" ]; then
+          echo "  limit $f: $(cat "/sys/fs/cgroup/$f")"
+        else
+          echo "  limit $f: not present (controller not enabled for the scope)"
+        fi
+      done
+      echo "OK: limited scope cgroup visible"
+    else
+      echo "SKIP: scope cgroup not visible at /sys/fs/cgroup, limits not shown"
+    fi
+  fi
   if [ "$SELFTEST_NET" = "1" ]; then
     if command -v getent >/dev/null 2>&1; then
       # getent ahostsv4 is broken/empty in this glibc (rc=2 even for names

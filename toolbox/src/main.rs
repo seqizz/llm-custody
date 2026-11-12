@@ -14,6 +14,7 @@
 
 mod broker;
 mod brokerctl;
+mod domain;
 mod json;
 mod launch;
 mod nix;
@@ -41,8 +42,10 @@ Usage: llm-custody [--dir PATH] [--pid PID] [--pause] <command> [ARG...]
   launch TOOL ...   start a sandboxed tool, no TOOL lists them
   mount ...         attach a host tree to a live session, or detach one
   sync ...          fold a live session's isolated trees back to the host
+  domain ...        a live session's network whitelist and blocked names
   session list      the live sessions and what each one has outstanding
-  request ...       the package and mount requests jailed agents wait on
+  request ...       the package, mount and domain requests jailed agents
+                    wait on
   toolbox ...       the package profile every jail sees on its PATH
   lease ...         how long an added package survives without being used
   serve             the per-jail request broker, started by the runner
@@ -52,7 +55,7 @@ Options:
                Without it: the toolbox of the most recently started session
                ($XDG_RUNTIME_DIR/llm-custody/current.toolbox), else
                $LLMCUSTODY_TOOLBOX_DIR or ~/.config/llm-custody/toolbox
-  --pid PID    which live session to act on (mount, sync, request).
+  --pid PID    which live session to act on (mount, sync, domain, request).
                Without it: the most recently started one
   --pause      wait for a keypress before exiting, so a pane a terminal
                keybinding spawned does not close over the output
@@ -109,8 +112,10 @@ Usage: llm-custody session list
 
 One block per live session: pid, tool and workspace, then the git mode,
 whether the workspace is an overlay, how many paths are written but not
-synced, how many trees are attached, how many requests are waiting, and the
-sync and mount launchers of that session.
+synced, how many trees are attached, how many requests are waiting, how
+many domains were allowed after launch and how many distinct names the
+network filter blocked (or that it has none), and the sync, mount and
+domain launchers of that session.
 
 Sessions register under $XDG_RUNTIME_DIR/llm-custody as <pid>.state.
 "
@@ -123,16 +128,19 @@ fn usage_request() {
 Usage: llm-custody [--dir PATH] [--pid PID] request <command> [ARG...]
 
 What jailed agents have asked for and are blocked on. A package goes into the
-toolbox profile, a mount attaches a host directory to the jail that asked.
+toolbox profile, a mount attaches a host directory to the jail that asked, a
+domain is added to that jail's network whitelist.
 
   list             pending requests from every running jail (alias: ls)
                    [--json] machine-readable, for a terminal integration
   answer           the same queue, interactively: pick a numbered row to
                    approve or deny it without typing a request id (a mount
-                   then asks for its mode)
+                   then asks for its mode, a domain for session or persist)
   approve ID       grant it and unblock the jail
                    [--mode ro|full|limited|none|overlay] how a mount is
-                   attached (default ro, ignored for a package)
+                   attached (default ro), [--mode session|persist] how
+                   long a domain stays allowed (default session); ignored
+                   for a package
   deny ID          refuse it [--reason TEXT]
 
 --pid restricts all of this to one session's broker.
@@ -219,6 +227,9 @@ client's connection open until the operator answers.
                      problem. $LLMCUSTODY_NOTIFY_HOOK is the default
   --mount-cmd PATH   the session's mount launcher; an approved mount request
                      runs it as `add --mode M -- PATH`
+  --domain-cmd PATH  the session's domain launcher; an approved domain
+                     request runs it as `add [--persist] -- NAME`. Without
+                     it (no network filter) a domain request fails at once
 
 Also runs one prune and gc in the background, which is what keeps expired
 leases from accumulating without anyone remembering to look.
@@ -235,6 +246,7 @@ fn help_for(topic: Option<&str>) -> Result<()> {
         Some("launch") => launch::usage(),
         Some("mount") => usage_mount(),
         Some("sync") => usage_sync(),
+        Some("domain") => domain::usage(),
         Some("session") => usage_session(),
         Some("request") => usage_request(),
         Some("toolbox") => usage_toolbox(),
@@ -255,6 +267,7 @@ fn unalias<'a>(group: &str, cmd: &'a str) -> &'a str {
         ("toolbox", "install") | ("toolbox", "i") => "add",
         ("toolbox", "rm") => "remove",
         ("mount", "rm") | ("mount", "umount") => "remove",
+        ("domain", "rm") => "remove",
         (_, "ls") => "list",
         _ => cmd,
     }
@@ -377,7 +390,7 @@ fn parse_global(args: &[String]) -> Result<Global> {
 fn run(g: Global) -> Result<()> {
     let (cmd, rest): (String, Vec<String>) = match g.args.split_first() {
         Some((c, r)) => (c.clone(), r.to_vec()),
-        // Nothing to guess at with eight commands: show them.
+        // Nothing to guess at with this few commands: show them.
         None => {
             usage();
             return Ok(());
@@ -388,6 +401,7 @@ fn run(g: Global) -> Result<()> {
         "launch" => launch::run(&rest),
         "mount" => cmd_mount(&g, &rest),
         "sync" => cmd_sync(&g, &rest),
+        "domain" => cmd_domain(&g, &rest),
         "session" => cmd_session(&rest),
         "request" => cmd_request(&g, &rest),
         "toolbox" => cmd_toolbox(&g, &rest),
@@ -445,6 +459,20 @@ fn cmd_sync(g: &Global, args: &[String]) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn cmd_domain(g: &Global, args: &[String]) -> Result<()> {
+    if wants_help(args) {
+        domain::usage();
+        return Ok(());
+    }
+    // Only the subcommand is unaliased, as for mount: the rest is a domain
+    // name and its flags, which domain.rs parses.
+    let mut args = args.to_vec();
+    if let Some(first) = args.first_mut() {
+        *first = unalias("domain", first).to_string();
+    }
+    domain::run(&Registry::open(), g.pid.as_deref(), g.layout()?, &args)
 }
 
 fn cmd_session(args: &[String]) -> Result<()> {
@@ -751,6 +779,7 @@ fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     let mut mount_cmd = None;
+    let mut domain_cmd = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -774,6 +803,13 @@ fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
                 match args.get(i) {
                     Some(v) => mount_cmd = Some(PathBuf::from(v)),
                     None => return usage_err("--mount-cmd needs a path"),
+                }
+            }
+            "--domain-cmd" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => domain_cmd = Some(PathBuf::from(v)),
+                    None => return usage_err("--domain-cmd needs a path"),
                 }
             }
             "--broker-id" => {
@@ -806,7 +842,15 @@ fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
     }
     broker::serve(
         tb.layout,
-        broker::ServeOpts { broker_id, label, timeout, uservar, notify_hook, mount_cmd },
+        broker::ServeOpts {
+            broker_id,
+            label,
+            timeout,
+            uservar,
+            notify_hook,
+            mount_cmd,
+            domain_cmd,
+        },
     )
 }
 
@@ -915,6 +959,8 @@ mod tests {
         assert_eq!(unalias("session", "ls"), "list");
         assert_eq!(unalias("mount", "rm"), "remove");
         assert_eq!(unalias("mount", "umount"), "remove");
+        assert_eq!(unalias("domain", "rm"), "remove");
+        assert_eq!(unalias("domain", "ls"), "list");
         // An alias belongs to its own group only.
         assert_eq!(unalias("lease", "i"), "i");
         assert_eq!(unalias("toolbox", "umount"), "umount");

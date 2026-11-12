@@ -185,6 +185,9 @@ llm-custody launch <tool> [options] [-- tool-args...]
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
 | `--mask GLOB` | Hide files/dirs matching GLOB in the workspace **and in every extra mount** (deleted from a jail copy; shadowed by an empty read-only file/dir where the tree is bound directly, i.e. `--ro-mount` and `--git full`; repeatable) | - |
+| `--max-mem SIZE` | Memory limit for the jail (`512M`, `8G`; suffix K/M/G/T), swap disabled for it too (see [Resource limits](#resource-limits)) | no limit |
+| `--max-cpu PCT` | CPU quota in percent of one core, `200` = two cores | no limit |
+| `--max-pids N` | Maximum number of tasks (processes and threads) in the jail | no limit |
 | `--no-net-filter` | Disable network filtering (unrestricted access) | filtering on |
 | `--merge-config` | Interactively merge root-level keys from the host tool's settings.json into the jail-private one; each differing key prompts y/N individually ('a' accepts the rest) | off |
 | `--merge-config-from PATH` | Same as `--merge-config` with an explicit source file instead of the default host tool settings.json | - |
@@ -784,6 +787,66 @@ binds `.git/hooks` read-only on top and in-jail git keeps its forced
 `core.hooksPath`, but the tree is the real one. Prefer `limited` unless the
 agent needs to see the host's edits as they happen.
 
+### Live domain management
+
+The network whitelist can change while the session runs, the same way
+mounts can. The operator adds or removes a domain from a second terminal,
+and the agent can ask for one it was blocked from:
+
+```bash
+llm-custody domain                                  # interactive menu: requests, allowed, blocked
+llm-custody domain add registry.npmjs.org           # for this session
+llm-custody domain add --persist registry.npmjs.org # also appended to --state-dir/domains
+llm-custody domain remove --persist registry.npmjs.org
+llm-custody domain list                             # each name with its source
+llm-custody domain blocked                          # names that hit the catch-all, with counts
+```
+
+Inside the jail, `custody-request --domain NAME --reason "..."` queues a
+request like a package or mount one (same exit codes), and approving it
+offers *session* or *persist*. With `--no-net-filter` every domain is
+already reachable, so such a request is refused at once instead of
+queued.
+
+`list` tags every name with where it came from: `default` (the tool's
+built-in list in `tools.nix`), `file` (`--state-dir/domains`), `flag`
+(`--allow-domain`, or a host taken from `ANTHROPIC_BASE_URL` /
+`OPENAI_BASE_URL`) or `live` (added during the session). An approval lasts
+for the session; *persist* additionally appends the name to
+`--state-dir/domains` so the next launch starts with it. `remove` of a
+default works for the session only: `remove --persist` refuses a default,
+because that list lives in the Nix source.
+
+Names must be plain hostnames: lowercase LDH labels, at least two of them,
+no wildcard, no IP literal, at most 253 characters. A domain covers its
+subdomains, as at launch. The same check now applies to `--allow-domain`
+and to the domains file; a name that fails it is left off with a warning
+rather than written into the dnsmasq config.
+
+What a change does: the controller (`$RUNDIR/domain`, which
+`llm-custody domain` runs through the session registry like `mount`)
+regenerates the dnsmasq config and restarts dnsmasq inside the holder's
+network namespace. A lookup that arrives during the restart (well under a
+second) goes unanswered and is retried by the resolver after its timeout.
+Adding then pre-resolves the new name into the nftables sets. Removing
+replaces the sets' contents, in one nft transaction, with the addresses of
+what is still allowed: a fresh lookup of every remaining name, plus every
+address dnsmasq has already handed out for those names this session (an
+open connection to a CDN address a fresh lookup no longer returns keeps
+working). Should that transaction fail, the controller falls back to a
+flush and a re-add one by one, and connects to still-allowed domains can
+be dropped until it finishes. An established connection to the removed
+domain's addresses is cut by the drop policy, unless another allowed name
+resolved to the same address.
+
+`blocked` reads the dnsmasq query log: every name that got the
+`address=/#/` catch-all, with how often, names allowed since left out. The
+exit summary lists the same names.
+
+The launcher is published as the `llm_custody_domain` user var and as
+`$XDG_RUNTIME_DIR/llm-custody/<pid>.domain` / `current.domain`, all only
+when the network filter is on.
+
 ### Repo history exposure (`--git`)
 
 By default (`--git limited`) the sandbox does **not** see your `.git`. The
@@ -954,6 +1017,7 @@ var `llm_custody_state`.
 | `sync` | the mid-session sync command. Always present now that a copy mount can be attached after launch; `state=direct` means nothing was isolated *at launch* |
 | `manifest` | the sync manifest the command reads, empty for a session with nothing isolated |
 | `mount` | the session's mount launcher (`add` / `remove` / `list`), see [Live mounts](#live-mounts) |
+| `domain` | the session's domain launcher (`add` / `remove` / `list` / `blocked`), see [Live domain management](#live-domain-management). Absent with `--no-net-filter` |
 
 A record rather than more single-purpose variables, or magic values stuffed
 into existing ones: the questions a consumer asks keep growing (is there
@@ -1166,8 +1230,8 @@ foreground group to go to. That group's leader is a `timeout --foreground
 0` sitting in the host workspace, because terminal splits take a new
 pane's cwd from the foreground leader and bwrap itself sits at `/`.
 
-The sandboxed process runs without `CAP_SYS_ADMIN` (bwrap
-`--cap-drop CAP_SYS_ADMIN`), so it cannot create bind mounts or remount
+The sandboxed process runs without any capability (bwrap
+`--cap-drop ALL`), so it cannot create bind mounts or remount
 anything regardless of syscall flavor. That matters because `mount --bind`
 that an agent runs via the jail's own `mount` binary uses the mount API
 (`open_tree`/`move_mount`), not `mount(2)` - a seccomp list of the classic
@@ -1204,15 +1268,33 @@ sandboxed process has its own PID 1 and no visibility into host processes.
 User and network namespaces are shared with a dedicated long-lived netns
 holder process (not the host's), so the sandbox gets a private network too.
 
+The sandboxed process cannot create user namespaces of its own. The
+seccomp filter is what enforces that: it denies `unshare` and
+namespace-creating `clone` flags, and answers `clone3` with `ENOSYS` so
+glibc falls back to the inspectable `clone`. bwrap's `--disable-userns` is
+passed too, but measured inert on bwrap 0.13.1 (it leaves
+`/proc/sys/user/max_user_namespaces` at `INT_MAX` instead of the documented
+`1`), so nothing depends on it. A fresh user namespace would
+hand it a full capability set inside, enough to reach netns-scoped
+nftables and the rest of the userns-gated kernel surface. The flip side:
+anything that needs one inside the jail fails, e.g. rootless podman, a
+nested bwrap, or Claude Code's own `sandbox` mode (which is why
+`--merge-config` never imports claude's `sandbox` key). `--selftest`
+probes `clone` and `clone3`.
+
 **Environment variables.** Only these are forwarded into the sandbox:
 
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`
 - `OPENAI_API_KEY`, `OPENAI_BASE_URL`
-- `AWS_*`
 - `TERM`, `COLORTERM`, `LANG`, `LC_ALL`, `LC_CTYPE` (not `LINES`/`COLUMNS`:
   the terminal size comes from the pty and follows resizes, a fixed value
   in the environment would pin ncurses-style tools to the launch size)
 - Anything passed via `--env KEY=VAL`
+
+Cloud credentials (`AWS_*` and the like) are not inherited from the host
+shell, which often carries keys for unrelated accounts. Pass the one the
+session needs explicitly, e.g. `--env AWS_PROFILE=dev` (plus a
+`--ro-mount` of the matching config) or `--env AWS_ACCESS_KEY_ID=...`.
 
 `DISPLAY`, `XAUTHORITY`, and `WAYLAND_DISPLAY` are explicitly stripped by
 default. This prevents tools like `pi` from trying (and failing) to use X11
@@ -1258,7 +1340,8 @@ filtering and a default-deny firewall inside a private network namespace:
   automatically whitelisted
 - Additional domains can be added with `--allow-domain` (suffix/subdomain
   matched, no wildcard/glob support yet), or persistently via
-  `~/.config/llm-custody/domains`
+  `~/.config/llm-custody/domains`, or while the session runs (see
+  [Live domain management](#live-domain-management))
 - Whitelisted domains are pre-resolved into the nftables sets before the
   sandbox starts (first-connect race mitigation); later DNS answers keep
   the sets fresh
@@ -1271,22 +1354,60 @@ filtering and a default-deny firewall inside a private network namespace:
 Default allowed domains are per tool (`tools.nix` `allowedDomains`).
 
 - `pi`: `pi.dev`, `api.anthropic.com`, `api.openai.com`, `auth.openai.com`,
-  `chatgpt.com`, `generativelanguage.googleapis.com`, `github.com`,
-  `api.github.com`, `openrouter.ai`, `api.deepseek.com`, `api.mistral.ai`,
-  `api.x.ai`, `api.groq.com`, `api.cerebras.ai`, `api.novita.ai`
+  `chatgpt.com`, `generativelanguage.googleapis.com`, `openrouter.ai`,
+  `api.deepseek.com`. Any other provider (Mistral, xAI, Groq, Cerebras,
+  Novita, ...) needs its API host added with `--allow-domain`
 - `claude`: `api.anthropic.com`, `platform.claude.com`, `claude.ai` (the
   last two only matter for the in-jail login - authorize page, code
   callback and token exchange live on `platform.claude.com`, which is where
-  the old `console.anthropic.com` endpoints moved), `github.com`,
-  `api.github.com`. Plugin/marketplace installs need
-  `--allow-domain registry.npmjs.org` (and possibly
-  `raw.githubusercontent.com`) on top.
+  the old `console.anthropic.com` endpoints moved)
+
+GitHub is on neither list: it is a bidirectional channel, so it is granted
+per need. Plugin/marketplace installs (and `git`/`gh` against GitHub) need
+`github.com`, `api.github.com`, `registry.npmjs.org` and possibly
+`raw.githubusercontent.com`, added with `--allow-domain`, the persistent
+`domains` file, or a live domain approval during the session.
 
 > [!NOTE]
 > Dual-stack: slirp4netns's IPv6 path (`-6`, marked experimental upstream)
 > is enabled, with a matching IPv6 nftables set/rule and dnsmasq AAAA
 > catch-all alongside the IPv4 ones. Not yet battle-tested against a
 > real IPv6-only endpoint.
+
+## Resource limits
+
+Off by default. `--max-mem`, `--max-cpu` and `--max-pids` put the jail in a
+transient systemd user scope (`systemd-run --user --scope`, unit
+`llm-custody-<tool>-<runner pid>.scope`) carrying `MemoryMax=` plus
+`MemorySwapMax=0`, `CPUQuota=` and `TasksMax=` respectively:
+
+```bash
+nix run .#pi -- --max-mem 8G --max-cpu 200 --max-pids 4096
+```
+
+The scope holds the jailed tool and everything it starts. The runner, the
+request broker, dnsmasq, slirp4netns and the watchers stay outside it, so a
+fork bomb or an OOM kill inside the jail leaves the helpers running and the
+sync-back at exit still happens. Exceeding `--max-mem` gets a process in
+the scope OOM-killed, nothing outside it.
+
+Memory accounting follows the kernel's rules for tmpfs: pages are charged
+to the cgroup of the process that wrote them. The workspace copy the runner
+makes under `--tmpdir` at launch is not counted against the jail, but files
+the agent writes into a tmpfs-backed copy afterwards are. Point `--tmpdir`
+at disk if a big build in the workspace would otherwise eat the limit.
+
+Any limit flag needs a working systemd user manager, and the runner refuses
+to launch rather than run unlimited when something is missing:
+`systemd-run` on PATH, the user bus (`DBUS_SESSION_BUS_ADDRESS` or
+`$XDG_RUNTIME_DIR/bus`), cgroup v2, and the requested controllers
+(`memory`, `cpu`, `pids`) delegated to `user@<uid>.service`. Before the
+sandbox is set up it also creates a throwaway scope with the same
+properties, which catches a shell that systemd cannot move into a scope
+(typical for some ssh sessions). `--dry-run` prints the `systemd-run`
+prefix without checking any of this. `--selftest` with limit flags runs the
+probe inside the scope and prints the `memory.max`, `memory.swap.max`,
+`cpu.max` and `pids.max` it sees.
 
 ## Dangerous mode
 

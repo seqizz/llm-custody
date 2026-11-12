@@ -1,10 +1,11 @@
 //! `custody-request`: the jail-side entry point.
 //!
-//! Reached inside the sandbox as `custody-request <attr> [--reason TEXT]` or
-//! `custody-request --mount <path> [--reason TEXT]`, which is the same binary
-//! under a different name. It sends one bounded message per attribute or
-//! path to the broker socket bound into the jail and waits for the operator's
-//! answer on the same connection.
+//! Reached inside the sandbox as `custody-request <attr> [--reason TEXT]`,
+//! `custody-request --mount <path> [--reason TEXT]` or
+//! `custody-request --domain <name> [--reason TEXT]`, which is the same binary
+//! under a different name. It sends one bounded message per attribute, path
+//! or domain to the broker socket bound into the jail and waits for the
+//! operator's answer on the same connection.
 //!
 //! Nothing here is trusted by the broker: the validation in proto.rs runs on
 //! the broker side too, and this copy exists only to fail fast with a readable
@@ -28,14 +29,19 @@ pub fn usage() {
         "\
 Usage: custody-request <nixpkgs-attr>... [--reason TEXT]
        custody-request --mount <host-path>... [--reason TEXT]
+       custody-request --domain <name>... [--reason TEXT]
 
 Ask the operator of this sandbox to add a package to the toolbox, which is
-the shared profile on this jail's PATH, or to attach a host directory to this
-jail. Blocks until the request is answered.
+the shared profile on this jail's PATH, to attach a host directory to this
+jail, or to let this jail reach a domain its network filter blocks. Blocks
+until the request is answered.
 
   --mount PATH    ask for a host path instead of a package (repeatable). The
                   operator decides how it is attached - read-only, a synced
                   copy, or the real tree - and the answer names where it is
+  --domain NAME   ask for a blocked domain instead of a package (repeatable).
+                  A blocked name resolves to 0.0.0.0 or fails to connect.
+                  Fails at once, exit 1, when this jail has no network filter
   --reason TEXT   why it is needed; the operator sees this
   --socket PATH   broker socket (default: {sock}, or ${env})
 
@@ -43,7 +49,8 @@ Exit status: 0 approved, {denied} denied, {unanswered} nobody answered.
 
 Only bare nixpkgs attribute names are accepted - `ripgrep`, `python3Packages.black`.
 Flake references are refused: choosing a flake to fetch is the operator's call.
-Mount paths must be absolute.
+Mount paths must be absolute. Domains are plain host names such as
+registry.npmjs.org: no wildcard, no IP address, no trailing dot.
 ",
         sock = proto::JAIL_SOCKET_PATH,
         env = proto::SOCKET_ENV,
@@ -86,6 +93,13 @@ pub fn run(args: &[String]) -> Result<()> {
                     None => return usage_err("--mount needs a host path"),
                 }
             }
+            "--domain" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => wants.push((proto::KIND_DOMAIN, v.clone())),
+                    None => return usage_err("--domain needs a domain name"),
+                }
+            }
             a if a.starts_with('-') => return usage_err(format!("unknown option: {a}")),
             a => wants.push((proto::KIND_PACKAGE, a.to_string())),
         }
@@ -94,13 +108,17 @@ pub fn run(args: &[String]) -> Result<()> {
 
     if wants.is_empty() {
         usage();
-        return usage_err("name at least one nixpkgs attribute, or --mount a host path");
+        return usage_err(
+            "name at least one nixpkgs attribute, --mount a host path or --domain a name",
+        );
     }
-    for (kind, name) in &wants {
-        if *kind == proto::KIND_MOUNT {
-            proto::validate_mount_path(name)?;
-        } else {
-            proto::validate_attr(name)?;
+    for (kind, name) in wants.iter_mut() {
+        match *kind {
+            proto::KIND_MOUNT => proto::validate_mount_path(name)?,
+            // Sent in the normalized form, so the operator approves exactly
+            // the name the whitelist will hold.
+            proto::KIND_DOMAIN => *name = proto::validate_domain(name)?,
+            _ => proto::validate_attr(name)?,
         }
     }
     proto::validate_reason(&reason)?;
@@ -155,8 +173,9 @@ fn one(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<()> {
             ))
         }
     };
-    // `attr` carries the path of a mount request as well: one field, one
-    // queue, one set of hook arguments on the host side.
+    // `attr` carries the path of a mount request and the name of a domain
+    // request as well: one field, one queue, one set of hook arguments on the
+    // host side.
     let msg = json::Obj::new()
         .str("op", "request")
         .str("kind", kind)
@@ -195,7 +214,10 @@ fn one(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<()> {
             proto::STATUS_OK => {
                 let commands = msg.str_field("commands");
                 let guest = msg.str_field("guest");
-                if !guest.is_empty() {
+                let scope = msg.str_field("scope");
+                if !scope.is_empty() {
+                    say(format!("{attr}: approved, reachable now ({scope})"));
+                } else if !guest.is_empty() {
                     say(format!("{attr}: approved, mounted at {guest}"));
                 } else if commands.is_empty() {
                     say(format!("{attr}: approved and installed"));

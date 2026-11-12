@@ -16,7 +16,10 @@
       # Root-level settings.json keys --merge-config must never offer: the
       # bootstrapScript owns these and rewrites them on every launch, so
       # adopting a host value would be undone immediately.
-      mergeSkipKeys = [ "extensions" "defaultProjectTrust" ];
+      mergeSkipKeys = [
+        "extensions"
+        "defaultProjectTrust"
+      ];
       # Per-tool translation table for the runner's generic session-resume
       # flags. The runner accepts -c/--continue/-r/--resume and maps them to
       # whatever this tool actually accepts: `continue` = resume the most
@@ -37,15 +40,8 @@
         "auth.openai.com"
         "chatgpt.com"
         "generativelanguage.googleapis.com"
-        "github.com"
-        "api.github.com"
         "openrouter.ai"
         "api.deepseek.com"
-        "api.mistral.ai"
-        "api.x.ai"
-        "api.groq.com"
-        "api.cerebras.ai"
-        "api.novita.ai"
       ];
     };
   };
@@ -64,9 +60,12 @@
       # its config dir, same shape pi uses for sessions/.
       sessionsDir = "projects";
       # Trust and onboarding live in .claude.json, not settings.json, so the
-      # bootstrapScript rewrites nothing here and every settings key is
-      # offerable to --merge-config.
-      mergeSkipKeys = [ ];
+      # bootstrapScript rewrites nothing here. "sandbox" is skipped for a
+      # different reason: Claude Code's own sandbox mode wraps every Bash
+      # call in its bundled bubblewrap, which needs a user namespace and
+      # fails under the runner's --disable-userns. The jail already is the
+      # sandbox, so a host value enabling it must never be imported.
+      mergeSkipKeys = [ "sandbox" ];
       dangerousFlag = "--dangerously-skip-permissions";
       # claude's --resume takes an optional session id of its own, so the
       # picker and the direct-id form are the same flag.
@@ -92,8 +91,6 @@
         "api.anthropic.com"
         "platform.claude.com"
         "claude.ai"
-        "github.com"
-        "api.github.com"
       ];
     };
   };
