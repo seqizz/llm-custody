@@ -233,7 +233,7 @@ llm-custody toolbox add lua5_4 shellcheck   # install (or renew), host-side
 llm-custody toolbox list                    # what is in there
 llm-custody lease list                      # ... and how long it stays
 llm-custody lease renew shellcheck          # push its lease out, install nothing
-llm-custody toolbox remove shellcheck       # (alias: rm)
+llm-custody toolbox remove shellcheck       # leased or permanent (alias: rm, also lease rm)
 llm-custody lease pin shellcheck            # never expire this one
 llm-custody toolbox upgrade                 # re-resolve every installed ref
 llm-custody toolbox upgrade ripgrep         # or just one of them
@@ -405,12 +405,15 @@ has stopped the agent until you answer.
       needs shellcheck for the thing
 
   type 1-2 to approve, 1d-2d to deny, r to refresh, q to quit
+  a approves all (mounts read-only, domains for this session), d denies all
 > 
 ```
 
 Rows are numbered because a request id is a broker pid and a counter
 (`171481.2`) - fine for routing, hopeless to type. It redraws after each
-answer and leaves when the queue empties.
+answer and leaves when the queue empties. `a` and `d` answer every row that
+is on screen, never one that arrived after the list was drawn; `a` uses the
+narrowest mode of each kind, so anything wider is approved by its number.
 
 That picker lives in the CLI rather than in the terminal integration, which
 is what `Ctrl+Shift+r` runs in a split. WezTerm has a selector widget, but it
@@ -545,6 +548,7 @@ llm-custody toolbox add shellcheck     # install, 30-day lease starts
 llm-custody toolbox add shellcheck     # ... and that is also how you renew
 llm-custody lease renew shellcheck     # renew without reinstalling
 llm-custody lease pin shellcheck       # drop the lease: permanent
+llm-custody lease rm shellcheck        # uninstall now, leased or permanent
 llm-custody lease list                 # package, lease age, expiry
 llm-custody lease prune --older-than 30d
 llm-custody lease prune --dry-run      # report what would go

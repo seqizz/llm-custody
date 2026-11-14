@@ -1,15 +1,22 @@
-//! `requests`, `approve` and `deny`: the operator's side of the brokers.
+//! The `request` command group (`list`, `answer`, `approve`, `deny`): the
+//! operator's side of the brokers, from its command line down to the control
+//! socket client (`discover`, `control_call`).
 //!
 //! None of this touches the profile directly. It finds the broker holding a
 //! request and tells it what to do, because the broker is the only thing that
 //! knows which jail client is still waiting on the answer.
 
-use crate::broker::{self, BrokerHandle};
+use crate::broker;
 use crate::json::{self, Json};
 use crate::paths::Layout;
 use crate::proto;
-use crate::util::{self, fail, Result};
-use std::io::{IsTerminal, Write};
+use crate::toolbox::Toolbox;
+use crate::util::{self, fail, usage_err, Result};
+use crate::{unalias, wants_help, Global};
+use std::fs;
+use std::io::{BufReader, IsTerminal};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Listing only reads an in-memory map, so a broker that cannot answer this
@@ -55,10 +62,10 @@ pub fn pending_of_kind(layout: &Layout, kind: &str) -> Vec<Row> {
 }
 
 fn collect(layout: &Layout, quiet: bool) -> (Vec<Row>, usize) {
-    let handles = broker::discover(layout);
+    let handles = discover(layout);
     let mut rows = Vec::new();
     for h in &handles {
-        let reply = match broker::control_call(h, &json::Obj::new().str("op", "list").finish(), LIST_TIMEOUT) {
+        let reply = match control_call(h, &json::Obj::new().str("op", "list").finish(), LIST_TIMEOUT) {
             Ok(r) => r,
             // One wedged broker should not hide the requests of the others.
             Err(e) => {
@@ -121,7 +128,7 @@ pub fn requests_json(layout: &Layout) -> Result<()> {
 }
 
 pub fn requests(layout: &Layout) -> Result<()> {
-    let handles = broker::discover(layout);
+    let handles = discover(layout);
     if handles.is_empty() {
         util::note("no jail broker is running");
         return Ok(());
@@ -129,7 +136,7 @@ pub fn requests(layout: &Layout) -> Result<()> {
 
     let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     for h in &handles {
-        let reply = match broker::control_call(h, &json::Obj::new().str("op", "list").finish(), LIST_TIMEOUT) {
+        let reply = match control_call(h, &json::Obj::new().str("op", "list").finish(), LIST_TIMEOUT) {
             Ok(r) => r,
             // One wedged broker should not hide the requests of the others.
             Err(e) => {
@@ -193,18 +200,18 @@ fn dispatch(layout: &Layout, id: &str, msg: String) -> Result<Json> {
     if id.is_empty() {
         return fail("need a request id - see the requests command");
     }
-    let handles = broker::discover(layout);
+    let handles = discover(layout);
     if handles.is_empty() {
         return fail("no jail broker is running, so there is nothing to answer");
     }
     if let Some(h) = route(&handles, id) {
-        return broker::control_call(h, &msg, ANSWER_TIMEOUT);
+        return control_call(h, &msg, ANSWER_TIMEOUT);
     }
     // Unroutable id: try them all rather than refusing on a formatting
     // detail, and report the real "no such request" from the brokers.
     let mut last = None;
     for h in &handles {
-        match broker::control_call(h, &msg, ANSWER_TIMEOUT) {
+        match control_call(h, &msg, ANSWER_TIMEOUT) {
             Ok(r) if r.str_field("status") == proto::STATUS_OK => return Ok(r),
             Ok(r) => last = Some(r.str_field("message").to_string()),
             Err(e) => last = Some(e.msg),
@@ -281,18 +288,14 @@ pub fn deny(layout: &Layout, id: &str, reason: &str) -> Result<()> {
 /// `q` backs out without answering the request at all.
 fn ask_mode(path: &str) -> Result<Option<String>> {
     loop {
-        if std::io::stdout().is_terminal() {
-            print!(
-                "  mode for {path} [{}] (ro=read-only, full=real tree rw, limited/none=synced copy, overlay=cow; q=back): ",
-                proto::DEFAULT_MOUNT_MODE
-            );
-            let _ = std::io::stdout().flush();
-        }
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-        let ans = line.trim().to_ascii_lowercase();
+        let prompt = format!(
+            "  mode for {path} [{}] (ro=read-only, full=real tree rw, limited/none=synced copy, overlay=cow; q=back): ",
+            proto::DEFAULT_MOUNT_MODE
+        );
+        let ans = match util::read_answer(&prompt)? {
+            Some(l) => l.to_ascii_lowercase(),
+            None => return Ok(None),
+        };
         match ans.as_str() {
             "" => return Ok(Some(proto::DEFAULT_MOUNT_MODE.to_string())),
             "q" | "quit" => return Ok(None),
@@ -310,14 +313,11 @@ fn ask_mode(path: &str) -> Result<Option<String>> {
 /// Returns the broker's mode word.
 pub fn ask_scope(verb: &str, name: &str) -> Result<Option<String>> {
     loop {
-        if std::io::stdout().is_terminal() {
-            print!("  {verb} {name} for [s]ession / [p]ersist / [q] back: ");
-            let _ = std::io::stdout().flush();
-        }
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
+        let prompt = format!("  {verb} {name} for [s]ession / [p]ersist / [q] back: ");
+        let line = match util::read_answer(&prompt)? {
+            Some(l) => l,
+            None => return Ok(None),
+        };
         match parse_scope(&line) {
             Some(Some(m)) => return Ok(Some(m.to_string())),
             Some(None) => return Ok(None),
@@ -337,11 +337,42 @@ fn parse_scope(line: &str) -> Option<Option<&'static str>> {
     }
 }
 
+/// Approve every row that was on screen when the operator answered, each
+/// with the default of its kind: a mount read-only, a domain for this
+/// session only. Those are the answers of least exposure, which is what an
+/// answer given to several requests at once has to be; anything wider is
+/// approved by its number, where the mode is asked.
+///
+/// The rows are the rendered ones on purpose, not a fresh read of the
+/// queue: a request that arrived after the list was drawn has not been
+/// seen, so it is not part of "all". One failure is reported and the rest
+/// still get their answer.
+pub fn approve_all(layout: &Layout, rows: &[Row]) {
+    for r in rows {
+        if let Err(e) = approve(layout, &r.id, "") {
+            util::note(e.msg);
+        }
+    }
+}
+
+/// Deny every row that was on screen, for the same reason and with the same
+/// one-failure-does-not-stop-the-rest handling as `approve_all`.
+pub fn deny_all(layout: &Layout, rows: &[Row], reason: &str) {
+    for r in rows {
+        if let Err(e) = deny(layout, &r.id, reason) {
+            util::note(e.msg);
+        }
+    }
+}
+
 /// What a typed line at the `answer` prompt meant.
 #[derive(Debug, PartialEq)]
 pub enum Choice {
     Approve(usize),
     Deny(usize),
+    /// Every row on screen, in one answer.
+    ApproveAll,
+    DenyAll,
     Refresh,
     Quit,
     Unknown,
@@ -355,6 +386,8 @@ pub fn parse_choice(line: &str, rows: usize) -> Choice {
     match line.as_str() {
         "" | "q" | "quit" => return Choice::Quit,
         "r" | "refresh" => return Choice::Refresh,
+        "a" | "all" => return Choice::ApproveAll,
+        "d" | "deny" => return Choice::DenyAll,
         _ => {}
     }
     let (digits, deny) = match line.strip_suffix('d') {
@@ -422,6 +455,9 @@ fn render(rows: &[Row], colour: bool) {
         )
     };
     println!("  {dim}{hint}{off}");
+    println!(
+        "  {dim}a approves all (mounts read-only, domains for this session), d denies all{off}"
+    );
 }
 
 /// The interactive half of `requests`: show the queue in this pane and act on
@@ -445,14 +481,10 @@ pub fn answer(layout: &Layout) -> Result<()> {
         // Reading either way means a pipe is answered in order and ends at
         // EOF, which is both what a script would want and what makes this
         // loop testable without a pty.
-        if std::io::stdout().is_terminal() {
-            print!("> ");
-            let _ = std::io::stdout().flush();
-        }
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            return Ok(());
-        }
+        let line = match util::read_answer("> ")? {
+            Some(l) => l,
+            None => return Ok(()),
+        };
         match parse_choice(&line, rows.len()) {
             Choice::Quit => return Ok(()),
             Choice::Refresh => continue,
@@ -483,12 +515,188 @@ pub fn answer(layout: &Layout) -> Result<()> {
                     util::note(e.msg);
                 }
             }
+            Choice::ApproveAll => approve_all(layout, &rows),
+            Choice::DenyAll => deny_all(layout, &rows, ""),
             Choice::Unknown => util::note(format!(
-                "not a choice: {} (want 1-{}, or 1d to deny)",
+                "not a choice: {} (want 1-{}, 1d to deny, a for all, d to deny all)",
                 line.trim(),
                 rows.len()
             )),
         }
+    }
+}
+
+/// `llm-custody request --help`.
+pub fn usage() {
+    print!(
+        "\
+Usage: llm-custody [--dir PATH] [--pid PID] request <command> [ARG...]
+
+What jailed agents have asked for and are blocked on. A package goes into the
+toolbox profile, a mount attaches a host directory to the jail that asked, a
+domain is added to that jail's network whitelist.
+
+  list             pending requests from every running jail (alias: ls)
+                   [--json] machine-readable, for a terminal integration
+  answer           the same queue, interactively: pick a numbered row to
+                   approve or deny it without typing a request id (a mount
+                   then asks for its mode, a domain for session or persist)
+                   `a` approves every listed row with the narrowest mode
+                   (mount read-only, domain for this session), `d` denies
+                   every listed row
+  approve ID       grant it and unblock the jail
+                   [--mode ro|full|limited|none|overlay] how a mount is
+                   attached (default ro), [--mode session|persist] how
+                   long a domain stays allowed (default session); ignored
+                   for a package
+  deny ID          refuse it [--reason TEXT]
+
+--pid restricts all of this to one session's broker.
+"
+    );
+}
+
+pub fn cmd_request(g: &Global, args: &[String]) -> Result<()> {
+    if wants_help(args) || args.is_empty() {
+        usage();
+        return Ok(());
+    }
+    let tb = g.toolbox()?;
+    let (cmd, rest) = args.split_first().expect("checked above");
+    match unalias("request", cmd) {
+        "list" => cmd_requests(&tb, rest),
+        "answer" => answer(&tb.layout),
+        "approve" => cmd_approve(&tb, rest),
+        "deny" => cmd_deny(&tb, rest),
+        other => usage_err(format!("request: unknown command: {other} (try --help)")),
+    }
+}
+
+
+fn cmd_requests(tb: &Toolbox, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        None => requests(&tb.layout),
+        Some("--json") => requests_json(&tb.layout),
+        Some(a) => usage_err(format!("requests: unknown option: {a} (try --help)")),
+    }
+}
+
+fn cmd_approve(tb: &Toolbox, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut mode = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mode" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => mode = v.clone(),
+                    None => return usage_err("--mode needs a value"),
+                }
+            }
+            a if a.starts_with('-') => return usage_err(format!("approve: unknown option: {a}")),
+            a => id = Some(a.to_string()),
+        }
+        i += 1;
+    }
+    match id {
+        Some(id) => approve(&tb.layout, &id, &mode),
+        None => usage_err("approve needs a request id - see the requests command"),
+    }
+}
+
+fn cmd_deny(tb: &Toolbox, args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut reason = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reason" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => reason = v.clone(),
+                    None => return usage_err("--reason needs a value"),
+                }
+            }
+            a if a.starts_with('-') => return usage_err(format!("deny: unknown option: {a}")),
+            a => id = Some(a.to_string()),
+        }
+        i += 1;
+    }
+    match id {
+        Some(id) => deny(&tb.layout, &id, &reason),
+        None => usage_err("deny needs a request id - see the requests command"),
+    }
+}
+
+/// Everything the host CLI needs to talk to one broker.
+pub struct BrokerHandle {
+    pub id: String,
+    pub dir: PathBuf,
+    pub label: String,
+}
+
+/// Live brokers, with dead registrations cleaned up on the way past.
+pub fn discover(layout: &Layout) -> Vec<BrokerHandle> {
+    let root = layout.brokers();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        // Scoped to one session by `--pid`: the others are left exactly as
+        // they are, stale registrations included, because an unscoped command
+        // is the one that owns that cleanup.
+        if matches!(&layout.broker_filter, Some(want) if *want != id) {
+            continue;
+        }
+        let meta = match fs::read_to_string(dir.join(proto::META_FILE)) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let parsed = match json::parse(meta.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pid = parsed.get("pid").and_then(Json::as_u64).unwrap_or(0) as u32;
+        // A broker killed outright (SIGKILL, a reboot with a persistent
+        // runtime dir) never ran its handler. Nothing else will ever clean
+        // this up, and leaving it makes `requests` report a queue that cannot
+        // be answered.
+        if pid == 0 || !util::pid_alive(pid) {
+            broker::cleanup(&dir);
+            continue;
+        }
+        out.push(BrokerHandle { id, dir, label: parsed.str_field("label").to_string() });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// One control request/response round trip.
+pub fn control_call(handle: &BrokerHandle, msg: &str, read_timeout: Option<Duration>) -> Result<Json> {
+    let path = handle.dir.join(proto::CONTROL_SOCKET);
+    let mut stream = util::ctx(
+        UnixStream::connect(&path),
+        format!("connecting to broker {}", handle.id),
+    )?;
+    // A broker that has wedged must not wedge the caller with it. The read
+    // side is the caller's choice because the two uses differ by orders of
+    // magnitude: listing reads a map, approving waits on a nix build.
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(read_timeout);
+    proto::write_message(&mut stream, msg)?;
+    let peer = util::ctx(stream.try_clone(), "cloning control socket")?;
+    let mut reader = BufReader::new(peer);
+    match proto::read_message(&mut reader)? {
+        Some(v) => Ok(v),
+        None => fail(format!("broker {} closed the connection without answering", handle.id)),
     }
 }
 
@@ -505,6 +713,11 @@ mod tests {
         assert_eq!(parse_choice("", 3), Choice::Quit);
         assert_eq!(parse_choice("q", 3), Choice::Quit);
         assert_eq!(parse_choice("r", 3), Choice::Refresh);
+        assert_eq!(parse_choice("a", 3), Choice::ApproveAll);
+        assert_eq!(parse_choice(" A ", 3), Choice::ApproveAll);
+        assert_eq!(parse_choice("all", 3), Choice::ApproveAll);
+        assert_eq!(parse_choice("d", 3), Choice::DenyAll);
+        assert_eq!(parse_choice("D", 3), Choice::DenyAll);
         // Out of range, zero and nonsense are all the same mistake.
         assert_eq!(parse_choice("0", 3), Choice::Unknown);
         assert_eq!(parse_choice("4", 3), Choice::Unknown);

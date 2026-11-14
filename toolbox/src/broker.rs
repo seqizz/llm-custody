@@ -21,11 +21,11 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::json::{self, Json};
-use crate::paths::Layout;
+use crate::json;
+use crate::paths::{self, Layout};
 use crate::proto;
 use crate::toolbox::Toolbox;
-use crate::util::{self, fail, Result};
+use crate::util::{self, fail, usage_err, Result};
 
 /// How often a waiting request thread looks up from its socket to notice an
 /// approval. Also the worst-case delay between the operator approving and the
@@ -58,11 +58,48 @@ pub struct ServeOpts {
     pub domain_cmd: Option<PathBuf>,
 }
 
+/// What an approval did, which depends on what was asked for.
+enum Done {
+    /// The commands the package put on the jail's PATH; empty when it was
+    /// already installed or ships no bin/.
+    Package { commands: Vec<String> },
+    /// Where the tree was attached inside the jail, and in which mode.
+    Mount { guest: String, mode: String },
+    /// How long the domain stays allowed: `session` or `persist`.
+    Domain { scope: String },
+}
+
+impl Done {
+    /// The fields a reply carries beyond `id` and `attr`. The operator's
+    /// reply and the jail client's differ on purpose: the operator is told
+    /// the mount mode they chose and gets `commands` even when it is empty,
+    /// while the client's reply names only what it can act on, and its
+    /// reader tells the three kinds apart by which field is present.
+    fn fields(&self, for_operator: bool) -> Vec<(&'static str, String)> {
+        match self {
+            Done::Package { commands } if commands.is_empty() && !for_operator => Vec::new(),
+            Done::Package { commands } => vec![("commands", commands.join(" "))],
+            Done::Mount { guest, mode } if for_operator => {
+                vec![("guest", guest.clone()), ("mode", mode.clone())]
+            }
+            Done::Mount { guest, .. } => vec![("guest", guest.clone())],
+            Done::Domain { scope } => vec![("scope", scope.clone())],
+        }
+    }
+
+    /// The word for having done it, for the note an operator gets when the
+    /// jail client stopped waiting in the meantime.
+    fn verb(&self) -> &'static str {
+        match self {
+            Done::Package { .. } => "installed",
+            Done::Mount { .. } => "mounted",
+            Done::Domain { .. } => "allowed",
+        }
+    }
+}
+
 enum Outcome {
-    /// `commands` is what a package approval put on PATH, `guest` where a
-    /// mount approval attached the tree, `scope` how long an approved domain
-    /// stays allowed (`session` or `persist`); the others are empty.
-    Approved { commands: Vec<String>, guest: String, scope: String },
+    Approved(Done),
     Denied(String),
     /// Nobody answered before the hold time ran out. Separate from `Denied`
     /// because the agent treats a denial as final.
@@ -98,6 +135,129 @@ struct Broker {
     /// nothing is gained by repeating a count, and an agent that spams
     /// requests should not get to decide how often this writes to a terminal.
     last_published: Mutex<Option<usize>>,
+}
+
+/// `llm-custody serve --help`.
+pub fn usage() {
+    print!(
+        "\
+Usage: llm-custody [--dir PATH] serve [OPTION...]
+
+The request broker for one jail. Started by the jail runner, not usually by
+hand: it owns the two sockets a jailed custody-request talks to and holds the
+client's connection open until the operator answers.
+
+  --broker-id ID     registration name under $XDG_RUNTIME_DIR/llm-custody/
+                     brokers (the runner passes its own pid)
+  --label TEXT       how this jail reads in the request list
+  --timeout PERIOD   how long an unanswered request blocks its client
+  --uservar 0|1      publish the pending count as a terminal user variable
+  --notify-hook PATH run on every queue change, with <event> <id> <attr>
+                     <reason> <count> <label> as separate arguments and no
+                     shell involved. Its failure is never the request's
+                     problem. $LLMCUSTODY_NOTIFY_HOOK is the default
+  --mount-cmd PATH   the session's mount launcher; an approved mount request
+                     runs it as `add --mode M -- PATH`
+  --domain-cmd PATH  the session's domain launcher; an approved domain
+                     request runs it as `add [--persist] -- NAME`. Without
+                     it (no network filter) a domain request fails at once
+
+Also runs one prune and gc in the background, which is what keeps expired
+leases from accumulating without anyone remembering to look.
+$LLMCUSTODY_TOOLBOX_AUTOPRUNE=0 turns that off.
+"
+    );
+}
+
+/// `llm-custody serve`: the runner's command line, parsed into `ServeOpts`.
+pub fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
+    let mut broker_id = std::process::id().to_string();
+    let mut label = String::new();
+    // Long enough that an operator can be away from the terminal, short enough
+    // that an abandoned jail's requests do not pile up forever.
+    let mut timeout = Duration::from_secs(30 * 60);
+    // Off unless the runner says this terminal takes user variables. Not
+    // re-derived from the environment here on purpose: the runner already
+    // decides it once for every publisher, and a second opinion is how they
+    // drift apart.
+    let mut uservar = false;
+    let mut notify_hook = std::env::var_os("LLMCUSTODY_NOTIFY_HOOK")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let mut mount_cmd = None;
+    let mut domain_cmd = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--uservar" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("1") => uservar = true,
+                    Some("0") => uservar = false,
+                    _ => return usage_err("--uservar takes 0 or 1"),
+                }
+            }
+            "--notify-hook" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => notify_hook = Some(PathBuf::from(v)),
+                    None => return usage_err("--notify-hook needs a path"),
+                }
+            }
+            "--mount-cmd" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => mount_cmd = Some(PathBuf::from(v)),
+                    None => return usage_err("--mount-cmd needs a path"),
+                }
+            }
+            "--domain-cmd" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => domain_cmd = Some(PathBuf::from(v)),
+                    None => return usage_err("--domain-cmd needs a path"),
+                }
+            }
+            "--broker-id" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => broker_id = v.clone(),
+                    None => return usage_err("--broker-id needs a value"),
+                }
+            }
+            "--label" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => label = v.clone(),
+                    None => return usage_err("--label needs a value"),
+                }
+            }
+            "--timeout" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => timeout = util::parse_duration(v, 'm')?,
+                    None => return usage_err("--timeout needs a period, e.g. 30m"),
+                }
+            }
+            a => return usage_err(format!("serve: unknown option: {a} (try --help)")),
+        }
+        i += 1;
+    }
+    if !paths::lease_name_ok(&broker_id) {
+        return usage_err(format!("not usable as a broker id: {broker_id}"));
+    }
+    serve(
+        tb.layout,
+        ServeOpts {
+            broker_id,
+            label,
+            timeout,
+            uservar,
+            notify_hook,
+            mount_cmd,
+            domain_cmd,
+        },
+    )
 }
 
 pub fn serve(layout: Layout, opts: ServeOpts) -> Result<()> {
@@ -216,7 +376,7 @@ pub fn serve(layout: Layout, opts: ServeOpts) -> Result<()> {
     Ok(())
 }
 
-fn cleanup(dir: &Path) {
+pub(crate) fn cleanup(dir: &Path) {
     let _ = fs::remove_file(dir.join(proto::REQUEST_SOCKET));
     let _ = fs::remove_file(dir.join(proto::CONTROL_SOCKET));
     let _ = fs::remove_file(dir.join(proto::META_FILE));
@@ -305,6 +465,22 @@ fn domain_command(launcher: &Path, persist: bool, name: &str) -> std::process::C
     cmd
 }
 
+/// The last non-empty line a launcher wrote to stderr: its own statement of
+/// what went wrong, and the one line of it the operator and the agent get to
+/// read, since neither can see the broker log.
+fn last_line(stderr: &str) -> Option<&str> {
+    stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last()
+}
+
+/// A successful launcher's commentary (the mode it used, a warning about a
+/// bound .git) is worth having in the broker log next to the request it
+/// belongs to.
+fn relay(tag: &str, stderr: &str) {
+    for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        util::note(format!("{tag}: {line}"));
+    }
+}
+
 /// Run the session's domain launcher and return the scope it reports.
 ///
 /// The launcher prints `NAME<TAB>session|persist` on stdout and its
@@ -318,23 +494,13 @@ fn run_domain(launcher: &Path, persist: bool, name: &str) -> Result<String> {
     )?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
-        let why = stderr
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("domain launcher failed")
-            .trim()
-            .to_string();
+        let why = last_line(&stderr).unwrap_or("domain launcher failed");
         return match out.status.code() {
             Some(2) => fail(format!("domain launcher refused {name}: {why}")),
             _ => fail(format!("allowing {name} failed: {why}")),
         };
     }
-    for line in stderr.lines() {
-        if !line.trim().is_empty() {
-            util::note(format!("domain: {}", line.trim()));
-        }
-    }
+    relay("domain", &stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let scope = stdout
         .lines()
@@ -388,13 +554,7 @@ fn run_mount(launcher: &Path, mode: &str, path: &str) -> Result<String> {
     )?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
-        let why = stderr
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("mount launcher failed")
-            .trim()
-            .to_string();
+        let why = last_line(&stderr).unwrap_or("mount launcher failed");
         return fail(format!("mounting {path} failed: {why}"));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -407,13 +567,7 @@ fn run_mount(launcher: &Path, mode: &str, path: &str) -> Result<String> {
     if guest.is_empty() {
         return fail(format!("mount launcher reported no guest path for {path}"));
     }
-    // The launcher's own commentary (mode, warnings about a bound .git) is
-    // worth having in the broker log next to the request it belongs to.
-    for line in stderr.lines() {
-        if !line.trim().is_empty() {
-            util::note(format!("mount: {}", line.trim()));
-        }
-    }
+    relay("mount", &stderr);
     Ok(guest)
 }
 
@@ -579,16 +733,10 @@ impl Broker {
 
         let outcome = self.wait_for_outcome(&id, &rx, &mut reader, stream);
         let reply = match outcome {
-            Some(Outcome::Approved { commands, guest, scope }) => {
+            Some(Outcome::Approved(done)) => {
                 let mut o = proto::ok_response().str("id", &id).str("attr", &attr);
-                if !commands.is_empty() {
-                    o = o.str("commands", &commands.join(" "));
-                }
-                if !guest.is_empty() {
-                    o = o.str("guest", &guest);
-                }
-                if !scope.is_empty() {
-                    o = o.str("scope", &scope);
+                for (key, value) in &done.fields(false) {
+                    o = o.str(key, value);
                 }
                 o.finish()
             }
@@ -805,83 +953,40 @@ impl Broker {
         // would otherwise still be asking for attention.
         self.announce("approved", id, &p.attr, &p.reason);
 
-        if let (proto::KIND_DOMAIN, Some(launcher)) = (kind.as_str(), &launcher) {
-            util::note(format!("request {id}: approved, allowing {} ({mode})", p.attr));
-            return match run_domain(launcher, mode == "persist", &p.attr) {
-                Ok(scope) => {
-                    let delivered = p
-                        .tx
-                        .send(Outcome::Approved {
-                            commands: Vec::new(),
-                            guest: String::new(),
-                            scope: scope.clone(),
-                        })
-                        .is_ok();
-                    let mut o = proto::ok_response()
-                        .str("id", id)
-                        .str("attr", &p.attr)
-                        .str("scope", &scope);
-                    if !delivered {
-                        o = o.str("note", "allowed, but the jail client had already gone away");
-                    }
-                    Ok(o.finish())
-                }
-                Err(e) => {
-                    let _ = p.tx.send(Outcome::Failed(e.msg.clone()));
-                    Err(e)
-                }
-            };
-        }
-
-        if let Some(launcher) = launcher {
-            util::note(format!("request {id}: approved, mounting {} ({mode})", p.attr));
-            return match run_mount(&launcher, mode, &p.attr) {
-                Ok(guest) => {
-                    let delivered = p
-                        .tx
-                        .send(Outcome::Approved {
-                            commands: Vec::new(),
-                            guest: guest.clone(),
-                            scope: String::new(),
-                        })
-                        .is_ok();
-                    let mut o = proto::ok_response()
-                        .str("id", id)
-                        .str("attr", &p.attr)
-                        .str("guest", &guest)
-                        .str("mode", mode);
-                    if !delivered {
-                        o = o.str("note", "mounted, but the jail client had already gone away");
-                    }
-                    Ok(o.finish())
-                }
-                Err(e) => {
-                    let _ = p.tx.send(Outcome::Failed(e.msg.clone()));
-                    Err(e)
-                }
-            };
-        }
-
-        util::note(format!("request {id}: approved, installing {}", p.attr));
-        match self.toolbox.add(std::slice::from_ref(&p.attr)) {
-            Ok(outcome) => {
-                let commands = outcome.new_commands.clone();
+        // Each kind differs only in what it runs and what that produces;
+        // delivering the outcome and reporting a failure are the same for
+        // all three, below.
+        let done: Result<Done> = match (kind.as_str(), &launcher) {
+            (proto::KIND_DOMAIN, Some(launcher)) => {
+                util::note(format!("request {id}: approved, allowing {} ({mode})", p.attr));
+                run_domain(launcher, mode == "persist", &p.attr).map(|scope| Done::Domain { scope })
+            }
+            (_, Some(launcher)) => {
+                util::note(format!("request {id}: approved, mounting {} ({mode})", p.attr));
+                run_mount(launcher, mode, &p.attr)
+                    .map(|guest| Done::Mount { guest, mode: mode.to_string() })
+            }
+            (_, None) => {
+                util::note(format!("request {id}: approved, installing {}", p.attr));
+                self.toolbox
+                    .add(std::slice::from_ref(&p.attr))
+                    .map(|outcome| Done::Package { commands: outcome.new_commands })
+            }
+        };
+        match done {
+            Ok(done) => {
+                let fields = done.fields(true);
+                let verb = done.verb();
                 // A client that gave up in the meantime is not an error: the
-                // package is installed and the next jail to look will find it.
-                let delivered = p
-                    .tx
-                    .send(Outcome::Approved {
-                        commands: commands.clone(),
-                        guest: String::new(),
-                        scope: String::new(),
-                    })
-                    .is_ok();
-                let mut o = proto::ok_response()
-                    .str("id", id)
-                    .str("attr", &p.attr)
-                    .str("commands", &commands.join(" "));
+                // work is done, and for a package the next jail to look will
+                // find it.
+                let delivered = p.tx.send(Outcome::Approved(done)).is_ok();
+                let mut o = proto::ok_response().str("id", id).str("attr", &p.attr);
+                for (key, value) in &fields {
+                    o = o.str(key, value);
+                }
                 if !delivered {
-                    o = o.str("note", "installed, but the jail client had already gone away");
+                    o = o.str("note", &format!("{verb}, but the jail client had already gone away"));
                 }
                 Ok(o.finish())
             }
@@ -1003,77 +1108,6 @@ mod signals {
     }
 }
 
-/// Everything the host CLI needs to talk to one broker.
-pub struct BrokerHandle {
-    pub id: String,
-    pub dir: PathBuf,
-    pub label: String,
-}
-
-/// Live brokers, with dead registrations cleaned up on the way past.
-pub fn discover(layout: &Layout) -> Vec<BrokerHandle> {
-    let root = layout.brokers();
-    let entries = match fs::read_dir(&root) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for entry in entries.filter_map(|e| e.ok()) {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let id = entry.file_name().to_string_lossy().into_owned();
-        // Scoped to one session by `--pid`: the others are left exactly as
-        // they are, stale registrations included, because an unscoped command
-        // is the one that owns that cleanup.
-        if matches!(&layout.broker_filter, Some(want) if *want != id) {
-            continue;
-        }
-        let meta = match fs::read_to_string(dir.join(proto::META_FILE)) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let parsed = match json::parse(meta.trim()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let pid = parsed.get("pid").and_then(Json::as_u64).unwrap_or(0) as u32;
-        // A broker killed outright (SIGKILL, a reboot with a persistent
-        // runtime dir) never ran its handler. Nothing else will ever clean
-        // this up, and leaving it makes `requests` report a queue that cannot
-        // be answered.
-        if pid == 0 || !util::pid_alive(pid) {
-            cleanup(&dir);
-            continue;
-        }
-        out.push(BrokerHandle { id, dir, label: parsed.str_field("label").to_string() });
-    }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
-}
-
-/// One control request/response round trip.
-pub fn control_call(handle: &BrokerHandle, msg: &str, read_timeout: Option<Duration>) -> Result<Json> {
-    let path = handle.dir.join(proto::CONTROL_SOCKET);
-    let mut stream = util::ctx(
-        UnixStream::connect(&path),
-        format!("connecting to broker {}", handle.id),
-    )?;
-    // A broker that has wedged must not wedge the caller with it. The read
-    // side is the caller's choice because the two uses differ by orders of
-    // magnitude: listing reads a map, approving waits on a nix build.
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_read_timeout(read_timeout);
-    proto::write_message(&mut stream, msg)?;
-    let peer = util::ctx(stream.try_clone(), "cloning control socket")?;
-    let mut reader = BufReader::new(peer);
-    match proto::read_message(&mut reader)? {
-        Some(v) => Ok(v),
-        None => fail(format!("broker {} closed the connection without answering", handle.id)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1204,7 @@ mod tests {
     /// form holds on its own, not only because the validator ran.
     #[test]
     fn a_hostile_domain_arrives_as_one_inert_argument() {
+        let _exec = util::exec_test_lock();
         let tmp = std::env::temp_dir().join(format!("llm-custody-dombait-{}", std::process::id()));
         let bait = tmp.join("executed");
         let name = format!("x.com; touch {b} $(touch {b}) `touch {b}`", b = bait.display());
@@ -1203,6 +1238,7 @@ mod tests {
     /// Exit 2 is the launcher refusing the name, and its stderr is the reason.
     #[test]
     fn a_refused_domain_reports_the_launchers_reason() {
+        let _exec = util::exec_test_lock();
         let (dir, launcher) =
             match fake_launcher("domain-refuse", "echo 'domain: invalid name' >&2\nexit 2\n") {
                 Some(v) => v,
@@ -1212,6 +1248,35 @@ mod tests {
         assert!(err.msg.contains("refused x.com"), "{}", err.msg);
         assert!(err.msg.contains("invalid name"), "{}", err.msg);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The reply fields are the wire contract with the jail client and the
+    /// operator CLI, so their names and presence are pinned here.
+    #[test]
+    fn approval_fields_per_kind_and_reader() {
+        let pkg = Done::Package { commands: vec!["rg".to_string(), "fd".to_string()] };
+        assert_eq!(pkg.fields(false), vec![("commands", "rg fd".to_string())]);
+        assert_eq!(pkg.fields(true), vec![("commands", "rg fd".to_string())]);
+        // Nothing new on PATH: the client gets no field, the operator an
+        // empty one.
+        let none = Done::Package { commands: Vec::new() };
+        assert!(none.fields(false).is_empty());
+        assert_eq!(none.fields(true), vec![("commands", String::new())]);
+
+        let mount = Done::Mount { guest: "/mnt/x".to_string(), mode: "ro".to_string() };
+        assert_eq!(mount.fields(false), vec![("guest", "/mnt/x".to_string())]);
+        assert_eq!(
+            mount.fields(true),
+            vec![("guest", "/mnt/x".to_string()), ("mode", "ro".to_string())]
+        );
+
+        let domain = Done::Domain { scope: "session".to_string() };
+        assert_eq!(domain.fields(false), vec![("scope", "session".to_string())]);
+        assert_eq!(domain.fields(true), domain.fields(false));
+
+        assert_eq!(pkg.verb(), "installed");
+        assert_eq!(mount.verb(), "mounted");
+        assert_eq!(domain.verb(), "allowed");
     }
 
     #[test]
@@ -1233,6 +1298,7 @@ mod tests {
     /// what arrives, and that nothing in the reason ran on the way.
     #[test]
     fn a_hostile_reason_arrives_as_one_inert_argument() {
+        let _exec = util::exec_test_lock();
         // The hook has to be something executable, and /bin/sh is the only
         // interpreter present both on a developer's host and inside the nix
         // build sandbox. Skipping beats failing a build over the test

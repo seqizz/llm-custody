@@ -24,7 +24,8 @@
 # Invocation: mount-ctl RUNDIR <command> [args]. The runner writes
 # RUNDIR/mount.env with everything else (holder pid, docks, masks, excludes).
 #
-# Wrapped by lib/mount-ctl.nix, which prepends SYNC_BACK and lib/jail-tree.sh.
+# Wrapped by lib/mount-ctl.nix, which prepends SYNC_BACK, lib/log.sh (the
+# log/warn/die helpers) and lib/jail-tree.sh.
 
 RUNDIR=""
 VERBOSITY=1
@@ -38,18 +39,6 @@ SYNC_MANIFEST=""
 DOCK_GUESTS=()
 DOCK_SRCS=()
 WORKSPACE_GUEST=""
-
-C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_YELLOW=""; C_GREEN=""; C_CYAN=""
-if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
-  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
-  C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'
-fi
-log()  { [ "$VERBOSITY" -ge 1 ] && printf '%sllm-custody:%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2 || true; }
-vlog() { [ "$VERBOSITY" -ge 2 ] && printf '%sllm-custody:%s %s%s%s\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$*" "$C_RESET" >&2 || true; }
-warn() { printf '%sllm-custody: WARNING%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-err()  { printf '%sllm-custody: ERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-hint() { printf '            %s\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
 
 usage() {
   cat <<'USAGE'

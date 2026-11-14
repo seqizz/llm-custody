@@ -27,7 +27,8 @@
 #   list                         NAME<TAB>SOURCE per line
 #   blocked                      COUNT<TAB>NAME per line, allowed names excluded
 #
-# Wrapped by lib/domain-ctl.nix, which prepends lib/net-filter.sh.
+# Wrapped by lib/domain-ctl.nix, which prepends lib/log.sh (the log/warn/die
+# helpers) and lib/net-filter.sh.
 
 RUNDIR=""
 VERBOSITY=1
@@ -39,17 +40,6 @@ STATE_ROOT=""
 UPSTREAM_DNS=""
 DNSMASQ_PID=""
 
-C_RESET=""; C_RED=""; C_YELLOW=""; C_CYAN=""; C_DIM=""
-if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
-  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'
-  C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
-fi
-log()  { [ "$VERBOSITY" -ge 1 ] && printf '%sllm-custody:%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2 || true; }
-vlog() { [ "$VERBOSITY" -ge 2 ] && printf '%sllm-custody:%s %s%s%s\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$*" "$C_RESET" >&2 || true; }
-warn() { printf '%sllm-custody: WARNING%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-err()  { printf '%sllm-custody: ERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-hint() { printf '            %s\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
 # A name that fails domain_valid gets its own exit status, so a caller can
 # tell "you asked for something malformed" from "the session could not do it".
 invalid() { err "$*"; exit 2; }

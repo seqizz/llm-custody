@@ -680,6 +680,7 @@ mod tests {
 
     #[test]
     fn domain_launcher_resolution_and_counts() {
+        let _exec = crate::util::exec_test_lock();
         if !Path::new("/bin/sh").exists() {
             eprintln!("SKIP: no /bin/sh to write a launcher with");
             return;

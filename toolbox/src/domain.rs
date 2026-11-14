@@ -21,7 +21,6 @@
 //! Exit 0 on success, 2 for a name it refused, 1 for anything else, and its
 //! diagnostics on stderr, which is passed straight to the operator.
 
-use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -265,21 +264,6 @@ fn cmd_blocked(launcher: &Path, args: &[String]) -> Result<()> {
 
 // ---- interactive menu --------------------------------------------------
 
-/// One typed line, after an optional prompt. None at end of input, which
-/// every level treats as leaving the whole menu: a pipe that ran out has
-/// nothing more to say to any of them.
-fn read_answer(prompt: &str) -> Result<Option<String>> {
-    if std::io::stdout().is_terminal() {
-        print!("{prompt}");
-        let _ = std::io::stdout().flush();
-    }
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line)? == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line.trim().to_string()))
-}
-
 /// What a submenu returns: carry on in the top menu, or leave entirely.
 enum Next {
     Back,
@@ -311,7 +295,7 @@ fn menu(launcher: &Path, layout: &Layout) -> Result<()> {
         println!("  {bold}3{off}  blocked names            {dim}{}{off}", n(blocked));
         println!();
         println!("  {dim}type 1-3 to open one, q to quit{off}");
-        let line = match read_answer("> ")? {
+        let line = match util::read_answer("> ")? {
             Some(l) => l.to_ascii_lowercase(),
             None => return Ok(()),
         };
@@ -367,7 +351,8 @@ fn menu_pending(launcher: &Path, layout: &Layout, colour: bool) -> Result<Next> 
         }
         println!();
         println!("  {dim}type a number to approve, the number and d to deny, r to refresh, q to go back{off}");
-        let line = match read_answer("> ")? {
+        println!("  {dim}a approves all for this session, d denies all{off}");
+        let line = match util::read_answer("> ")? {
             Some(l) => l,
             None => return Ok(Next::Exit),
         };
@@ -384,7 +369,7 @@ fn menu_pending(launcher: &Path, layout: &Layout, colour: bool) -> Result<Next> 
                 }
             }
             Choice::Deny(i) => {
-                let reason = match read_answer("  reason for the agent (empty for none): ")? {
+                let reason = match util::read_answer("  reason for the agent (empty for none): ")? {
                     Some(r) => r,
                     None => return Ok(Next::Exit),
                 };
@@ -392,7 +377,18 @@ fn menu_pending(launcher: &Path, layout: &Layout, colour: bool) -> Result<Next> 
                     util::note(e.msg);
                 }
             }
-            Choice::Unknown => util::note(format!("not a choice: {line} (want 1-{}, or 1d to deny)", rows.len())),
+            Choice::ApproveAll => brokerctl::approve_all(layout, &rows),
+            Choice::DenyAll => {
+                let reason = match util::read_answer("  reason for the agent (empty for none): ")? {
+                    Some(r) => r,
+                    None => return Ok(Next::Exit),
+                };
+                brokerctl::deny_all(layout, &rows, &reason);
+            }
+            Choice::Unknown => util::note(format!(
+                "not a choice: {line} (want 1-{}, 1d to deny, a for all, d to deny all)",
+                rows.len()
+            )),
         }
     }
 }
@@ -444,7 +440,7 @@ fn menu_allowed(launcher: &Path, colour: bool) -> Result<Next> {
         }
         println!();
         println!("  {dim}type a number to remove it, a to add a domain, r to refresh, q to go back{off}");
-        let line = match read_answer("> ")? {
+        let line = match util::read_answer("> ")? {
             Some(l) => l,
             None => return Ok(Next::Exit),
         };
@@ -452,7 +448,7 @@ fn menu_allowed(launcher: &Path, colour: bool) -> Result<Next> {
             AllowedChoice::Back => return Ok(Next::Back),
             AllowedChoice::Refresh => continue,
             AllowedChoice::Add => {
-                let name = match read_answer("  domain to allow: ")? {
+                let name = match util::read_answer("  domain to allow: ")? {
                     Some(n) if n.is_empty() => continue,
                     Some(n) => n,
                     None => return Ok(Next::Exit),
@@ -520,7 +516,7 @@ fn menu_blocked(launcher: &Path, colour: bool) -> Result<Next> {
         }
         println!();
         println!("  {dim}type a number to allow that name, r to refresh, q to go back{off}");
-        let line = match read_answer("> ")? {
+        let line = match util::read_answer("> ")? {
             Some(l) => l,
             None => return Ok(Next::Exit),
         };

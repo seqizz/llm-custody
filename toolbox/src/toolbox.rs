@@ -291,21 +291,41 @@ impl Toolbox {
         self.add_locked(attrs)
     }
 
-    pub fn remove(&self, names: &[String]) -> Result<()> {
+    /// Uninstall packages whatever their lease state, leased or permanent, and
+    /// drop the lease of a name whose element is already gone (removed with a
+    /// hand-run `nix profile remove`, say). Names are sorted against the
+    /// profile first, so one unknown name is reported instead of failing the
+    /// nix call for every other name given with it.
+    pub fn remove(&self, names: &[String]) -> Result<Vec<(String, RemoveResult)>> {
         self.require_dir()?;
         let _lock = self.lock()?;
-        self.nix.remove(names)?;
-        self.refresh_current()?;
-        // Only after the removal succeeded: a lease outliving its element is
-        // dead weight prune would have to special-case forever, but a lease
-        // deleted for an element that is still installed would silently make
-        // that package permanent.
-        for n in names {
-            if paths::lease_name_ok(n) {
-                self.drop_lease(n)?;
-            }
+        let installed: BTreeSet<String> = self.nix.names()?.into_iter().collect();
+        let present: Vec<String> =
+            names.iter().filter(|n| installed.contains(*n)).cloned().collect();
+        if !present.is_empty() {
+            self.nix.remove(&present)?;
+            self.refresh_current()?;
         }
-        Ok(())
+        let mut out = Vec::new();
+        for n in names {
+            let r = if installed.contains(n) {
+                // Only after the removal succeeded: a lease outliving its
+                // element is dead weight prune would have to special-case
+                // forever, but a lease deleted for an element that is still
+                // installed would silently make that package permanent.
+                if paths::lease_name_ok(n) {
+                    self.drop_lease(n)?;
+                }
+                RemoveResult::Removed
+            } else if self.has_lease(n) {
+                self.drop_lease(n)?;
+                RemoveResult::LeaseOnly
+            } else {
+                RemoveResult::NotInstalled
+            };
+            out.push((n.clone(), r));
+        }
+        Ok(out)
     }
 
     /// Rebuild installed entries from the flake refs they were installed with.
@@ -491,6 +511,13 @@ impl Toolbox {
         let after = self.generation_count();
         Ok(before.saturating_sub(after))
     }
+}
+
+pub enum RemoveResult {
+    Removed,
+    /// No such element, only its lease was left to drop.
+    LeaseOnly,
+    NotInstalled,
 }
 
 pub enum PinResult {

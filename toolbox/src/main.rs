@@ -18,6 +18,7 @@ mod domain;
 mod json;
 mod launch;
 mod nix;
+mod packages;
 mod paths;
 mod proto;
 mod request;
@@ -25,13 +26,12 @@ mod session;
 mod toolbox;
 mod util;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use paths::Layout;
 use session::Registry;
-use toolbox::{LeaseState, PinResult, Toolbox};
+use toolbox::Toolbox;
 use util::{usage_err, Result};
 
 fn usage() {
@@ -122,122 +122,6 @@ Sessions register under $XDG_RUNTIME_DIR/llm-custody as <pid>.state.
     );
 }
 
-fn usage_request() {
-    print!(
-        "\
-Usage: llm-custody [--dir PATH] [--pid PID] request <command> [ARG...]
-
-What jailed agents have asked for and are blocked on. A package goes into the
-toolbox profile, a mount attaches a host directory to the jail that asked, a
-domain is added to that jail's network whitelist.
-
-  list             pending requests from every running jail (alias: ls)
-                   [--json] machine-readable, for a terminal integration
-  answer           the same queue, interactively: pick a numbered row to
-                   approve or deny it without typing a request id (a mount
-                   then asks for its mode, a domain for session or persist)
-  approve ID       grant it and unblock the jail
-                   [--mode ro|full|limited|none|overlay] how a mount is
-                   attached (default ro), [--mode session|persist] how
-                   long a domain stays allowed (default session); ignored
-                   for a package
-  deny ID          refuse it [--reason TEXT]
-
---pid restricts all of this to one session's broker.
-"
-    );
-}
-
-fn usage_toolbox() {
-    print!(
-        "\
-Usage: llm-custody [--dir PATH] [--pause] toolbox <command> [ARG...]
-
-The package profile bound into every jail at /toolbox and prepended to its
-PATH. Adding to it is live: a running jail finds the command on its next PATH
-lookup.
-
-  add PKG...        install nixpkgs attributes and start their {days}-day lease.
-                    ALSO HOW YOU RENEW ONE: re-running add on something
-                    already installed skips the install and just pushes its
-                    lease out, so answering the same request again keeps the
-                    package alive for another {days} days
-                    (aliases: install, i)
-  remove PKG...     remove them again (alias: rm)
-  list              show what is installed
-  upgrade [PKG...]  rebuild installed packages against their flake refs
-  (no command)      prompt for packages to add
-
-A bare name is resolved against $LLMCUSTODY_TOOLBOX_FLAKE (default nixpkgs);
-anything containing # or : is passed to nix verbatim as a flake reference.
-Jailed clients may only ask for bare attributes.
-
-The whole request block an agent printed can be pasted as-is:
-  llm-custody toolbox add required packages: lua5_4, shellcheck
-",
-        days = paths::DEFAULT_LEASE_DAYS
-    );
-}
-
-fn usage_lease() {
-    print!(
-        "\
-Usage: llm-custody [--dir PATH] [--pause] lease <command> [ARG...]
-
-A package added to the toolbox holds a {days}-day lease, so provisioning is not
-a one-way ratchet: what an afternoon needed does not stay on every future
-jail's PATH, with its whole closure pinned, until someone remembers to look.
-
-  list              each package, the age of its lease and when it expires;
-                    the unleased ones are the permanent ones (alias: ls)
-                    [--older-than PERIOD]
-  renew PKG...      push a lease out without touching the profile
-  pin PKG...        drop the lease, making the package permanent
-                    (add or renew it again to put it back under a lease)
-  prune             remove the packages whose lease has expired, then drop
-                    the generations that held them. Every jail start does
-                    this on its own, so running it by hand is for pruning
-                    early or with another lifetime
-                    [--older-than PERIOD] lifetime to apply, e.g. 30d
-                    [--dry-run] report without removing
-  gc                drop the profile generations every add leaves behind
-                    [--older-than PERIOD] [--dry-run]
-",
-        days = paths::DEFAULT_LEASE_DAYS
-    );
-}
-
-fn usage_serve() {
-    print!(
-        "\
-Usage: llm-custody [--dir PATH] serve [OPTION...]
-
-The request broker for one jail. Started by the jail runner, not usually by
-hand: it owns the two sockets a jailed custody-request talks to and holds the
-client's connection open until the operator answers.
-
-  --broker-id ID     registration name under $XDG_RUNTIME_DIR/llm-custody/
-                     brokers (the runner passes its own pid)
-  --label TEXT       how this jail reads in the request list
-  --timeout PERIOD   how long an unanswered request blocks its client
-  --uservar 0|1      publish the pending count as a terminal user variable
-  --notify-hook PATH run on every queue change, with <event> <id> <attr>
-                     <reason> <count> <label> as separate arguments and no
-                     shell involved. Its failure is never the request's
-                     problem. $LLMCUSTODY_NOTIFY_HOOK is the default
-  --mount-cmd PATH   the session's mount launcher; an approved mount request
-                     runs it as `add --mode M -- PATH`
-  --domain-cmd PATH  the session's domain launcher; an approved domain
-                     request runs it as `add [--persist] -- NAME`. Without
-                     it (no network filter) a domain request fails at once
-
-Also runs one prune and gc in the background, which is what keeps expired
-leases from accumulating without anyone remembering to look.
-$LLMCUSTODY_TOOLBOX_AUTOPRUNE=0 turns that off.
-"
-    );
-}
-
 /// `llm-custody help mount` and `llm-custody mount --help` are the same
 /// question asked two ways, so they end in the same place.
 fn help_for(topic: Option<&str>) -> Result<()> {
@@ -248,10 +132,10 @@ fn help_for(topic: Option<&str>) -> Result<()> {
         Some("sync") => usage_sync(),
         Some("domain") => domain::usage(),
         Some("session") => usage_session(),
-        Some("request") => usage_request(),
-        Some("toolbox") => usage_toolbox(),
-        Some("lease") => usage_lease(),
-        Some("serve") => usage_serve(),
+        Some("request") => brokerctl::usage(),
+        Some("toolbox") => packages::usage_toolbox(),
+        Some("lease") => packages::usage_lease(),
+        Some("serve") => broker::usage(),
         Some("custody-request") => request::usage(),
         Some(other) => return usage_err(format!("no help for: {other} (try --help)")),
     }
@@ -265,7 +149,7 @@ fn help_for(topic: Option<&str>) -> Result<()> {
 fn unalias<'a>(group: &str, cmd: &'a str) -> &'a str {
     match (group, cmd) {
         ("toolbox", "install") | ("toolbox", "i") => "add",
-        ("toolbox", "rm") => "remove",
+        ("toolbox", "rm") | ("lease", "rm") => "remove",
         ("mount", "rm") | ("mount", "umount") => "remove",
         ("domain", "rm") => "remove",
         (_, "ls") => "list",
@@ -387,6 +271,10 @@ fn parse_global(args: &[String]) -> Result<Global> {
     Ok(Global { dir, pid, pause, args: args[i..].to_vec() })
 }
 
+/// The command words, and through the modules they dispatch to, every
+/// subcommand and flag, are described a second time in lib/completions.nix
+/// (`commands`), by hand. Adding or renaming one here or in a group's module
+/// needs the matching entry there; nothing checks the two against each other.
 fn run(g: Global) -> Result<()> {
     let (cmd, rest): (String, Vec<String>) = match g.args.split_first() {
         Some((c, r)) => (c.clone(), r.to_vec()),
@@ -403,15 +291,15 @@ fn run(g: Global) -> Result<()> {
         "sync" => cmd_sync(&g, &rest),
         "domain" => cmd_domain(&g, &rest),
         "session" => cmd_session(&rest),
-        "request" => cmd_request(&g, &rest),
-        "toolbox" => cmd_toolbox(&g, &rest),
-        "lease" => cmd_lease(&g, &rest),
+        "request" => brokerctl::cmd_request(&g, &rest),
+        "toolbox" => packages::cmd_toolbox(&g, &rest),
+        "lease" => packages::cmd_lease(&g, &rest),
         "serve" => {
             if wants_help(&rest) {
-                usage_serve();
+                broker::usage();
                 return Ok(());
             }
-            cmd_serve(g.toolbox()?, &rest)
+            broker::cmd_serve(g.toolbox()?, &rest)
         }
         other => usage_err(format!("unknown command: {other} (try --help)")),
     }
@@ -486,430 +374,6 @@ fn cmd_session(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_request(g: &Global, args: &[String]) -> Result<()> {
-    if wants_help(args) || args.is_empty() {
-        usage_request();
-        return Ok(());
-    }
-    let tb = g.toolbox()?;
-    let (cmd, rest) = args.split_first().expect("checked above");
-    match unalias("request", cmd) {
-        "list" => cmd_requests(&tb, rest),
-        "answer" => brokerctl::answer(&tb.layout),
-        "approve" => cmd_approve(&tb, rest),
-        "deny" => cmd_deny(&tb, rest),
-        other => usage_err(format!("request: unknown command: {other} (try --help)")),
-    }
-}
-
-fn cmd_toolbox(g: &Global, args: &[String]) -> Result<()> {
-    if wants_help(args) {
-        usage_toolbox();
-        return Ok(());
-    }
-    let tb = g.toolbox()?;
-    let (cmd, rest) = match args.split_first() {
-        Some((c, r)) => (c.clone(), r.to_vec()),
-        // A keybinding's way in: ask for the one thing it cannot know.
-        None => ("add".to_string(), prompt_for_add()?),
-    };
-    match unalias("toolbox", &cmd) {
-        "add" => cmd_add(&tb, &normalize(&rest)?),
-        "remove" => cmd_remove(&tb, &normalize(&rest)?),
-        "list" => tb.list(),
-        "upgrade" => cmd_upgrade(&tb, &rest),
-        other => usage_err(format!("toolbox: unknown command: {other} (try --help)")),
-    }
-}
-
-fn cmd_lease(g: &Global, args: &[String]) -> Result<()> {
-    if wants_help(args) || args.is_empty() {
-        usage_lease();
-        return Ok(());
-    }
-    let tb = g.toolbox()?;
-    let (cmd, rest) = args.split_first().expect("checked above");
-    match unalias("lease", cmd) {
-        "list" => cmd_leases(&tb, rest),
-        "renew" => cmd_renew(&tb, &normalize(rest)?),
-        "pin" => cmd_pin(&tb, &normalize(rest)?),
-        "prune" => cmd_prune(&tb, rest),
-        "gc" => cmd_gc(&tb, rest),
-        other => usage_err(format!("lease: unknown command: {other} (try --help)")),
-    }
-}
-
-/// The typed line comes back as one argument, which normalize() splits - it
-/// has to handle a pasted request block anyway.
-fn prompt_for_add() -> Result<Vec<String>> {
-    if !std::io::stdin().is_terminal() {
-        usage_toolbox();
-        std::process::exit(0);
-    }
-    eprint!("package(s) to add: ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    if line.trim().is_empty() {
-        return usage_err("nothing to add");
-    }
-    Ok(vec![line.trim().to_string()])
-}
-
-/// Agents are asked to print their request as `required packages: a, b`, so
-/// that shape is accepted verbatim - the operator pastes the line instead of
-/// retyping the names out of it. Commas are separators in that format and are
-/// never part of an attribute name.
-fn normalize(args: &[String]) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for arg in args {
-        for word in arg.split([',', ' ', '\t']) {
-            let w = word.trim();
-            if w.is_empty() {
-                continue;
-            }
-            if matches!(
-                w,
-                "required" | "required:" | "good-to-have" | "good-to-have:" | "packages"
-                    | "packages:"
-            ) {
-                continue;
-            }
-            out.push(w.to_string());
-        }
-    }
-    if out.is_empty() {
-        return usage_err("no package names given");
-    }
-    Ok(out)
-}
-
-fn cmd_add(tb: &Toolbox, attrs: &[String]) -> Result<()> {
-    let outcome = tb.add(attrs)?;
-    if !outcome.renewed.is_empty() {
-        util::note(format!(
-            "already installed, lease renewed: {}",
-            outcome.renewed.join(" ")
-        ));
-    }
-    if outcome.unleased {
-        util::note(
-            "could not read element names from nix - no lease recorded, these will never expire",
-        );
-    }
-    if !outcome.installed.is_empty() {
-        if outcome.new_commands.is_empty() {
-            util::note("no new commands (already present, or the package ships no bin/)");
-        } else {
-            util::note(format!(
-                "now on the jail PATH: {}",
-                outcome.new_commands.join(" ")
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn cmd_remove(tb: &Toolbox, names: &[String]) -> Result<()> {
-    tb.remove(names)
-}
-
-fn cmd_renew(tb: &Toolbox, names: &[String]) -> Result<()> {
-    for (name, was_permanent) in tb.renew(names)? {
-        if was_permanent {
-            util::note(format!("{name} was permanent, now leased again"));
-        } else {
-            util::note(format!("{name} renewed"));
-        }
-    }
-    Ok(())
-}
-
-fn cmd_pin(tb: &Toolbox, names: &[String]) -> Result<()> {
-    for (name, r) in tb.pin(names)? {
-        match r {
-            PinResult::Pinned => util::note(format!("{name} pinned, it will never be pruned")),
-            PinResult::AlreadyPermanent => {
-                util::note(format!("{name} holds no lease, already permanent"))
-            }
-            PinResult::NotInstalled => util::note(format!(
-                "{name} is not an installed element - check the list command"
-            )),
-        }
-    }
-    Ok(())
-}
-
-fn cmd_upgrade(tb: &Toolbox, args: &[String]) -> Result<()> {
-    if let Some(a) = args.iter().find(|a| a.starts_with('-')) {
-        return usage_err(format!("upgrade: unknown option: {a} (it takes package names only)"));
-    }
-    if tb.upgrade(args)? {
-        util::note("live for running jails on their next PATH lookup");
-        util::note("the previous generation is still pinned - run gc to drop it");
-    } else {
-        util::note("nothing changed, the installed refs already resolve to this");
-    }
-    Ok(())
-}
-
-/// `--older-than`, shared by leases, prune and gc. Returns the raw string too,
-/// because gc hands its period to nix rather than interpreting it here.
-fn take_period(args: &[String], cmd: &str) -> Result<(Option<String>, bool)> {
-    let mut period = None;
-    let mut dry = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--older-than" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => period = Some(v.clone()),
-                    None => return usage_err("--older-than needs a period, e.g. 30d"),
-                }
-            }
-            "--dry-run" => dry = true,
-            a => return usage_err(format!("{cmd}: unknown option: {a} (try --help)")),
-        }
-        i += 1;
-    }
-    Ok((period, dry))
-}
-
-fn period_or_default(tb: &Toolbox, period: Option<String>) -> Result<Duration> {
-    match period {
-        Some(p) => util::parse_duration(&p, 'd'),
-        None => Ok(tb.layout.lease_period),
-    }
-}
-
-fn cmd_leases(tb: &Toolbox, args: &[String]) -> Result<()> {
-    let (period, dry) = take_period(args, "leases")?;
-    if dry {
-        return usage_err("leases: --dry-run makes no sense here, it never changes anything");
-    }
-    let period = period_or_default(tb, period)?;
-    let rows = tb.lease_report(period)?;
-    if rows.is_empty() {
-        util::note(format!("nothing installed in {}", tb.layout.dir.display()));
-        return Ok(());
-    }
-    let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(8).max(8);
-    for row in &rows {
-        let state = match row.state {
-            LeaseState::Live { age, left } => format!(
-                "leased {} ago, expires in {}",
-                util::human_duration(Duration::from_secs(age)),
-                util::human_duration(Duration::from_secs(left))
-            ),
-            LeaseState::Expired { age } => format!(
-                "leased {} ago, EXPIRED",
-                util::human_duration(Duration::from_secs(age))
-            ),
-            LeaseState::Orphaned { age } => format!(
-                "leased {} ago, EXPIRED, no such profile element",
-                util::human_duration(Duration::from_secs(age))
-            ),
-            LeaseState::Permanent => "permanent (no lease)".to_string(),
-        };
-        println!("{:<w$}  {}", row.name, state, w = w);
-    }
-    Ok(())
-}
-
-fn cmd_prune(tb: &Toolbox, args: &[String]) -> Result<()> {
-    let (period, dry) = take_period(args, "prune")?;
-    let period = period_or_default(tb, period)?;
-    let outcome = tb.prune(period, dry)?;
-
-    for name in &outcome.orphaned {
-        util::note(format!(
-            "{name}: lease expired, no such profile element - dropping the lease only"
-        ));
-    }
-    for name in &outcome.removed {
-        util::note(format!("{name}: lease expired"));
-    }
-    if outcome.removed.is_empty() && outcome.orphaned.is_empty() {
-        util::note(format!(
-            "no lease is older than {} (see: leases)",
-            util::human_duration(period)
-        ));
-        return Ok(());
-    }
-    if outcome.dry_run {
-        util::note("dry run, nothing removed");
-        return Ok(());
-    }
-    util::note(format!(
-        "{} package(s) pruned, {} generation(s) dropped",
-        outcome.removed.len(),
-        outcome.generations_dropped
-    ));
-    // Worth saying because the removal is live: a command a running jail had a
-    // moment ago can be gone from its next PATH lookup. That is what a lease
-    // is for, and the session carries on without it.
-    util::note("running jails lose these from their PATH immediately");
-    util::note("store paths are only unpinned - run nix-collect-garbage to reclaim them");
-    Ok(())
-}
-
-fn cmd_gc(tb: &Toolbox, args: &[String]) -> Result<()> {
-    let (period, dry) = take_period(args, "gc")?;
-    let dropped = tb.gc(period.as_deref(), dry)?;
-    util::note(format!("{dropped} generation(s) dropped"));
-    // Said plainly because the obvious next question is why the store did not
-    // shrink: this only unpins, it frees nothing on its own.
-    util::note("store paths are only unpinned - run nix-collect-garbage to reclaim them");
-    Ok(())
-}
-
-fn cmd_serve(tb: Toolbox, args: &[String]) -> Result<()> {
-    let mut broker_id = std::process::id().to_string();
-    let mut label = String::new();
-    // Long enough that an operator can be away from the terminal, short enough
-    // that an abandoned jail's requests do not pile up forever.
-    let mut timeout = Duration::from_secs(30 * 60);
-    // Off unless the runner says this terminal takes user variables. Not
-    // re-derived from the environment here on purpose: the runner already
-    // decides it once for every publisher, and a second opinion is how they
-    // drift apart.
-    let mut uservar = false;
-    let mut notify_hook = std::env::var_os("LLMCUSTODY_NOTIFY_HOOK")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let mut mount_cmd = None;
-    let mut domain_cmd = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--uservar" => {
-                i += 1;
-                match args.get(i).map(String::as_str) {
-                    Some("1") => uservar = true,
-                    Some("0") => uservar = false,
-                    _ => return usage_err("--uservar takes 0 or 1"),
-                }
-            }
-            "--notify-hook" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => notify_hook = Some(PathBuf::from(v)),
-                    None => return usage_err("--notify-hook needs a path"),
-                }
-            }
-            "--mount-cmd" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => mount_cmd = Some(PathBuf::from(v)),
-                    None => return usage_err("--mount-cmd needs a path"),
-                }
-            }
-            "--domain-cmd" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => domain_cmd = Some(PathBuf::from(v)),
-                    None => return usage_err("--domain-cmd needs a path"),
-                }
-            }
-            "--broker-id" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => broker_id = v.clone(),
-                    None => return usage_err("--broker-id needs a value"),
-                }
-            }
-            "--label" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => label = v.clone(),
-                    None => return usage_err("--label needs a value"),
-                }
-            }
-            "--timeout" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => timeout = util::parse_duration(v, 'm')?,
-                    None => return usage_err("--timeout needs a period, e.g. 30m"),
-                }
-            }
-            a => return usage_err(format!("serve: unknown option: {a} (try --help)")),
-        }
-        i += 1;
-    }
-    if !paths::lease_name_ok(&broker_id) {
-        return usage_err(format!("not usable as a broker id: {broker_id}"));
-    }
-    broker::serve(
-        tb.layout,
-        broker::ServeOpts {
-            broker_id,
-            label,
-            timeout,
-            uservar,
-            notify_hook,
-            mount_cmd,
-            domain_cmd,
-        },
-    )
-}
-
-fn cmd_requests(tb: &Toolbox, args: &[String]) -> Result<()> {
-    match args.first().map(String::as_str) {
-        None => brokerctl::requests(&tb.layout),
-        Some("--json") => brokerctl::requests_json(&tb.layout),
-        Some(a) => usage_err(format!("requests: unknown option: {a} (try --help)")),
-    }
-}
-
-fn cmd_approve(tb: &Toolbox, args: &[String]) -> Result<()> {
-    let mut id = None;
-    let mut mode = String::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--mode" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => mode = v.clone(),
-                    None => return usage_err("--mode needs a value"),
-                }
-            }
-            a if a.starts_with('-') => return usage_err(format!("approve: unknown option: {a}")),
-            a => id = Some(a.to_string()),
-        }
-        i += 1;
-    }
-    match id {
-        Some(id) => brokerctl::approve(&tb.layout, &id, &mode),
-        None => usage_err("approve needs a request id - see the requests command"),
-    }
-}
-
-fn cmd_deny(tb: &Toolbox, args: &[String]) -> Result<()> {
-    let mut id = None;
-    let mut reason = String::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--reason" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => reason = v.clone(),
-                    None => return usage_err("--reason needs a value"),
-                }
-            }
-            a if a.starts_with('-') => return usage_err(format!("deny: unknown option: {a}")),
-            a => id = Some(a.to_string()),
-        }
-        i += 1;
-    }
-    match id {
-        Some(id) => brokerctl::deny(&tb.layout, &id, &reason),
-        None => usage_err("deny needs a request id - see the requests command"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +417,7 @@ mod tests {
         assert_eq!(unalias("toolbox", "install"), "add");
         assert_eq!(unalias("toolbox", "i"), "add");
         assert_eq!(unalias("toolbox", "rm"), "remove");
+        assert_eq!(unalias("lease", "rm"), "remove");
         assert_eq!(unalias("toolbox", "ls"), "list");
         assert_eq!(unalias("lease", "ls"), "list");
         assert_eq!(unalias("request", "ls"), "list");

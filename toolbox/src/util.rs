@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -253,6 +253,37 @@ fn uservar_sequence(name: &str, value: &str, tmux: bool) -> String {
     } else {
         osc
     }
+}
+
+/// One typed line, after an optional prompt. None at end of input, which
+/// every menu level treats as leaving the whole menu: a pipe that ran out has
+/// nothing more to say to any of them.
+pub fn read_answer(prompt: &str) -> Result<Option<String>> {
+    if std::io::stdout().is_terminal() {
+        print!("{prompt}");
+        let _ = std::io::stdout().flush();
+    }
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
+/// Held, for its whole body, by every test that writes an executable or
+/// spawns a child.
+///
+/// Tests run as threads of one process. A fork made by one test while another
+/// still has a script open for writing carries that writable descriptor until
+/// the child's own exec, and the kernel refuses to exec a file anyone holds
+/// open for writing (ETXTBSY, "Text file busy"). Serializing the tests that
+/// do either closes that window; a test that does neither needs no lock.
+#[cfg(test)]
+pub fn exec_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it has poisoned nothing worth
+    // protecting, and failing every later test for it would bury the cause.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]

@@ -238,6 +238,16 @@ let
   # The umbrella subcommand tree. `pos` is what the positional arguments of a
   # leaf complete to (file or nothing - a package attribute, a request id or
   # a mount name has nothing on disk to offer).
+  #
+  # Maintained by hand next to the Rust CLI, which is the authority: the
+  # command words are dispatched in toolbox/src/main.rs (`run`) and each
+  # group's subcommands and flags in the module that owns it (packages.rs,
+  # brokerctl.rs, broker.rs, domain.rs, session.rs, launch.rs). A subcommand
+  # or flag added there needs its entry here, and nothing checks that. Not
+  # generated from the Rust side because the crate takes no dependencies
+  # (toolbox/Cargo.toml), which rules out a completion generator, and the
+  # runner half of this file describes a shell parser no Rust tool could
+  # read anyway.
   commands = [
     {
       name = "launch";
@@ -426,7 +436,14 @@ let
         {
           name = "list";
           desc = "Show the leases and their age";
-          flags = [ olderThan ];
+          flags = [
+            olderThan
+            {
+              flag = "--json";
+              arg = "none";
+              desc = "Machine readable output";
+            }
+          ];
         }
         {
           name = "renew";
@@ -435,6 +452,10 @@ let
         {
           name = "pin";
           desc = "Make a package permanent by dropping its lease";
+        }
+        {
+          name = "remove";
+          desc = "Uninstall a package now, leased or permanent";
         }
         {
           name = "prune";
