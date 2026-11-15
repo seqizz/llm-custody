@@ -203,8 +203,10 @@ tool really is meant to receive it.
 Environment: `LLMCUSTODY_PROFILE`, `LLMCUSTODY_STATE_DIR` and
 `LLMCUSTODY_TOOLBOX_DIR` are the defaults for `--profile`, `--state-dir` and
 `--toolbox-dir`, `LLMCUSTODY_USERVAR=1|0` forces the WezTerm user-var
-emission, `NO_COLOR` disables coloured output, and `PAGER` is used for the
-`d` answer at the sync prompt.
+emission, `LLMCUSTODY_NOTIFY_HOOK` replaces the desktop notification sent
+when an agent starts waiting on a request (empty disables it, see below),
+`NO_COLOR` disables coloured output, and `PAGER` is used for the `d` answer
+at the sync prompt.
 
 Shell completions for bash, zsh and fish ship in the package under
 `share/`, so they are picked up automatically wherever the package is on a
@@ -382,7 +384,7 @@ itself:
 |------|------|-------|
 | `<broker>/pending` | every change | the count, atomically rewritten; what a second terminal can read at any time |
 | `llm_custody_requests` user var | on change | OSC 1337, empty when the queue drains |
-| `--notify-hook` | every change | your command, argv only |
+| `--notify-hook` | every change | a desktop notification per new request by default, or your command, argv only |
 
 `request list --json` prints the queue flattened across every broker, oldest
 first - the one that has been blocking an agent longest is the one to answer
@@ -457,8 +459,13 @@ checking that nothing in the reason executed on the way. Set it with
 `$LLMCUSTODY_NOTIFY_HOOK`. A hook that is missing, unexecutable, slow or
 failing is logged to `broker.log` and changes nothing: it is spawned, never
 waited on (a reaper thread collects it), so a hook that sleeps for a minute
-does not delay the approval by a millisecond. `notify-send` is the obvious
-one to put there if you want a desktop popup as well.
+does not delay the approval by a millisecond.
+
+With `$LLMCUSTODY_NOTIFY_HOOK` unset, the runner passes its own hook
+(`lib/notify-desktop.sh`): a `notify-send` popup for every `request` event,
+with the attribute, the reason and the jail's label in a markup-escaped body.
+It does nothing on a host without a session bus. Your own hook replaces it,
+and `LLMCUSTODY_NOTIFY_HOOK=` (set, empty) turns notifications off.
 
 Both sockets live under `$XDG_RUNTIME_DIR/llm-custody/brokers/<pid>/`, so
 several jails broker in parallel and `request list` aggregates across all of

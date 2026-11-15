@@ -33,6 +33,9 @@ let
   # whitelist ($RUNDIR/domain, `llm-custody domain`, the broker's approval of
   # an agent's domain request). Only wired up when the filter is on.
   domainCtl = pkgs.lib.getExe (import ./domain-ctl.nix { inherit pkgs; });
+  # Desktop notification for a new agent request (lib/notify-desktop.sh),
+  # the broker's notify hook unless the operator names their own.
+  notifyDesktop = pkgs.lib.getExe (import ./notify-desktop.nix { inherit pkgs; });
   # Guest path and symlink names of the operator-managed package profile
   # (lib/toolbox.nix), shared with ../toolbox and the launchers.
   toolbox = import ./toolbox.nix;
@@ -1927,10 +1930,20 @@ pkgs.writeShellApplication {
       if [ "$NET_FILTER" = "1" ]; then
         BROKER_DOMAIN_ARGS=(--domain-cmd "$RUNDIR/domain")
       fi
+      # A blocked agent is announced on the desktop by default: the user var
+      # only reaches a terminal that renders it, and only while that tab bar
+      # is in view. LLMCUSTODY_NOTIFY_HOOK is the operator's override and is
+      # read by the broker itself, so only the unset case is decided here;
+      # set but empty means no hook at all.
+      BROKER_HOOK_ARGS=()
+      if [ -z "''${LLMCUSTODY_NOTIFY_HOOK+set}" ]; then
+        BROKER_HOOK_ARGS=(--notify-hook "${notifyDesktop}")
+      fi
       ${custodyCli} --dir "$TOOLBOX_DIR" serve \
         --broker-id "$$" --label "${name} $WORKSPACE_HOST" \
         --uservar "$USERVAR_ON" --mount-cmd "$RUNDIR/mount" \
         "''${BROKER_DOMAIN_ARGS[@]+"''${BROKER_DOMAIN_ARGS[@]}"}" \
+        "''${BROKER_HOOK_ARGS[@]+"''${BROKER_HOOK_ARGS[@]}"}" \
         >"$RUNDIR/broker.log" 2>&1 &
       BROKER_PID=$!
       # Readiness is observed, not slept for (same reason as slirp4netns and
