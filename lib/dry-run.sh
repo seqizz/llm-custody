@@ -1,42 +1,113 @@
-# The --dry-run report sections printed after the session card: the mask
-# matches of every tree and a grouped summary of the bwrap arguments.
+# The --dry-run report printed after the session card: the mask matches of
+# every tree, the allowed domains, a grouped summary of the bwrap
+# arguments and the command. Each part is a section under a ── header
+# rather than a run of llm-custody: prefixed log lines, since nothing here
+# is a diagnostic and the prefix on every line only buries the content.
 # Runner-only, interpolated into lib/mkBwrapRunner.nix (no Nix
 # interpolation in here); reads the runner's resolved state at call time
-# (MASK_PATTERNS, GIT_MODE, WORKSPACE_HOST, the DRY_MOUNT_* arrays,
-# BWRAP_ARGS, RUNDIR, SKILLS_GUEST_DIR) plus the log helpers.
+# (MASK_PATTERNS, GIT_MODE, WORKSPACE_HOST/GUEST, the DRY_MOUNT_* arrays,
+# BWRAP_ARGS, RUNDIR, SKILLS_GUEST_DIR) plus the colours from lib/log.sh.
+#
+# Sections print whatever the verbosity: a dry run exists to show them.
+
+dry_section() {
+  printf '%s──%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" >&2
+}
+
+dry_line() {
+  printf '   %s\n' "$1" >&2
+}
+
+dry_row() {
+  dry_line "$(printf '%-9s %s' "$1" "$2")"
+}
 
 # Masks of the workspace and every extra mount, resolved against the host
-# trees. Nothing is copied or bound for a dry run, but a copy is the host
-# tree minus .git, so the host-side matches are exactly what a launch would
-# delete or shadow.
+# trees and merged per pattern, with paths as the jail would see them.
+# Nothing is copied or bound for a dry run, but a copy is the host tree
+# minus .git, so the host-side matches are exactly what a launch would
+# delete or shadow. Trees are split only by what happens to a match:
+# deleted from a copy, or shadowed by an empty bind where the tree is bound
+# directly. One section per kind that occurs, so the usual all-copies run
+# gets one.
 dry_mask_report() {
-  local i host mode what
+  local i host mode kind
+  local -a t_host=() t_guest=() t_kind=() notes=()
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
-  dry_mask_tree "$WORKSPACE_HOST" "workspace $WORKSPACE_HOST" "$GIT_MODE"
+
+  if [ "$GIT_MODE" = "full" ]; then kind=shadow; else kind=delete; fi
+  t_host+=("$WORKSPACE_HOST"); t_guest+=("$WORKSPACE_GUEST"); t_kind+=("$kind")
   for i in "${!DRY_MOUNT_HOSTS[@]}"; do
     host="${DRY_MOUNT_HOSTS[$i]}"
     mode="${DRY_MOUNT_MODES[$i]}"
-    what="mount ${DRY_MOUNT_GUESTS[$i]}"
     if [ ! -d "$host" ]; then
-      log "--mask: $what is a single file, masks do not apply to it"
+      notes+=("${DRY_MOUNT_GUESTS[$i]} is a single file, masks do not apply to it")
       continue
     fi
-    dry_mask_tree "$host" "$what" "$mode"
+    case "$mode" in
+      limited|none) kind=delete ;;
+      *) kind=shadow ;;
+    esac
+    t_host+=("$host"); t_guest+=("${DRY_MOUNT_GUESTS[$i]}"); t_kind+=("$kind")
   done
+
+  dry_mask_kind delete "to delete from the copies"
+  dry_mask_kind shadow "to shadow with empty binds"
+  for i in "${notes[@]}"; do dry_line "$i"; done
 }
 
-dry_mask_tree() {
-  local host="$1" label="$2" mode="$3"
-  jail_mask_collect "$host"
-  case "$mode" in
-    limited|none) jail_mask_report "$label" "to delete from the copy" always ;;
-    *)
-      jail_mask_report "$label" "to shadow with empty binds" always
-      if [ "${#MASK_HIT_PATH[@]}" -gt 0 ] && [ -d "$host/.git" ]; then
-        hint "bound with its .git: masked content stays readable as git blobs"
+# One section of dry_mask_report: every tree of KIND, merged. Reads the
+# t_host/t_guest/t_kind arrays of its caller.
+dry_mask_kind() {
+  local kind="$1" what="$2" t j n shown cap=20 trees=0 counts=""
+  local -a idx=() paths=() leaky=()
+  for t in "${!t_kind[@]}"; do
+    [ "${t_kind[$t]}" = "$kind" ] || continue
+    jail_mask_collect "${t_host[$t]}"
+    for j in "${!MASK_HIT_PATH[@]}"; do
+      idx+=("${MASK_HIT_IDX[$j]}")
+      paths+=("${t_guest[$t]}/${MASK_HIT_PATH[$j]}")
+    done
+    if [ "$kind" = "shadow" ] && [ "${#MASK_HIT_PATH[@]}" -gt 0 ] && [ -d "${t_host[$t]}/.git" ]; then
+      leaky+=("${t_guest[$t]}")
+    fi
+    trees=$((trees+1))
+  done
+  [ "$trees" -gt 0 ] || return 0
+
+  [ "$VERBOSITY" -lt 2 ] || cap=0
+  for t in "${!MASK_PATTERNS[@]}"; do
+    n=0
+    for j in "${!idx[@]}"; do
+      if [ "${idx[$j]}" = "$t" ]; then n=$((n+1)); fi
+    done
+    counts="$counts, ${MASK_PATTERNS[$t]}: $n"
+  done
+  dry_section "masks: ${#paths[@]} path(s) $what (${counts#, })"
+  for t in "${!MASK_PATTERNS[@]}"; do
+    n=0; shown=0
+    for j in "${!idx[@]}"; do
+      if [ "${idx[$j]}" = "$t" ]; then n=$((n+1)); fi
+    done
+    if [ "$n" -eq 0 ]; then
+      dry_line "${MASK_PATTERNS[$t]}  ${C_DIM}(no match)${C_RESET}"
+      continue
+    fi
+    dry_line "${MASK_PATTERNS[$t]}"
+    n=0
+    for j in "${!idx[@]}"; do
+      [ "${idx[$j]}" = "$t" ] || continue
+      n=$((n+1))
+      if [ "$cap" -eq 0 ] || [ "$n" -le "$cap" ]; then
+        dry_line "  ${paths[$j]}"
+        shown=$n
       fi
-      ;;
-  esac
+    done
+    [ "$n" -le "$shown" ] || dry_line "  ${C_DIM}... $((n - shown)) more (-v lists all)${C_RESET}"
+  done
+  for t in "${leaky[@]}"; do
+    dry_line "${C_YELLOW}$t is bound with its .git: masked content stays readable as git blobs${C_RESET}"
+  done
 }
 
 # Terminal width for packing rows, from stderr since that is where the
@@ -64,17 +135,13 @@ dry_short() {
   printf '%s' "$p"
 }
 
-dry_row() {
-  hint "$(printf '%-9s %s' "$1" "$2")"
-}
-
 # One labelled row per terminal line: ITEMS are joined with SEP and
 # wrapped at the terminal width, the label only on the first line.
 dry_pack() {
   local label="$1" sep="$2" width line="" item
   shift 2
-  # 12 columns of hint indent plus the 10-column label.
-  width=$(( DRY_COLS - 22 ))
+  # 3 columns of dry_line indent plus the 10-column label.
+  width=$(( DRY_COLS - 13 ))
   [ "$width" -ge 30 ] || width=30
   for item in "$@"; do
     if [ -n "$line" ] && [ $(( ${#line} + ${#sep} + ${#item} )) -gt "$width" ]; then
@@ -281,7 +348,7 @@ dry_bwrap_summary() {
 
 # Where the skill binds come from: their source dirs with a count each,
 # under a common parent when they share one (the usual case, one checkout
-# per skill repo in the skillissue cache).
+# per skill repo under a single cache dir).
 dry_skill_sources() {
   local d parent="" same=1 out=""
   local -a groups=() counts=()

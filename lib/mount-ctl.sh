@@ -142,7 +142,7 @@ shadow_masks() {
   local hostroot="$1" point="$2" mdir="$3" label="$4" entry n=0
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
   jail_mask_collect "$hostroot"
-  jail_mask_report "$label" "shadowed with empty binds" verbose
+  jail_mask_report "$label" "shadowed with empty binds"
   [ "${#MASK_HIT_PATH[@]}" -gt 0 ] || return 0
   mkdir -p "$mdir"
   for entry in "${MASK_HIT_PATH[@]}"; do

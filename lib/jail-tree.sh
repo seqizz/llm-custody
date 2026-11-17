@@ -28,6 +28,19 @@ jail_copy_tree() {
   shopt -u dotglob nullglob
 }
 
+# A tree mode (--git vocabulary plus ro and overlay) coloured by how much
+# of the host it exposes, the same scale the session card uses: green for
+# a copy or read-only bind, yellow for an overlay that syncs only on
+# confirmation, red for the real tree read-write.
+jail_mode_label() {
+  case "$1" in
+    limited|none|copy|ro) printf '%s%s%s' "$C_GREEN" "$1" "$C_RESET" ;;
+    overlay) printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
+    full) printf '%s%s%s' "$C_RED" "$1" "$C_RESET" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 # Delete every --mask match from a jail copy. Deleting beats shadowing
 # with an empty bind: with no .git next to them there is nothing left to
 # recover the contents from.
@@ -50,7 +63,7 @@ jail_apply_masks() {
     # it leaves masked content in the jail, so it is reported.
     rm -rf -- "$dir/${path:?mask target empty}" || warn "could not remove $path from $label"
   done
-  jail_mask_report "$label" removed verbose
+  jail_mask_report "$label" removed
 }
 
 # Every --mask match under a tree, as two parallel arrays: MASK_HIT_IDX
@@ -86,15 +99,12 @@ jail_mask_collect() {
 }
 
 # Report the last jail_mask_collect for one tree: a summary line with a
-# count per pattern, then (DETAIL "always", or "verbose" under -v) the
-# matched paths grouped by pattern. Patterns with no match stay in the
-# list, since a zero next to a pattern is how a typo in it shows up. Below
-# -v each group stops at 20 paths, so a broad glob over a large tree does
-# not bury the rest of the output.
+# count per pattern, then under -v the matched paths grouped by pattern.
+# Patterns with no match stay in the list, since a zero next to a pattern
+# is how a typo in it shows up.
 jail_mask_report() {
-  local label="$1" what="$2" detail="$3" i j n shown cap=20 counts=""
+  local label="$1" what="$2" i j n counts=""
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
-  [ "$VERBOSITY" -lt 2 ] || cap=0
   for i in "${!MASK_PATTERNS[@]}"; do
     n=0
     for j in "${!MASK_HIT_IDX[@]}"; do
@@ -103,25 +113,21 @@ jail_mask_report() {
     counts="$counts, ${MASK_PATTERNS[$i]}: $n"
   done
   log "--mask: $label, ${#MASK_HIT_PATH[@]} path(s) $what (${counts#, })"
-  # hint is not silenced by --quiet, and these lines hang off the log above.
-  [ "$VERBOSITY" -ge 1 ] || return 0
-  if [ "$detail" != "always" ] && [ "$VERBOSITY" -lt 2 ]; then return 0; fi
+  [ "$VERBOSITY" -ge 2 ] || return 0
   for i in "${!MASK_PATTERNS[@]}"; do
-    hint "${MASK_PATTERNS[$i]}"
-    n=0; shown=0
+    n=0
     for j in "${!MASK_HIT_IDX[@]}"; do
-      [ "${MASK_HIT_IDX[$j]}" = "$i" ] || continue
-      n=$((n+1))
-      if [ "$cap" -eq 0 ] || [ "$n" -le "$cap" ]; then
-        hint "  ${MASK_HIT_PATH[$j]}"
-        shown=$n
-      fi
+      if [ "${MASK_HIT_IDX[$j]}" = "$i" ]; then n=$((n+1)); fi
     done
     if [ "$n" -eq 0 ]; then
-      hint "  (no match)"
-    elif [ "$n" -gt "$shown" ]; then
-      hint "  ... $((n - shown)) more (-v lists all)"
+      hint "${MASK_PATTERNS[$i]}  (no match)"
+      continue
     fi
+    hint "${MASK_PATTERNS[$i]}"
+    for j in "${!MASK_HIT_IDX[@]}"; do
+      [ "${MASK_HIT_IDX[$j]}" = "$i" ] || continue
+      hint "  ${MASK_HIT_PATH[$j]}"
+    done
   done
 }
 

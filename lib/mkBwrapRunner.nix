@@ -1014,7 +1014,7 @@ pkgs.writeShellApplication {
       jail_mask_collect "$hostroot"
       # --dry-run reports every tree's masks together after the session
       # card (dry_mask_report), so the binds are built here silently.
-      [ "$DRYRUN" = "1" ] || jail_mask_report "$label" "shadowed with empty binds" verbose
+      [ "$DRYRUN" = "1" ] || jail_mask_report "$label" "shadowed with empty binds"
       [ "''${#MASK_HIT_PATH[@]}" -gt 0 ] || return 0
       mkdir -p "$RUNDIR/masks"
       for entry in "''${MASK_HIT_PATH[@]}"; do
@@ -1055,7 +1055,7 @@ pkgs.writeShellApplication {
         # A dry run resolves paths but copies nothing: on a large repo the
         # copy is the slowest part of a launch, and reproducing it would
         # make the one mode meant for a quick look the expensive one.
-        log "--git $GIT_MODE would copy $WORKSPACE_HOST into $RUNDIR (not done for --dry-run)"
+        log "--git $(jail_mode_label "$GIT_MODE") would copy $WORKSPACE_HOST into $RUNDIR (not done for --dry-run)"
       else
         log "--git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)"
         jail_copy_tree "$WORKSPACE_HOST" "$WORKSPACE_COPY"
@@ -1675,7 +1675,7 @@ pkgs.writeShellApplication {
     BWRAP_ARGS+=(--setenv PATH "$JAIL_PATH")
 
     # Bind each skill's *resolved* target rather than the ~/.claude/skills
-    # dir itself - external skill managers (e.g. skillissue) place symlinks
+    # dir itself - external skill managers place symlinks
     # there, and a symlink bound as-is just dangles inside the sandbox since
     # its target lives outside anything else mounted.
     #
@@ -1688,9 +1688,8 @@ pkgs.writeShellApplication {
     # Read-only by default: the bind source is the real host checkout the
     # host's own agents read via ~/.claude/skills, so a writable bind would
     # let a jailed agent edit the instructions it (and other agents) run,
-    # and those changes persist on the host and get pushed on the next
-    # skillissue sync. --rw-skills opts into exactly that, only when the
-    # in-jail work is deliberately skill maintenance.
+    # and those changes persist on the host. --rw-skills opts into exactly
+    # that, only when the in-jail work is deliberately skill maintenance.
     if [ -d "$HOME/.claude/skills" ]; then
       for entry in "$HOME/.claude/skills"/*; do
         [ -e "$entry" ] || continue
@@ -1701,7 +1700,7 @@ pkgs.writeShellApplication {
         fi
       done
       if [ "$RW_SKILLS" = "1" ]; then
-        warn "skills are read-write; an in-jail agent can modify ~/.claude/skills content that the host reads (and skillissue may push)."
+        warn "skills are read-write; an in-jail agent can modify ~/.claude/skills content that the host reads."
         hint "Only continue if in-jail skill maintenance is intended."
       fi
     fi
@@ -1837,7 +1836,7 @@ pkgs.writeShellApplication {
       fi
       EXTRA_MOUNT_COUNT=$((EXTRA_MOUNT_COUNT+1))
       if [ "$DRYRUN" = "1" ]; then
-        log "would mount $hostpath at $guestpath (mode $mmode; nothing copied for --dry-run)"
+        log "would mount $hostpath at $guestpath (mode $(jail_mode_label "$mmode"); nothing copied for --dry-run)"
         DRY_MOUNT_HOSTS+=("$hostpath")
         DRY_MOUNT_GUESTS+=("$guestpath")
         DRY_MOUNT_MODES+=("$mmode")
@@ -2120,35 +2119,37 @@ pkgs.writeShellApplication {
     if [ "$DRYRUN" = "1" ]; then
       print_card
       dry_mask_report
-      log "allowed domains:"
+      dry_section "allowed domains"
       for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
-        hint "$d"
+        dry_line "$d"
       done
       if [ "$VERBOSITY" -ge 2 ]; then
-        log "bwrap summary (\$RUNDIR = $RUNDIR, ~ = $HOME):"
+        dry_section "bwrap summary (\$RUNDIR = $RUNDIR, ~ = $HOME)"
         dry_bwrap_summary
       fi
       if [ "$VERBOSITY" -ge 3 ]; then
         # One argument per line rather than a reconstructed command line:
         # argument order decides which bind shadows which, and a
         # 60-argument bwrap invocation on one line cannot be read for that.
-        log "bwrap arguments:"
+        dry_section "bwrap arguments"
         for arg in "''${BWRAP_ARGS[@]}"; do
-          hint "$arg"
+          dry_line "$arg"
         done
-      elif [ "$VERBOSITY" -eq 1 ]; then
-        log "bwrap arguments: -v for a summary, -vv for the raw list"
+      elif [ "$VERBOSITY" -lt 2 ]; then
+        dry_section "bwrap"
+        dry_line "Use -v to see summary of actual bwrap arguments, -vv for the raw list"
       fi
       if [ "''${#SCOPE_PREFIX[@]}" -gt 0 ]; then
-        log "resource limit scope (prefixed to the jail command, not checked against systemd for --dry-run):"
+        dry_section "resource limit scope (prefixed to the jail command, not checked against systemd for --dry-run)"
         for arg in "''${SCOPE_PREFIX[@]}"; do
-          hint "$arg"
+          dry_line "$arg"
         done
       fi
+      dry_section "command"
       if [ "''${#TOOL_ARGS[@]}" -gt 0 ]; then
-        log "command: ${toolExe} ''${TOOL_ARGS[*]}"
+        dry_line "${toolExe} ''${TOOL_ARGS[*]}"
       else
-        log "command: ${toolExe}"
+        dry_line "${toolExe}"
       fi
       exit 0
     fi

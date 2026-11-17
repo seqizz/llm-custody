@@ -175,7 +175,7 @@ llm-custody launch <tool> [options] [-- tool-args...]
 | `--sync-exclude GLOB` | Never sync paths matching GLOB back to the host tree, in any mode that syncs (repeatable). Matched against tree-relative paths; unlike `--mask`, `*` crosses `/` here, so `*.log` covers every depth | - |
 | `--watch-interval N` | Seconds between unsynced-change checks during the session; 0 disables the watcher (see [Unsynced-change indicator](#unsynced-change-indicator)) | `15` |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
-| `--dry-run` | Resolve everything and print it instead of launching: the session card, every `--mask` match per tree (first 20 per pattern, all with `-v`), the allowed domains, a grouped bwrap summary with `-v` and the raw bwrap argument list with `-vv`. Starts no network namespace and copies no trees | off |
+| `--dry-run` | Resolve everything and print it instead of launching: the session card, every `--mask` match merged per pattern across all trees as jail-side paths (first 20 per pattern, all with `-v`), the allowed domains, a grouped bwrap summary with `-v` and the raw bwrap argument list with `-vv`. Starts no network namespace and copies no trees | off |
 | `--list-profiles` | List the state profiles of this tool, with session counts, and exit | off |
 | `--list-sessions` | List the sessions stored in the selected profile, newest first, and exit | off |
 | `-q`, `--quiet` | Only warnings and errors | normal |
@@ -183,7 +183,7 @@ llm-custody launch <tool> [options] [-- tool-args...]
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
-| `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads and skillissue may push) | read-only |
+| `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads) | read-only |
 | `--mask GLOB` | Hide files/dirs matching GLOB in the workspace **and in every extra mount** (deleted from a jail copy; shadowed by an empty read-only file/dir where the tree is bound directly, i.e. `--ro-mount` and `--git full`; repeatable) | - |
 | `--max-mem SIZE` | Memory limit for the jail (`512M`, `8G`; suffix K/M/G/T), swap disabled for it too (see [Resource limits](#resource-limits)) | no limit |
 | `--max-cpu PCT` | CPU quota in percent of one core, `200` = two cores | no limit |
@@ -1212,8 +1212,8 @@ bound paths are visible inside it:
 - `~/.gitconfig` and `~/.claude/skills` (the latter one entry at a time,
   into whatever dir the tool reads skills from - `tools.nix` `skillsDir`;
   read-only by default, because skills are the instructions a jailed agent
-  executes and their real host checkout is what the host's own agents and
-  skillissue read, so writes would persist; `--rw-skills` mounts them
+  executes and their real host checkout is what the host's own agents
+  read, so writes would persist; `--rw-skills` mounts them
   read-write instead, opt-in only)
 - Host system and user packages -> `/host-sw`, `/host-user-sw` (read-only,
   NixOS hosts only; on non-NixOS hosts the real `/usr/bin` and `/bin` are
