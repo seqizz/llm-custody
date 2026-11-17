@@ -37,7 +37,9 @@ while [ $# -gt 0 ]; do
       printf 'Usage: llm-custody-sync-back [--prompt|--auto] [--exclude GLOB]... MANIFEST\n'
       printf '  --prompt       review each changed tree and confirm (default)\n'
       printf '  --auto         sync copies without asking; overlays are never\n'
-      printf '                 synced unattended (they exist to be reviewed first)\n'
+      printf '                 synced unattended (they exist to be reviewed first);\n'
+      printf '                 a path also changed on the host keeps the host\n'
+      printf '                 version, the agent one lands beside it as PATH.llm-custody\n'
       printf '  --exclude GLOB never sync paths matching GLOB (repeatable)\n'
       exit 0 ;;
     *) MANIFEST="$1"; shift ;;
@@ -115,12 +117,74 @@ page() {
   fi
   # Unquoted on purpose: $PAGER conventionally carries its own flags
   # ("less -R"), and quoting would look for a binary with a space in it.
+  # stdin stays the pipe carrying the diff: less takes its keys from
+  # /dev/tty on its own, only its output needs pointing at the terminal.
   # shellcheck disable=SC2086
   if [ "$TTY_FD" = "4" ]; then
-    $pager <&4 >&4 2>&4 || true
+    $pager >&4 2>&4 || true
   else
     $pager || true
   fi
+}
+
+# Blob id git would store for $4 at tree path $3, or nothing when $4 does
+# not exist. Regular files are hashed with --path so the copy's
+# .gitattributes filters apply exactly as they did when the baseline was
+# committed; symlinks hash their target text, which is how git stores them.
+# A directory gets a marker that matches no blob id.
+tree_blob() {
+  local copy="$1" track="$2" path="$3" file="$4"
+  if [ -L "$file" ]; then
+    printf '%s' "$(readlink -- "$file")" | GIT_DIR="$track" git hash-object --no-filters --stdin 2>/dev/null || true
+  elif [ -d "$file" ]; then
+    printf 'directory'
+  elif [ -e "$file" ]; then
+    GIT_DIR="$track" GIT_WORK_TREE="$copy" git hash-object --path="$path" -- "$file" 2>/dev/null || true
+  fi
+}
+
+# True when syncing $4 would overwrite or delete a host-side edit: the host
+# file moved away from the last sync point and does not already match the
+# agent's version (both sides making the same change is no conflict). The
+# baseline is the tracking repo's HEAD, which holds what the host had for
+# that path when it was copied in or last synced.
+host_conflict() {
+  local copy="$1" track="$2" host="$3" path="$4" base cur
+  base=$(GIT_DIR="$track" git rev-parse -q --verify "HEAD:$path" 2>/dev/null || true)
+  cur=$(tree_blob "$copy" "$track" "$path" "$host/$path")
+  [ "$base" != "$cur" ] || return 1
+  [ "$cur" != "$(tree_blob "$copy" "$track" "$path" "$copy/$path")" ]
+}
+
+# Asks how to settle one conflicting path and leaves the answer in
+# RESOLUTION (agent|keep). Called directly, never in $(...), so an uppercase
+# answer can set CONFLICT_ALL and settle every later conflict in the same
+# tree without asking again. An empty answer keeps the host version, the
+# choice that loses nothing on the host side.
+resolve_conflict() {
+  local copy="$1" host="$2" path="$3" ans old new
+  if [ -n "$CONFLICT_ALL" ]; then
+    RESOLUTION="$CONFLICT_ALL"
+    return 0
+  fi
+  while true; do
+    ans=$(read_answer "llm-custody: $path changed on both sides: [a]gent / [k]eep on-disk / [d]iff, A/K = all remaining [k] ")
+    case "$ans" in
+      a) RESOLUTION=agent; return 0 ;;
+      A) RESOLUTION=agent; CONFLICT_ALL=agent; return 0 ;;
+      K) RESOLUTION=keep; CONFLICT_ALL=keep; return 0 ;;
+      d|D)
+        # /dev/null stands in for a missing side, so a deletion on either
+        # end still shows as a diff instead of a git error.
+        old="$host/$path"
+        [ -e "$old" ] || [ -L "$old" ] || old=/dev/null
+        new="$copy/$path"
+        [ -e "$new" ] || [ -L "$new" ] || new=/dev/null
+        git --no-pager diff --no-index -- "$old" "$new" 2>/dev/null | page || true
+        continue ;;
+      *) RESOLUTION=keep; return 0 ;;
+    esac
+  done
 }
 
 # --git limited|none: the sandbox worked on a copy, so the real tree is
@@ -128,12 +192,39 @@ page() {
 # dir (never mounted into the sandbox, so the agent cannot rewrite the
 # baseline to smuggle a change past this review) and copy the differences
 # over.
+#
+# The copy is a snapshot, so the host tree can move underneath it. A path
+# the agent changed whose host side also moved since the last sync point is
+# a conflict: with a tty the operator picks per path, without one the host
+# file stays and the agent's version is written next to it as
+# <path>.llm-custody, since the copy is deleted right after an unattended
+# sync and would otherwise take that version with it.
 sync_copy() {
   local copy="$1" track="$2" host="$3" label="$4"
-  local changes count applied=0 skipped=0 code path ans
+  local changes count applied=0 skipped=0 kept=0 code path ans entry
+  local -a entries=() conflict_paths=() sidecars=()
+  local -A conflict=()
   changes=$(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain --untracked-files=all 2>/dev/null || true)
   [ -n "$changes" ] || return 0
   count=$(printf '%s\n' "$changes" | wc -l || true)
+
+  # Read into an array up front: the conflict prompts below may read their
+  # answers from stdin, which must not be the status stream. --no-renames
+  # because the 'd' review stages into the tracking index, and a staged
+  # rename turns into a two-field -z record the loop would misparse.
+  while IFS= read -r -d "" entry; do
+    entries+=("$entry")
+  done < <(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain -z --no-renames --untracked-files=all 2>/dev/null || true)
+  for entry in "${entries[@]+"${entries[@]}"}"; do
+    path="${entry:3}"
+    [ -n "$path" ] || continue
+    path_excluded "$path" && continue
+    if host_conflict "$copy" "$track" "$host" "$path"; then
+      conflict["$path"]=1
+      conflict_paths+=("$path")
+    fi
+  done
+
   printf 'llm-custody: %s changed (host: %s):\n' "$label" "$host" >&2
   # --stat for the tracked side (line counts say far more than a status
   # letter about what is about to be written to the host tree), with the
@@ -146,6 +237,10 @@ sync_copy() {
   printf '%s\n' "$changes" | grep '^??' | head -n 20 >&2 || true
   if [ "$count" -gt 40 ]; then
     printf '          ... (%s paths total)\n' "$count" >&2
+  fi
+  if [ "${#conflict_paths[@]}" -gt 0 ]; then
+    printf 'llm-custody: %s of these also changed on the host since the last sync:\n' "${#conflict_paths[@]}" >&2
+    printf '          %s\n' "${conflict_paths[@]}" | head -n 20 >&2 || true
   fi
 
   if [ "$MODE" = "prompt" ]; then
@@ -170,13 +265,37 @@ sync_copy() {
 
   # -z keeps paths literal (no quoting/escaping of odd names); the status
   # code is the first two chars, the path starts at offset 3.
-  while IFS= read -r -d "" entry; do
+  CONFLICT_ALL=""
+  for entry in "${entries[@]+"${entries[@]}"}"; do
     code="${entry:0:2}"
     path="${entry:3}"
     [ -n "$path" ] || continue
     if path_excluded "$path"; then
       skipped=$((skipped+1))
       continue
+    fi
+    if [ -n "${conflict[$path]+x}" ]; then
+      if [ "$MODE" = "prompt" ]; then
+        resolve_conflict "$copy" "$host" "$path"
+      else
+        RESOLUTION=sidecar
+      fi
+      case "$RESOLUTION" in
+        keep)
+          kept=$((kept+1))
+          continue ;;
+        sidecar)
+          # Nothing to save when the agent's side of the conflict is a
+          # deletion.
+          if [ -e "$copy/$path" ] || [ -L "$copy/$path" ]; then
+            mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
+            if cp -a --reflink=auto -- "$copy/$path" "$host/$path.llm-custody" 2>/dev/null; then
+              sidecars+=("$path.llm-custody")
+            fi
+          fi
+          kept=$((kept+1))
+          continue ;;
+      esac
     fi
     case "$code" in
       *D*)
@@ -186,15 +305,25 @@ sync_copy() {
         cp -a --reflink=auto -- "$copy/$path" "$host/$path" 2>/dev/null || true ;;
     esac
     applied=$((applied+1))
-  done < <(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain -z --untracked-files=all 2>/dev/null || true)
+  done
   # Advance the baseline so a following sync (mid-session syncs are meant to
   # be repeatable) only reports what changed since this one, instead of
-  # re-copying everything already synced.
+  # re-copying everything already synced. Kept conflicts advance with it:
+  # the agent's version counts as seen, and the host side still differs
+  # from the new baseline, so a later agent edit to that path conflicts
+  # again instead of overwriting the kept file.
   GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" add -A >/dev/null 2>&1 || true
   GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" commit -q -m "llm-custody sync point" --allow-empty >/dev/null 2>&1 || true
   printf 'llm-custody: synced %s path(s) back to %s (review with git status/diff)\n' "$applied" "$host" >&2
   if [ "$skipped" -gt 0 ]; then
     printf '          %s path(s) held back by --sync-exclude.\n' "$skipped" >&2
+  fi
+  if [ "$kept" -gt 0 ]; then
+    printf '          %s conflicting path(s) kept their host version.\n' "$kept" >&2
+  fi
+  if [ "${#sidecars[@]}" -gt 0 ]; then
+    printf '          agent versions of those written beside them, review and delete:\n' >&2
+    printf '            %s\n' "${sidecars[@]}" >&2
   fi
   printf '          gitignored paths are not tracked and never sync back.\n' >&2
 }
