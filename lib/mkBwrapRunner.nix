@@ -127,7 +127,8 @@ pkgs.writeShellApplication {
     MAX_MEM=""
     MAX_CPU=""
     MAX_PIDS=""
-    # 0 = warnings and errors only, 1 = normal, 2 = verbose.
+    # 0 = warnings and errors only, 1 = normal, 2 = verbose, 3 = verbose
+    # plus the raw bwrap argument list in --dry-run.
     VERBOSITY=1
     DANGEROUS_FLAG="${dangerousFlag}"
     # Root-level settings.json keys --merge-config never offers, because the
@@ -151,6 +152,9 @@ pkgs.writeShellApplication {
     # Same reason: the name of the toolbox symlink the sandbox resolves
     # through (lib/toolbox.nix currentLink).
     TOOLBOX_CURRENT_LINK="${toolbox.currentLink}"
+    # Same reason: where skills land in the sandbox (tools.nix skillsDir),
+    # so the --dry-run summary can fold their binds into one row.
+    SKILLS_GUEST_DIR="/home/user/${toolDefaults.skillsDir}"
 
     # Colours and the log/vlog/warn/err/hint/die helpers everything the
     # runner says about itself goes through, from lib/log.sh, shared with
@@ -251,7 +255,9 @@ pkgs.writeShellApplication {
       --list-profiles       List the state profiles of this tool and exit
       --list-sessions       List the sessions stored in this profile and exit
       -q, --quiet           Only warnings and errors
-      -v, --verbose         Extra detail about mounts and network setup
+      -v, --verbose         Extra detail about mounts and network setup;
+                             --dry-run adds a bwrap summary. -vv (or -v
+                             twice) adds the raw bwrap argument list
       -c, --continue, -r, --resume [ID]
                              Resume a session; translated to the tool's own
                              resume flags (see tools.nix resumeFlags)
@@ -324,7 +330,11 @@ pkgs.writeShellApplication {
         --list-profiles) LIST_PROFILES=1; shift ;;
         --list-sessions) LIST_SESSIONS=1; shift ;;
         -q|--quiet)      VERBOSITY=0; shift ;;
-        -v|--verbose)    VERBOSITY=2; shift ;;
+        -v|--verbose)
+          # A second -v is the raw bwrap dump in --dry-run.
+          if [ "$VERBOSITY" -ge 2 ]; then VERBOSITY=3; else VERBOSITY=2; fi
+          shift ;;
+        -vv)             VERBOSITY=3; shift ;;
         --dangerous)
           if [ -z "$DANGEROUS_FLAG" ]; then
             die "${name} has no dangerous-mode flag (tools.nix dangerousFlag unset)"
@@ -1000,11 +1010,14 @@ pkgs.writeShellApplication {
     # blobs (git show HEAD:<path>).
     jail_mask_binds() {
       local hostroot="$1" guestroot="$2" label="$3" entry
-      local -a matches
-      mapfile -d "" -t matches < <(jail_mask_matches "$hostroot")
-      [ "''${#matches[@]}" -gt 0 ] || return 0
+      [ "''${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
+      jail_mask_collect "$hostroot"
+      # --dry-run reports every tree's masks together after the session
+      # card (dry_mask_report), so the binds are built here silently.
+      [ "$DRYRUN" = "1" ] || jail_mask_report "$label" "shadowed with empty binds" verbose
+      [ "''${#MASK_HIT_PATH[@]}" -gt 0 ] || return 0
       mkdir -p "$RUNDIR/masks"
-      for entry in "''${matches[@]}"; do
+      for entry in "''${MASK_HIT_PATH[@]}"; do
         MASK_INDEX=$((MASK_INDEX+1))
         if [ -d "$hostroot/$entry" ] && [ ! -L "$hostroot/$entry" ]; then
           mkdir -p "$RUNDIR/masks/$MASK_INDEX"
@@ -1013,8 +1026,7 @@ pkgs.writeShellApplication {
         fi
         BWRAP_ARGS+=(--ro-bind "$RUNDIR/masks/$MASK_INDEX" "$guestroot/$entry")
       done
-      log "--mask: shadowed ''${#matches[@]} path(s) in $label with empty binds"
-      if [ -d "$hostroot/.git" ]; then
+      if [ "$DRYRUN" != "1" ] && [ -d "$hostroot/.git" ]; then
         warn "$label is bound along with its .git, so masked content is still"
         hint "readable from history (git show HEAD:<path>). Only a copy (--git"
         hint "limited|none) removes it outright."
@@ -1683,9 +1695,9 @@ pkgs.writeShellApplication {
       for entry in "$HOME/.claude/skills"/*; do
         [ -e "$entry" ] || continue
         if [ "$RW_SKILLS" = "1" ]; then
-          BWRAP_ARGS+=(--bind "$(readlink -f "$entry")" "/home/user/${toolDefaults.skillsDir}/$(basename "$entry")")
+          BWRAP_ARGS+=(--bind "$(readlink -f "$entry")" "$SKILLS_GUEST_DIR/$(basename "$entry")")
         else
-          BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "/home/user/${toolDefaults.skillsDir}/$(basename "$entry")")
+          BWRAP_ARGS+=(--ro-bind "$(readlink -f "$entry")" "$SKILLS_GUEST_DIR/$(basename "$entry")")
         fi
       done
       if [ "$RW_SKILLS" = "1" ]; then
@@ -1779,6 +1791,12 @@ pkgs.writeShellApplication {
     # chosen by the same flags - an agent let loose in a second checkout
     # can do exactly as much damage there as in the main one, so a direct
     # bind only when --git full explicitly asks for the real tree.
+    #
+    # --dry-run attaches nothing, so it records each mount here for the
+    # mask report after the session card (dry_mask_report).
+    DRY_MOUNT_HOSTS=()
+    DRY_MOUNT_GUESTS=()
+    DRY_MOUNT_MODES=()
     for spec in "''${EXTRA_MOUNTS[@]+"''${EXTRA_MOUNTS[@]}"}"; do
       access="''${spec##*:}"
       paths="''${spec%:*}"
@@ -1820,6 +1838,9 @@ pkgs.writeShellApplication {
       EXTRA_MOUNT_COUNT=$((EXTRA_MOUNT_COUNT+1))
       if [ "$DRYRUN" = "1" ]; then
         log "would mount $hostpath at $guestpath (mode $mmode; nothing copied for --dry-run)"
+        DRY_MOUNT_HOSTS+=("$hostpath")
+        DRY_MOUNT_GUESTS+=("$guestpath")
+        DRY_MOUNT_MODES+=("$mmode")
         continue
       fi
       # --allow-fixed: a guest path outside every dock is still honoured at
@@ -2092,19 +2113,32 @@ pkgs.writeShellApplication {
     # from lib/session-card.sh.
     ${builtins.readFile ./session-card.sh}
 
+    # dry_mask_report and dry_bwrap_summary, the --dry-run report sections,
+    # from lib/dry-run.sh.
+    ${builtins.readFile ./dry-run.sh}
+
     if [ "$DRYRUN" = "1" ]; then
       print_card
+      dry_mask_report
       log "allowed domains:"
       for d in "''${ALLOWED_DOMAINS[@]}" "''${EXTRA_DOMAINS[@]+"''${EXTRA_DOMAINS[@]}"}"; do
         hint "$d"
       done
-      # One argument per line rather than a reconstructed command line: the
-      # point of a dry run is auditing the mounts, and a 60-argument bwrap
-      # invocation on one line is exactly what that cannot be read from.
-      log "bwrap arguments:"
-      for arg in "''${BWRAP_ARGS[@]}"; do
-        hint "$arg"
-      done
+      if [ "$VERBOSITY" -ge 2 ]; then
+        log "bwrap summary (\$RUNDIR = $RUNDIR, ~ = $HOME):"
+        dry_bwrap_summary
+      fi
+      if [ "$VERBOSITY" -ge 3 ]; then
+        # One argument per line rather than a reconstructed command line:
+        # argument order decides which bind shadows which, and a
+        # 60-argument bwrap invocation on one line cannot be read for that.
+        log "bwrap arguments:"
+        for arg in "''${BWRAP_ARGS[@]}"; do
+          hint "$arg"
+        done
+      elif [ "$VERBOSITY" -eq 1 ]; then
+        log "bwrap arguments: -v for a summary, -vv for the raw list"
+      fi
       if [ "''${#SCOPE_PREFIX[@]}" -gt 0 ]; then
         log "resource limit scope (prefixed to the jail command, not checked against systemd for --dry-run):"
         for arg in "''${SCOPE_PREFIX[@]}"; do

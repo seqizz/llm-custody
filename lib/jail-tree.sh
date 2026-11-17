@@ -42,52 +42,87 @@ jail_copy_tree() {
 # masks out of the sync-back diff - copy and tracking baseline agree,
 # so the host tree's own copies are never reported as deletions.
 jail_apply_masks() {
-  local dir="$1" label="$2" removed count
+  local dir="$1" label="$2" path
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
-  # Subshell so the cd and the glob options stay local to the expansion.
-  removed=$(
-    cd "$dir" || exit 0
-    shopt -s nullglob globstar
-    for m in "${MASK_PATTERNS[@]}"; do
-      # shellcheck disable=SC2086
-      for entry in $m; do
-        rm -rf -- "${entry:?mask target empty}" && printf '%s\n' "$entry"
-      done
-    done
-    # A failed rm must not take the whole runner down through errexit:
-    # the subshell's status is the loop's, and the assignment below
-    # propagates it.
-    exit 0
-  )
-  [ -n "$removed" ] || return 0
-  count=$(printf '%s\n' "$removed" | wc -l)
-  log "--mask: removed $count path(s) from $label"
-  while IFS= read -r line; do hint "$line"; done <<< "$removed"
+  jail_mask_collect "$dir"
+  for path in "${MASK_HIT_PATH[@]}"; do
+    # A failed rm must not take the whole runner down through errexit, but
+    # it leaves masked content in the jail, so it is reported.
+    rm -rf -- "$dir/${path:?mask target empty}" || warn "could not remove $path from $label"
+  done
+  jail_mask_report "$label" removed verbose
 }
 
-# The --mask matches of a tree the sandbox sees through a direct bind, as
-# NUL-separated tree-relative paths on stdout. There is no copy to delete
-# from there, so the caller shadows each match with an empty read-only
-# file/dir instead (bwrap binds for the workspace, holder-side binds for an
-# extra mount).
+# Every --mask match under a tree, as two parallel arrays: MASK_HIT_IDX
+# (index into MASK_PATTERNS) and MASK_HIT_PATH (tree-relative path).
+# Globals rather than stdout because callers need both the paths and the
+# pattern behind each one, for the per-pattern report below. A copy is the
+# host tree minus .git, so matching the host tree gives exactly what a copy
+# would lose, which is what lets --dry-run report masks without copying.
 #
-# NUL-delimited: a path with a newline in it would otherwise split into two
-# bogus mask targets.
-jail_mask_matches() {
-  local hostroot="$1" entry
+# NUL-delimited records: a path with a newline in it would otherwise split
+# into two bogus mask targets.
+jail_mask_collect() {
+  local hostroot="$1" rec
+  MASK_HIT_IDX=()
+  MASK_HIT_PATH=()
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
-  (
+  while IFS= read -r -d '' rec; do
+    MASK_HIT_IDX+=("${rec%%$'\t'*}")
+    MASK_HIT_PATH+=("${rec#*$'\t'}")
+  done < <(
+    # Subshell so the cd and the glob options stay local to the expansion.
     cd "$hostroot" || exit 0
     shopt -s nullglob globstar
-    for m in "${MASK_PATTERNS[@]}"; do
+    for i in "${!MASK_PATTERNS[@]}"; do
       # shellcheck disable=SC2086
-      for entry in $m; do
+      for entry in ${MASK_PATTERNS[$i]}; do
         [ -e "$entry" ] || [ -L "$entry" ] || continue
-        printf '%s\0' "$entry"
+        printf '%s\t%s\0' "$i" "$entry"
       done
     done
     exit 0
   )
+}
+
+# Report the last jail_mask_collect for one tree: a summary line with a
+# count per pattern, then (DETAIL "always", or "verbose" under -v) the
+# matched paths grouped by pattern. Patterns with no match stay in the
+# list, since a zero next to a pattern is how a typo in it shows up. Below
+# -v each group stops at 20 paths, so a broad glob over a large tree does
+# not bury the rest of the output.
+jail_mask_report() {
+  local label="$1" what="$2" detail="$3" i j n shown cap=20 counts=""
+  [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
+  [ "$VERBOSITY" -lt 2 ] || cap=0
+  for i in "${!MASK_PATTERNS[@]}"; do
+    n=0
+    for j in "${!MASK_HIT_IDX[@]}"; do
+      if [ "${MASK_HIT_IDX[$j]}" = "$i" ]; then n=$((n+1)); fi
+    done
+    counts="$counts, ${MASK_PATTERNS[$i]}: $n"
+  done
+  log "--mask: $label, ${#MASK_HIT_PATH[@]} path(s) $what (${counts#, })"
+  # hint is not silenced by --quiet, and these lines hang off the log above.
+  [ "$VERBOSITY" -ge 1 ] || return 0
+  if [ "$detail" != "always" ] && [ "$VERBOSITY" -lt 2 ]; then return 0; fi
+  for i in "${!MASK_PATTERNS[@]}"; do
+    hint "${MASK_PATTERNS[$i]}"
+    n=0; shown=0
+    for j in "${!MASK_HIT_IDX[@]}"; do
+      [ "${MASK_HIT_IDX[$j]}" = "$i" ] || continue
+      n=$((n+1))
+      if [ "$cap" -eq 0 ] || [ "$n" -le "$cap" ]; then
+        hint "  ${MASK_HIT_PATH[$j]}"
+        shown=$n
+      fi
+    done
+    if [ "$n" -eq 0 ]; then
+      hint "  (no match)"
+    elif [ "$n" -gt "$shown" ]; then
+      hint "  ... $((n - shown)) more (-v lists all)"
+    fi
+  done
 }
 
 # Re-init a copy as a fresh repo with a single baseline commit, so in-jail

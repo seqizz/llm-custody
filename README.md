@@ -175,11 +175,11 @@ llm-custody launch <tool> [options] [-- tool-args...]
 | `--sync-exclude GLOB` | Never sync paths matching GLOB back to the host tree, in any mode that syncs (repeatable). Matched against tree-relative paths; unlike `--mask`, `*` crosses `/` here, so `*.log` covers every depth | - |
 | `--watch-interval N` | Seconds between unsynced-change checks during the session; 0 disables the watcher (see [Unsynced-change indicator](#unsynced-change-indicator)) | `15` |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
-| `--dry-run` | Resolve everything (mounts, masks, domains, env, bwrap arguments) and print it instead of launching. Starts no network namespace and copies no trees | off |
+| `--dry-run` | Resolve everything and print it instead of launching: the session card, every `--mask` match per tree (first 20 per pattern, all with `-v`), the allowed domains, a grouped bwrap summary with `-v` and the raw bwrap argument list with `-vv`. Starts no network namespace and copies no trees | off |
 | `--list-profiles` | List the state profiles of this tool, with session counts, and exit | off |
 | `--list-sessions` | List the sessions stored in the selected profile, newest first, and exit | off |
 | `-q`, `--quiet` | Only warnings and errors | normal |
-| `-v`, `--verbose` | Extra detail about mounts and network setup | normal |
+| `-v`, `--verbose` | Extra detail about mounts and network setup; `-vv` (or `-v` twice) also prints the raw bwrap arguments in `--dry-run` | normal |
 | `-c`, `--continue` | Resume the most recent session, translated to the tool's own continue flag | - |
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
@@ -698,11 +698,14 @@ denylist, git wrapper) without starting a session:
 nix run .#pi -- --selftest
 ```
 
-See exactly which trees would be mounted where, with the full bwrap
-argument list, without starting anything:
+See exactly which trees would be mounted where and what every `--mask`
+pattern matches in each of them, without starting anything. `-v` adds a
+grouped summary of the bwrap arguments (binds, env, isolation), `-vv` the
+raw argument list in order, which is what decides which bind shadows which:
 
 ```bash
 nix run .#pi -- --mount /srv/data --mask 'secrets/*' --dry-run
+nix run .#pi -- --mount /srv/data --mask 'secrets/*' --dry-run -vv
 ```
 
 List the state profiles of a tool and the sessions inside one:

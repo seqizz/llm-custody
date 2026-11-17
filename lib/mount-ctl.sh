@@ -140,11 +140,12 @@ ovl_escape() {
 # as blobs (git show HEAD:<path>).
 shadow_masks() {
   local hostroot="$1" point="$2" mdir="$3" label="$4" entry n=0
-  local -a matches
-  mapfile -d "" -t matches < <(jail_mask_matches "$hostroot")
-  [ "${#matches[@]}" -gt 0 ] || return 0
+  [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
+  jail_mask_collect "$hostroot"
+  jail_mask_report "$label" "shadowed with empty binds" verbose
+  [ "${#MASK_HIT_PATH[@]}" -gt 0 ] || return 0
   mkdir -p "$mdir"
-  for entry in "${matches[@]}"; do
+  for entry in "${MASK_HIT_PATH[@]}"; do
     n=$((n+1))
     if [ -d "$hostroot/$entry" ] && [ ! -L "$hostroot/$entry" ]; then
       mkdir -p "$mdir/$n"
@@ -154,7 +155,6 @@ shadow_masks() {
     holder mount --bind -o ro "$mdir/$n" "$point/$entry" ||
       warn "could not shadow $entry in $label"
   done
-  log "--mask: shadowed $n path(s) in $label with empty binds"
   if [ -d "$hostroot/.git" ]; then
     warn "$label is bound along with its .git, so masked content is still"
     hint "readable from history (git show HEAD:<path>). Only a copy (mode"

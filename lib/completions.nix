@@ -177,7 +177,7 @@ let
     {
       flag = "--verbose";
       arg = "none";
-      desc = "Extra detail about mounts and network setup";
+      desc = "Extra detail, twice adds the raw bwrap arguments to --dry-run";
     }
     {
       flag = "--help";
