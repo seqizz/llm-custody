@@ -297,6 +297,31 @@ runs - see
 [Live mounts](#live-mounts) - and the client is told where the tree landed
 (`/workspace/2024` here).
 
+The path is a guess: the agent writes it from inside a jail that cannot see
+the host. The operator can mount another one for the same request, with
+`request approve ID --path /real/path` or by typing it at the path question
+of `request answer` (enter keeps the agent's path, a leading `~` is the
+operator's home). An agent with no guess to offer asks by name instead, any
+argument without a slash:
+
+```bash
+custody-request --mount igbackup --reason "Need the igbackup checkout to read its restic wrapper"
+```
+
+```console
+$ llm-custody request list
+ID      REQUEST                         AGE  JAIL               REASON
+41207.3 mount igbackup (no path given)  1m   pi /workspace/foo  Need the igbackup checkout ...
+$ llm-custody request approve 41207.3 --path /devel/ig/igbackup
+```
+
+Such a request cannot be approved without `--path`; it stays queued and the
+approval fails with a message. The override exists only on the control
+socket, so nothing inside a jail can redirect a mount. The client's reply
+carries the host path that was mounted (`host`) next to where it landed
+(`guest`), and the agent is told when the two it asked for and got differ.
+The mount is named after the path that was mounted, not the one asked for.
+
 Approval of a package goes through the same `add` the host CLI uses, so the
 package is installed, leased, and on the PATH by the time the client unblocks. It
 appears in every jail sharing that **toolbox**, which is not the same as
@@ -308,7 +333,11 @@ $XDG_RUNTIME_DIR/llm-custody/brokers/*/meta`.
 
 Denial (`request deny ID [--reason TEXT]`) leaves the profile untouched and
 the client exits 3, which the agent is told to read as a final answer rather
-than a retry. Nothing happens without an operator: there is no auto-approval and
+than a retry. The reason is printed by the agent's `custody-request`
+(`refused - TEXT`), for all three kinds, so a refusal can point at what to
+use instead. In `request answer` it is the rest of the line after the
+denial: `2d already mounted, see /workspace/igaptly` for one row,
+`d not today` for every listed row. Nothing happens without an operator: there is no auto-approval and
 no timer that approves.
 
 A request that nobody answers before `--timeout` exits **4**, not 3, and says
@@ -372,6 +401,7 @@ has stopped the agent until you answer.
 
   type 1-2 to approve, 1d-2d to deny, r to refresh, q to quit
   a approves all (mounts read-only, domains for this session), d denies all
+  text after a denial is the reason the agent gets: 1d not needed, use X
 > 
 ```
 

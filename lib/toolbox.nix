@@ -76,20 +76,38 @@
 
     ## Sandbox: asking for a host directory
 
-    Only the workspace and what the operator mounted are visible here. If the
-    task needs another host path (a sibling checkout, a dataset, a config
-    directory), ask for it the same way:
+    Only the workspace and what the operator mounted are visible here. A
+    directory the operator mounts, at launch or while the session runs,
+    appears under `/workspace` next to the project, named after its last path
+    component (under `/mnt` when the workspace sits at its host path instead
+    of `/workspace`). When the operator says something was mounted, and
+    before asking for a path, list those directories first: the tree may
+    already be there.
+
+    If the task needs another host path (a sibling checkout, a dataset, a
+    config directory), ask for it the same way:
 
         custody-request --mount /absolute/host/path --reason "<why you need it>"
 
-    That blocks like a package request and uses the same exit codes. The
+    The path is your best guess of where the tree lives on the host, and the
+    operator may mount a different path for it. When you know what you need
+    but not where it is, give a name with no slash in it instead and the
+    operator picks the path:
+
+        custody-request --mount igbackup --reason "<what it is and why you need it>"
+
+    Both block like a package request and use the same exit codes. The
     operator decides whether it is attached and how: read-only by default, or
     as a synced copy, or as the real tree. On approval the command prints
-    where the tree landed (under `/workspace` or `/mnt`) and you can use it
-    immediately. Name the path you need, not a mode, and ask for the narrowest
-    directory that covers the task rather than a home directory or a secrets
-    store. If `custody-request` is missing, name the path in your reply
-    instead and carry on with what does not depend on it.
+    which host path was mounted and where it landed, and you can use it
+    immediately. Read that line rather than assuming your guess was taken.
+    Ask for a tree, not a mode, and for the narrowest directory that covers
+    the task rather than a home directory or a secrets store. If
+    `custody-request` is missing, name the path in your reply instead and
+    carry on with what does not depend on it.
+
+    A refusal of any request (exit status 3) can come with a line from the
+    operator saying why, often naming what to use instead. Follow it.
 
     ## Sandbox: asking for a network domain
 

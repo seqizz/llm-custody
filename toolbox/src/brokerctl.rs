@@ -45,9 +45,11 @@ fn kind_of(r: &Json) -> String {
 }
 
 /// How a request reads in a listing: the attribute, `mount PATH` or
-/// `domain NAME`.
+/// `domain NAME`. A mount asked for by name says so, because approving it
+/// takes a path from the operator.
 fn describe(kind: &str, attr: &str) -> String {
     match kind {
+        proto::KIND_MOUNT if proto::is_mount_name(attr) => format!("mount {attr} (no path given)"),
         proto::KIND_MOUNT => format!("mount {attr}"),
         proto::KIND_DOMAIN => format!("domain {attr}"),
         _ => attr.to_string(),
@@ -184,7 +186,7 @@ pub fn requests(layout: &Layout) -> Result<()> {
     for (id, attr, age, jail, reason) in &rows {
         println!("{id:<w_id$}  {attr:<w_attr$}  {age:<w_age$}  {jail:<w_jail$}  {reason}");
     }
-    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|none|overlay, default ro; a domain: --mode session|persist, default session), deny <id> to refuse");
+    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|none|overlay, default ro, --path PATH to mount another host path than the one asked for; a domain: --mode session|persist, default session), deny <id> [--reason TEXT] to refuse");
     Ok(())
 }
 
@@ -231,7 +233,10 @@ fn check(reply: &Json) -> Result<()> {
 /// ignores it for a package and defaults it (read-only, session) when empty.
 /// Which vocabulary applies depends on the request, which only the broker
 /// knows, so this checks for either and the broker checks the right one.
-pub fn approve(layout: &Layout, id: &str, mode: &str) -> Result<()> {
+///
+/// `path` replaces the host path of a mount request (empty keeps the one the
+/// agent asked for); the broker refuses it for any other kind.
+pub fn approve(layout: &Layout, id: &str, mode: &str, path: &str) -> Result<()> {
     if !mode.is_empty()
         && proto::validate_mount_mode(mode).is_err()
         && proto::validate_domain_mode(mode).is_err()
@@ -242,10 +247,14 @@ pub fn approve(layout: &Layout, id: &str, mode: &str) -> Result<()> {
             proto::DOMAIN_MODES.join("|")
         ));
     }
+    if !path.is_empty() {
+        proto::validate_mount_path(path)?;
+    }
     let msg = json::Obj::new()
         .str("op", "approve")
         .str("id", id)
         .str("mode", mode)
+        .str("path", path)
         .finish();
     let reply = dispatch(layout, id, msg)?;
     check(&reply)?;
@@ -256,7 +265,11 @@ pub fn approve(layout: &Layout, id: &str, mode: &str) -> Result<()> {
     if !scope.is_empty() {
         util::note(format!("{attr} allowed for the jail ({scope})"));
     } else if !guest.is_empty() {
-        util::note(format!("{attr} mounted at {guest} ({})", reply.str_field("mode")));
+        let host = match reply.str_field("host") {
+            "" => attr,
+            h => h,
+        };
+        util::note(format!("{host} mounted at {guest} ({})", reply.str_field("mode")));
     } else if commands.is_empty() {
         util::note(format!(
             "{attr} installed (no new commands - already present, or it ships no bin/)"
@@ -282,6 +295,57 @@ pub fn deny(layout: &Layout, id: &str, reason: &str) -> Result<()> {
     check(&reply)?;
     util::note(format!("{} denied, nothing changed", reply.str_field("attr")));
     Ok(())
+}
+
+/// A leading `~` is the operator's home directory, as a shell would have made
+/// it before this program saw the line.
+fn expand_home(path: &str, home: Option<&str>) -> String {
+    match (home, path.strip_prefix('~')) {
+        (Some(home), Some(rest)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{}{rest}", home.trim_end_matches('/'))
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// The path question for a mount approval: which host path to mount for this
+/// request. The agent's path is a guess made from inside the jail, so it is
+/// the default and an empty answer keeps it; a request that carries only a
+/// name has no default and needs one typed. Returns the path to send as the
+/// override (empty = keep the agent's), or `None` when the operator backed
+/// out with `q`.
+fn ask_path(ask: &str) -> Result<Option<String>> {
+    let named = proto::is_mount_name(ask);
+    let home = std::env::var("HOME").ok();
+    loop {
+        let prompt = if named {
+            format!("  host path to mount for \"{ask}\" (q=back): ")
+        } else {
+            format!("  host path [{ask}] (enter keeps it, q=back): ")
+        };
+        let ans = match util::read_path_answer(&prompt)? {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        match ans.as_str() {
+            "q" | "quit" => return Ok(None),
+            "" if named => util::note("this request names no path, type the one to mount"),
+            "" => return Ok(Some(String::new())),
+            typed => {
+                let path = expand_home(typed, home.as_deref());
+                // Completion ends a directory with a slash, and the mount is
+                // named after the last path component.
+                let path = match path.trim_end_matches('/') {
+                    "" => "/".to_string(),
+                    p => p.to_string(),
+                };
+                match proto::validate_mount_path(&path) {
+                    Ok(()) => return Ok(Some(path)),
+                    Err(e) => util::note(e.msg),
+                }
+            }
+        }
+    }
 }
 
 /// The mode question for a mount approval. Empty answer means read-only;
@@ -349,7 +413,7 @@ fn parse_scope(line: &str) -> Option<Option<&'static str>> {
 /// still get their answer.
 pub fn approve_all(layout: &Layout, rows: &[Row]) {
     for r in rows {
-        if let Err(e) = approve(layout, &r.id, "") {
+        if let Err(e) = approve(layout, &r.id, "", "") {
             util::note(e.msg);
         }
     }
@@ -369,10 +433,12 @@ pub fn deny_all(layout: &Layout, rows: &[Row], reason: &str) {
 #[derive(Debug, PartialEq)]
 pub enum Choice {
     Approve(usize),
-    Deny(usize),
+    /// The row, and the operator's reason for the agent (empty for none).
+    Deny(usize, String),
     /// Every row on screen, in one answer.
     ApproveAll,
-    DenyAll,
+    /// With the reason every denied agent is given (empty for none).
+    DenyAll(String),
     Refresh,
     Quit,
     Unknown,
@@ -381,23 +447,38 @@ pub enum Choice {
 /// `3` approves the third row, `3d` denies it, `r` re-reads the queue, an
 /// empty line or `q` leaves. Indexes rather than request ids: an id is a
 /// broker pid and a counter, fine for routing and hopeless to type.
+///
+/// A denial takes the rest of the line as the reason handed to the agent:
+/// `3d already mounted, look in /workspace/igaptly`, or `d not today` for
+/// every row. The refusal is the moment the operator knows why, and an agent
+/// told why can pick another route where a bare "denied" only stops it.
 pub fn parse_choice(line: &str, rows: usize) -> Choice {
-    let line = line.trim().to_ascii_lowercase();
-    match line.as_str() {
-        "" | "q" | "quit" => return Choice::Quit,
-        "r" | "refresh" => return Choice::Refresh,
-        "a" | "all" => return Choice::ApproveAll,
-        "d" | "deny" => return Choice::DenyAll,
+    let line = line.trim();
+    let (head, rest) = match line.split_once(char::is_whitespace) {
+        Some((h, r)) => (h.to_ascii_lowercase(), r.trim()),
+        None => (line.to_ascii_lowercase(), ""),
+    };
+    match head.as_str() {
+        "" | "q" | "quit" if rest.is_empty() => return Choice::Quit,
+        "r" | "refresh" if rest.is_empty() => return Choice::Refresh,
+        "a" | "all" if rest.is_empty() => return Choice::ApproveAll,
+        "d" | "deny" => return Choice::DenyAll(rest.to_string()),
         _ => {}
     }
-    let (digits, deny) = match line.strip_suffix('d') {
-        Some(d) => (d.trim_end(), true),
-        None => (line.as_str(), false),
+    // `3d why` and `3 d why` are the same answer.
+    let (digits, deny, reason) = match head.strip_suffix('d') {
+        Some(d) => (d, true, rest),
+        None => match rest.split_once(char::is_whitespace) {
+            Some((d, why)) if d.eq_ignore_ascii_case("d") => (head.as_str(), true, why.trim()),
+            None if rest.eq_ignore_ascii_case("d") => (head.as_str(), true, ""),
+            _ if rest.is_empty() => (head.as_str(), false, ""),
+            _ => return Choice::Unknown,
+        },
     };
     match digits.parse::<usize>() {
         Ok(n) if n >= 1 && n <= rows => {
             if deny {
-                Choice::Deny(n - 1)
+                Choice::Deny(n - 1, reason.to_string())
             } else {
                 Choice::Approve(n - 1)
             }
@@ -458,6 +539,7 @@ fn render(rows: &[Row], colour: bool) {
     println!(
         "  {dim}a approves all (mounts read-only, domains for this session), d denies all{off}"
     );
+    println!("  {dim}text after a denial is the reason the agent gets: 1d not needed, use X{off}");
 }
 
 /// The interactive half of `requests`: show the queue in this pane and act on
@@ -492,13 +574,21 @@ pub fn answer(layout: &Layout) -> Result<()> {
             // has changed either way, and the operator is probably about to
             // answer the next one.
             Choice::Approve(i) => {
-                // A mount and a domain are the approvals with a second
-                // question in them (mode, scope). Asked here, at the moment
-                // of approving, rather than encoded into the row syntax: the
-                // answer is a decision about this one request, and read-only
-                // or session-only has to stay the answer of least effort.
+                // A mount and a domain are the approvals with further
+                // questions in them (path and mode, scope). Asked here, at
+                // the moment of approving, rather than encoded into the row
+                // syntax: the answer is a decision about this one request,
+                // and the agent's path, read-only and session-only have to
+                // stay the answers of least effort.
+                let mut path = String::new();
                 let asked = match rows[i].kind.as_str() {
-                    proto::KIND_MOUNT => ask_mode(&rows[i].attr)?,
+                    proto::KIND_MOUNT => match ask_path(&rows[i].attr)? {
+                        Some(p) => {
+                            path = p;
+                            ask_mode(if path.is_empty() { &rows[i].attr } else { &path })?
+                        }
+                        None => None,
+                    },
                     proto::KIND_DOMAIN => ask_scope("allow", &rows[i].attr)?,
                     _ => Some(String::new()),
                 };
@@ -506,19 +596,19 @@ pub fn answer(layout: &Layout) -> Result<()> {
                     Some(m) => m,
                     None => continue,
                 };
-                if let Err(e) = approve(layout, &rows[i].id, &mode) {
+                if let Err(e) = approve(layout, &rows[i].id, &mode, &path) {
                     util::note(e.msg);
                 }
             }
-            Choice::Deny(i) => {
-                if let Err(e) = deny(layout, &rows[i].id, "") {
+            Choice::Deny(i, reason) => {
+                if let Err(e) = deny(layout, &rows[i].id, &reason) {
                     util::note(e.msg);
                 }
             }
             Choice::ApproveAll => approve_all(layout, &rows),
-            Choice::DenyAll => deny_all(layout, &rows, ""),
+            Choice::DenyAll(reason) => deny_all(layout, &rows, &reason),
             Choice::Unknown => util::note(format!(
-                "not a choice: {} (want 1-{}, 1d to deny, a for all, d to deny all)",
+                "not a choice: {} (want 1-{}, 1d [reason] to deny, a for all, d [reason] to deny all)",
                 line.trim(),
                 rows.len()
             )),
@@ -540,16 +630,22 @@ domain is added to that jail's network whitelist.
                    [--json] machine-readable, for a terminal integration
   answer           the same queue, interactively: pick a numbered row to
                    approve or deny it without typing a request id (a mount
-                   then asks for its mode, a domain for session or persist)
+                   then asks for its host path and mode, a domain for
+                   session or persist)
                    `a` approves every listed row with the narrowest mode
                    (mount read-only, domain for this session), `d` denies
                    every listed row
+                   text after a denial is the reason the agent is given:
+                   `2d already mounted, see /workspace/x`, `d not today`
   approve ID       grant it and unblock the jail
                    [--mode ro|full|limited|none|overlay] how a mount is
                    attached (default ro), [--mode session|persist] how
                    long a domain stays allowed (default session); ignored
                    for a package
-  deny ID          refuse it [--reason TEXT]
+                   [--path PATH] the host path to mount for a mount
+                   request, replacing the one the agent asked for; needed
+                   when the agent gave only a name
+  deny ID          refuse it [--reason TEXT], the text goes to the agent
 
 --pid restricts all of this to one session's broker.
 "
@@ -584,6 +680,7 @@ fn cmd_requests(tb: &Toolbox, args: &[String]) -> Result<()> {
 fn cmd_approve(tb: &Toolbox, args: &[String]) -> Result<()> {
     let mut id = None;
     let mut mode = String::new();
+    let mut path = String::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -594,13 +691,20 @@ fn cmd_approve(tb: &Toolbox, args: &[String]) -> Result<()> {
                     None => return usage_err("--mode needs a value"),
                 }
             }
+            "--path" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => path = v.clone(),
+                    None => return usage_err("--path needs a host path"),
+                }
+            }
             a if a.starts_with('-') => return usage_err(format!("approve: unknown option: {a}")),
             a => id = Some(a.to_string()),
         }
         i += 1;
     }
     match id {
-        Some(id) => approve(&tb.layout, &id, &mode),
+        Some(id) => approve(&tb.layout, &id, &mode, &path),
         None => usage_err("approve needs a request id - see the requests command"),
     }
 }
@@ -708,21 +812,62 @@ mod tests {
     fn choices_parse() {
         assert_eq!(parse_choice("1", 3), Choice::Approve(0));
         assert_eq!(parse_choice("3", 3), Choice::Approve(2));
-        assert_eq!(parse_choice("2d", 3), Choice::Deny(1));
-        assert_eq!(parse_choice(" 2D \n", 3), Choice::Deny(1));
+        assert_eq!(parse_choice("2d", 3), Choice::Deny(1, String::new()));
+        assert_eq!(parse_choice(" 2D \n", 3), Choice::Deny(1, String::new()));
+        assert_eq!(parse_choice("2 d", 3), Choice::Deny(1, String::new()));
         assert_eq!(parse_choice("", 3), Choice::Quit);
         assert_eq!(parse_choice("q", 3), Choice::Quit);
         assert_eq!(parse_choice("r", 3), Choice::Refresh);
         assert_eq!(parse_choice("a", 3), Choice::ApproveAll);
         assert_eq!(parse_choice(" A ", 3), Choice::ApproveAll);
         assert_eq!(parse_choice("all", 3), Choice::ApproveAll);
-        assert_eq!(parse_choice("d", 3), Choice::DenyAll);
-        assert_eq!(parse_choice("D", 3), Choice::DenyAll);
+        assert_eq!(parse_choice("d", 3), Choice::DenyAll(String::new()));
+        assert_eq!(parse_choice("D", 3), Choice::DenyAll(String::new()));
         // Out of range, zero and nonsense are all the same mistake.
         assert_eq!(parse_choice("0", 3), Choice::Unknown);
         assert_eq!(parse_choice("4", 3), Choice::Unknown);
         assert_eq!(parse_choice("4d", 3), Choice::Unknown);
         assert_eq!(parse_choice("yes", 3), Choice::Unknown);
+    }
+
+    #[test]
+    fn a_denial_carries_its_reason() {
+        // The reason keeps its own case and inner spacing; only the choice
+        // in front of it is case-insensitive.
+        assert_eq!(
+            parse_choice("1d you don't need that, check igaptly", 3),
+            Choice::Deny(0, "you don't need that, check igaptly".to_string())
+        );
+        assert_eq!(
+            parse_choice(" 2D  Use  /workspace/x \n", 3),
+            Choice::Deny(1, "Use  /workspace/x".to_string())
+        );
+        assert_eq!(parse_choice("2 d not now", 3), Choice::Deny(1, "not now".to_string()));
+        assert_eq!(parse_choice("d not today", 3), Choice::DenyAll("not today".to_string()));
+        assert_eq!(parse_choice("deny not today", 3), Choice::DenyAll("not today".to_string()));
+        // Out of range stays a mistake, reason or not.
+        assert_eq!(parse_choice("4d nope", 3), Choice::Unknown);
+        // Trailing text on anything but a denial is not silently dropped.
+        assert_eq!(parse_choice("1 please", 3), Choice::Unknown);
+        assert_eq!(parse_choice("a please", 3), Choice::Unknown);
+        assert_eq!(parse_choice("q now", 3), Choice::Unknown);
+    }
+
+    #[test]
+    fn home_expands_only_as_a_leading_component() {
+        assert_eq!(expand_home("~/src/x", Some("/home/op")), "/home/op/src/x");
+        assert_eq!(expand_home("~", Some("/home/op")), "/home/op");
+        assert_eq!(expand_home("~", Some("/home/op/")), "/home/op");
+        assert_eq!(expand_home("~other/x", Some("/home/op")), "~other/x");
+        assert_eq!(expand_home("/srv/~/x", Some("/home/op")), "/srv/~/x");
+        assert_eq!(expand_home("~/x", None), "~/x");
+    }
+
+    #[test]
+    fn a_named_mount_reads_as_needing_a_path() {
+        assert_eq!(describe(proto::KIND_MOUNT, "/srv/x"), "mount /srv/x");
+        assert_eq!(describe(proto::KIND_MOUNT, "igbackup"), "mount igbackup (no path given)");
+        assert_eq!(describe(proto::KIND_PACKAGE, "igbackup"), "igbackup");
     }
 
     #[test]

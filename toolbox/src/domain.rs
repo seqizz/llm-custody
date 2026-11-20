@@ -364,24 +364,33 @@ fn menu_pending(launcher: &Path, layout: &Layout, colour: bool) -> Result<Next> 
                     Some(m) => m,
                     None => continue,
                 };
-                if let Err(e) = brokerctl::approve(layout, &rows[i].id, &mode) {
+                if let Err(e) = brokerctl::approve(layout, &rows[i].id, &mode, "") {
                     util::note(e.msg);
                 }
             }
-            Choice::Deny(i) => {
-                let reason = match util::read_answer("  reason for the agent (empty for none): ")? {
-                    Some(r) => r,
-                    None => return Ok(Next::Exit),
+            Choice::Deny(i, reason) => {
+                // Asked only when the line did not already carry one.
+                let reason = if !reason.is_empty() {
+                    reason
+                } else {
+                    match util::read_answer("  reason for the agent (empty for none): ")? {
+                        Some(r) => r,
+                        None => return Ok(Next::Exit),
+                    }
                 };
                 if let Err(e) = brokerctl::deny(layout, &rows[i].id, &reason) {
                     util::note(e.msg);
                 }
             }
             Choice::ApproveAll => brokerctl::approve_all(layout, &rows),
-            Choice::DenyAll => {
-                let reason = match util::read_answer("  reason for the agent (empty for none): ")? {
-                    Some(r) => r,
-                    None => return Ok(Next::Exit),
+            Choice::DenyAll(reason) => {
+                let reason = if !reason.is_empty() {
+                    reason
+                } else {
+                    match util::read_answer("  reason for the agent (empty for none): ")? {
+                        Some(r) => r,
+                        None => return Ok(Next::Exit),
+                    }
                 };
                 brokerctl::deny_all(layout, &rows, &reason);
             }

@@ -180,6 +180,42 @@ pub fn validate_mount_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// A mount request that names no path: just what the agent needs (`igbackup`,
+/// `the puppet repo`), for a tree whose host location it cannot know from
+/// inside the jail. Anything without a `/` reads as a name, and the operator
+/// supplies the path when approving. Printable and bounded, since it is shown
+/// in the operator's terminal like a reason.
+pub fn validate_mount_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return fail("empty mount name");
+    }
+    if name.len() > MAX_ATTR {
+        return fail(format!("mount name longer than {MAX_ATTR} characters"));
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return fail("mount name contains control characters");
+    }
+    if name == "." || name == ".." {
+        return fail(format!("not a usable mount name: {name}"));
+    }
+    Ok(())
+}
+
+/// Whether a mount request carries a name instead of a host path.
+pub fn is_mount_name(ask: &str) -> bool {
+    !ask.contains('/')
+}
+
+/// What a jail may put in a mount request: an absolute host path (its best
+/// guess, which the operator can replace when approving) or a bare name.
+pub fn validate_mount_ask(ask: &str) -> Result<()> {
+    if is_mount_name(ask) {
+        validate_mount_name(ask)
+    } else {
+        validate_mount_path(ask)
+    }
+}
+
 /// Only bare nixpkgs attributes are accepted from a jail.
 ///
 /// Not a style preference: a flake reference is a URL, and a URL is a fetch
@@ -302,6 +338,25 @@ mod tests {
         assert!(validate_mount_path(&format!("/{}", "a".repeat(MAX_PATH))).is_err());
         // A dot-dot inside a name is a name, not a traversal.
         assert!(validate_mount_path("/srv/a..b").is_ok());
+    }
+
+    #[test]
+    fn mount_asks() {
+        // A path is held to the path rules, a name to the name rules.
+        assert!(validate_mount_ask("/srv/data").is_ok());
+        assert!(validate_mount_ask("igbackup").is_ok());
+        assert!(validate_mount_ask("the puppet repo").is_ok());
+        assert!(is_mount_name("igbackup"));
+        assert!(!is_mount_name("/srv/data"));
+        // A relative path is neither: it has a slash, so it is not a name.
+        assert!(validate_mount_ask("srv/data").is_err());
+        assert!(validate_mount_ask("~/data").is_err());
+        assert!(validate_mount_ask("/srv/../etc").is_err());
+        assert!(validate_mount_ask("").is_err());
+        assert!(validate_mount_ask("   ").is_err());
+        assert!(validate_mount_ask("..").is_err());
+        assert!(validate_mount_ask("name\n").is_err());
+        assert!(validate_mount_ask(&"a".repeat(MAX_ATTR + 1)).is_err());
     }
 
     #[test]

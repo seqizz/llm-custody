@@ -392,7 +392,14 @@ let
         {
           name = "approve";
           desc = "Approve one request by id";
-          flags = [ (modeFlag "Mount mode to approve a mount request with") ];
+          flags = [
+            (modeFlag "Mount mode to approve a mount request with")
+            {
+              flag = "--path";
+              arg = "file";
+              desc = "Host path to mount in place of the one the agent asked for";
+            }
+          ];
         }
         {
           name = "deny";

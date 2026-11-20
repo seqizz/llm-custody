@@ -3,8 +3,9 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -263,11 +264,50 @@ pub fn read_answer(prompt: &str) -> Result<Option<String>> {
         print!("{prompt}");
         let _ = std::io::stdout().flush();
     }
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line)? == 0 {
+    let mut line = Vec::new();
+    if std::io::stdin().lock().read_until(b'\n', &mut line)? == 0 {
         return Ok(None);
     }
-    Ok(Some(line.trim().to_string()))
+    Ok(Some(decode_answer(&line)))
+}
+
+/// `read -e` is readline: line editing plus filename completion on Tab. The
+/// prompt travels as `$1` and `read -p` prints it literally, so text an agent
+/// chose (the path or name it asked for) is never parsed by the shell. `read`
+/// writes prompt and echo to the terminal on stderr, which leaves stdout free
+/// to carry the answer back. Without `-r`, `read` resolves the backslashes
+/// completion puts in front of spaces.
+const READLINE_SCRIPT: &str = r#"read -e -p "$1" line 1>&2 || exit 1; printf %s "$line""#;
+
+/// `read_answer` for a host path, with Tab completing file names. The editing
+/// is bash's, resolved from PATH like the host's nix; a pipe, or a host
+/// without bash, gets the plain reader.
+pub fn read_path_answer(prompt: &str) -> Result<Option<String>> {
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return read_answer(prompt);
+    }
+    let out = Command::new("bash")
+        .args(["-c", READLINE_SCRIPT, "bash", prompt])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(Some(decode_answer(&o.stdout))),
+        // End of input (Ctrl-D on an empty line) leaves the menu, as it does
+        // for `read_answer`.
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => read_answer(prompt),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A typed line as text. Bytes that are not UTF-8 become U+FFFD: a terminal
+/// can deliver half a character (a backspace over a multi-byte one on a tty
+/// without IUTF8 erases a single byte), and one such byte must cost the
+/// operator a character of the answer, never the menu they are in.
+fn decode_answer(line: &[u8]) -> String {
+    String::from_utf8_lossy(line).trim().to_string()
 }
 
 /// Held, for its whole body, by every test that writes an executable or
@@ -289,6 +329,15 @@ pub fn exec_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_survives_bytes_that_are_not_utf8() {
+        assert_eq!(decode_answer(b" 1d let's test \n"), "1d let's test");
+        assert_eq!(decode_answer("1d \u{2019}s\n".as_bytes()), "1d \u{2019}s");
+        // The first two bytes of a three-byte character, as left behind by a
+        // single-byte erase.
+        assert_eq!(decode_answer(b"1d let\xe2\x80s\n"), "1d let\u{fffd}s");
+    }
 
     #[test]
     fn base64_matches_rfc4648() {

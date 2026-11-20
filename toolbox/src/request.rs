@@ -1,7 +1,7 @@
 //! `custody-request`: the jail-side entry point.
 //!
 //! Reached inside the sandbox as `custody-request <attr> [--reason TEXT]`,
-//! `custody-request --mount <path> [--reason TEXT]` or
+//! `custody-request --mount <path|name> [--reason TEXT]` or
 //! `custody-request --domain <name> [--reason TEXT]`, which is the same binary
 //! under a different name. It sends one bounded message per attribute, path
 //! or domain to the broker socket bound into the jail and waits for the
@@ -28,7 +28,7 @@ pub fn usage() {
     print!(
         "\
 Usage: custody-request <nixpkgs-attr>... [--reason TEXT]
-       custody-request --mount <host-path>... [--reason TEXT]
+       custody-request --mount <host-path|name>... [--reason TEXT]
        custody-request --domain <name>... [--reason TEXT]
 
 Ask the operator of this sandbox to add a package to the toolbox, which is
@@ -36,9 +36,13 @@ the shared profile on this jail's PATH, to attach a host directory to this
 jail, or to let this jail reach a domain its network filter blocks. Blocks
 until the request is answered.
 
-  --mount PATH    ask for a host path instead of a package (repeatable). The
-                  operator decides how it is attached - read-only, a synced
-                  copy, or the real tree - and the answer names where it is
+  --mount PATH    ask for a host path instead of a package (repeatable). PATH
+                  is a best guess: the operator can mount a different path
+                  for it, and decides how it is attached - read-only, a
+                  synced copy, or the real tree. The answer names what was
+                  mounted and where it is
+  --mount NAME    the same with no path to guess: a bare name (no slash) for
+                  what is needed, and the operator picks the path
   --domain NAME   ask for a blocked domain instead of a package (repeatable).
                   A blocked name resolves to 0.0.0.0 or fails to connect.
                   Fails at once, exit 1, when this jail has no network filter
@@ -49,7 +53,8 @@ Exit status: 0 approved, {denied} denied, {unanswered} nobody answered.
 
 Only bare nixpkgs attribute names are accepted - `ripgrep`, `python3Packages.black`.
 Flake references are refused: choosing a flake to fetch is the operator's call.
-Mount paths must be absolute. Domains are plain host names such as
+Mount paths must be absolute; a mount argument without a slash is a name.
+Domains are plain host names such as
 registry.npmjs.org: no wildcard, no IP address, no trailing dot.
 ",
         sock = proto::JAIL_SOCKET_PATH,
@@ -114,7 +119,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     for (kind, name) in wants.iter_mut() {
         match *kind {
-            proto::KIND_MOUNT => proto::validate_mount_path(name)?,
+            proto::KIND_MOUNT => proto::validate_mount_ask(name)?,
             // Sent in the normalized form, so the operator approves exactly
             // the name the whitelist will hold.
             proto::KIND_DOMAIN => *name = proto::validate_domain(name)?,
@@ -214,9 +219,14 @@ fn one(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<()> {
             proto::STATUS_OK => {
                 let commands = msg.str_field("commands");
                 let guest = msg.str_field("guest");
+                let host = msg.str_field("host");
                 let scope = msg.str_field("scope");
                 if !scope.is_empty() {
                     say(format!("{attr}: approved, reachable now ({scope})"));
+                } else if !guest.is_empty() && !host.is_empty() && host != attr {
+                    // The operator answered with a path of their own, so the
+                    // one asked for is not what is behind the mount.
+                    say(format!("{attr}: approved, the operator mounted {host} at {guest}"));
                 } else if !guest.is_empty() {
                     say(format!("{attr}: approved, mounted at {guest}"));
                 } else if commands.is_empty() {

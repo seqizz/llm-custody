@@ -63,8 +63,9 @@ enum Done {
     /// The commands the package put on the jail's PATH; empty when it was
     /// already installed or ships no bin/.
     Package { commands: Vec<String> },
-    /// Where the tree was attached inside the jail, and in which mode.
-    Mount { guest: String, mode: String },
+    /// Where the tree was attached inside the jail, which host path it is
+    /// (the operator may have replaced the one asked for), and in which mode.
+    Mount { guest: String, host: String, mode: String },
     /// How long the domain stays allowed: `session` or `persist`.
     Domain { scope: String },
 }
@@ -79,10 +80,12 @@ impl Done {
         match self {
             Done::Package { commands } if commands.is_empty() && !for_operator => Vec::new(),
             Done::Package { commands } => vec![("commands", commands.join(" "))],
-            Done::Mount { guest, mode } if for_operator => {
-                vec![("guest", guest.clone()), ("mode", mode.clone())]
+            Done::Mount { guest, host, mode } if for_operator => {
+                vec![("guest", guest.clone()), ("host", host.clone()), ("mode", mode.clone())]
             }
-            Done::Mount { guest, .. } => vec![("guest", guest.clone())],
+            Done::Mount { guest, host, .. } => {
+                vec![("guest", guest.clone()), ("host", host.clone())]
+            }
             Done::Domain { scope } => vec![("scope", scope.clone())],
         }
     }
@@ -668,7 +671,7 @@ impl Broker {
         let reason = msg.str_field("reason").trim().to_string();
         match kind.as_str() {
             proto::KIND_PACKAGE => proto::validate_attr(&attr)?,
-            proto::KIND_MOUNT => proto::validate_mount_path(&attr)?,
+            proto::KIND_MOUNT => proto::validate_mount_ask(&attr)?,
             proto::KIND_DOMAIN => attr = proto::validate_domain(&attr)?,
             other => return fail(format!("unknown request kind: {other}")),
         }
@@ -848,7 +851,11 @@ impl Broker {
                 proto::write_message(stream, &reply)
             }
             "approve" => {
-                let reply = self.approve(msg.str_field("id"), msg.str_field("mode"))?;
+                let reply = self.approve(
+                    msg.str_field("id"),
+                    msg.str_field("mode"),
+                    msg.str_field("path"),
+                )?;
                 proto::write_message(stream, &reply)
             }
             "deny" => {
@@ -897,11 +904,17 @@ impl Broker {
     /// chose (`mode`; empty means read-only), and a domain request runs the
     /// session's domain launcher (`mode` is `session` or `persist`, empty
     /// means `session`).
-    fn approve(&self, id: &str, mode: &str) -> Result<String> {
+    ///
+    /// `path` is the operator's own host path for a mount request, replacing
+    /// the one the agent asked for; empty keeps the agent's. The agent names
+    /// a path from inside a jail that cannot see the host, so its path is a
+    /// guess, and a request that carries only a name has none at all.
+    fn approve(&self, id: &str, mode: &str, path: &str) -> Result<String> {
         // Checked before the request leaves the queue: a mount or domain
-        // nobody can perform, or a mode that does not fit the request, should
-        // leave it listed rather than be consumed by a failed approval.
-        let (kind, launcher, mode) = {
+        // nobody can perform, or a mode or path that does not fit the
+        // request, should leave it listed rather than be consumed by a
+        // failed approval.
+        let (kind, launcher, mode, host) = {
             let pending = self.pending.lock().unwrap();
             let p = match pending.get(id) {
                 None => return fail(format!("no pending request with id {id}")),
@@ -911,8 +924,19 @@ impl Broker {
                 proto::KIND_MOUNT => {
                     let mode = if mode.is_empty() { proto::DEFAULT_MOUNT_MODE } else { mode };
                     proto::validate_mount_mode(mode)?;
+                    let host = if !path.is_empty() {
+                        proto::validate_mount_path(path)?;
+                        path.to_string()
+                    } else if proto::is_mount_name(&p.attr) {
+                        return fail(format!(
+                            "this request names no host path ({}), approve it with one: --path PATH",
+                            p.attr
+                        ));
+                    } else {
+                        p.attr.clone()
+                    };
                     match &self.mount_cmd {
-                        Some(l) => (p.kind.clone(), Some(l.clone()), mode),
+                        Some(l) => (p.kind.clone(), Some(l.clone()), mode, host),
                         None => {
                             return fail(
                                 "this jail was started without a mount launcher, so the request \
@@ -924,8 +948,11 @@ impl Broker {
                 proto::KIND_DOMAIN => {
                     let mode = if mode.is_empty() { proto::DEFAULT_DOMAIN_MODE } else { mode };
                     proto::validate_domain_mode(mode)?;
+                    if !path.is_empty() {
+                        return fail("a path only applies to a mount request");
+                    }
                     match &self.domain_cmd {
-                        Some(l) => (p.kind.clone(), Some(l.clone()), mode),
+                        Some(l) => (p.kind.clone(), Some(l.clone()), mode, String::new()),
                         // The request socket already refuses a domain request
                         // in this case; kept as a check rather than an assert
                         // so a broker bug cannot turn into a panic.
@@ -938,7 +965,12 @@ impl Broker {
                     }
                 }
                 // The mode means nothing for a package.
-                _ => (p.kind.clone(), None, ""),
+                _ => {
+                    if !path.is_empty() {
+                        return fail("a path only applies to a mount request");
+                    }
+                    (p.kind.clone(), None, "", String::new())
+                }
             }
         };
         // Taken out of the map before the install so a second `approve` of the
@@ -962,9 +994,15 @@ impl Broker {
                 run_domain(launcher, mode == "persist", &p.attr).map(|scope| Done::Domain { scope })
             }
             (_, Some(launcher)) => {
-                util::note(format!("request {id}: approved, mounting {} ({mode})", p.attr));
-                run_mount(launcher, mode, &p.attr)
-                    .map(|guest| Done::Mount { guest, mode: mode.to_string() })
+                util::note(format!(
+                    "request {id}: approved, mounting {host} for {} ({mode})",
+                    p.attr
+                ));
+                run_mount(launcher, mode, &host).map(|guest| Done::Mount {
+                    guest,
+                    host: host.clone(),
+                    mode: mode.to_string(),
+                })
             }
             (_, None) => {
                 util::note(format!("request {id}: approved, installing {}", p.attr));
@@ -1263,11 +1301,24 @@ mod tests {
         assert!(none.fields(false).is_empty());
         assert_eq!(none.fields(true), vec![("commands", String::new())]);
 
-        let mount = Done::Mount { guest: "/mnt/x".to_string(), mode: "ro".to_string() };
-        assert_eq!(mount.fields(false), vec![("guest", "/mnt/x".to_string())]);
+        let mount = Done::Mount {
+            guest: "/mnt/x".to_string(),
+            host: "/srv/x".to_string(),
+            mode: "ro".to_string(),
+        };
+        // The host path goes to the client too: it may not be the one asked
+        // for, and the agent has to know what is behind the mount.
+        assert_eq!(
+            mount.fields(false),
+            vec![("guest", "/mnt/x".to_string()), ("host", "/srv/x".to_string())]
+        );
         assert_eq!(
             mount.fields(true),
-            vec![("guest", "/mnt/x".to_string()), ("mode", "ro".to_string())]
+            vec![
+                ("guest", "/mnt/x".to_string()),
+                ("host", "/srv/x".to_string()),
+                ("mode", "ro".to_string())
+            ]
         );
 
         let domain = Done::Domain { scope: "session".to_string() };
