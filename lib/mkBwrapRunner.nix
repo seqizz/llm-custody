@@ -822,6 +822,7 @@ pkgs.writeShellApplication {
       # clearing emission further down, or run its git against trees the
       # sync-back is in the middle of.
       [ -n "$DIRTY_PID" ] && kill "$DIRTY_PID" 2>/dev/null || true
+      rm -f "$RUNDIR/dirty.pid"
       collect_net_stats
       [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null || true
       # The pid file first: the domain controller restarts dnsmasq on every
@@ -2015,9 +2016,14 @@ pkgs.writeShellApplication {
       for glob in "''${SYNC_EXCLUDES[@]+"''${SYNC_EXCLUDES[@]}"}"; do
         SYNC_EXCLUDE_LITERAL="$SYNC_EXCLUDE_LITERAL --exclude $(printf '%q' "$glob")"
       done
-      printf '#!%s\nexec %s --prompt%s %s "$@"\n' \
+      printf '#!%s\n%s --prompt%s %s "$@"\n' \
         "${pkgs.bash}/bin/sh" "${syncBack}" "$SYNC_EXCLUDE_LITERAL" \
         "$(printf '%q' "$SYNC_MANIFEST")" > "$RUNDIR/sync"
+      # Wake the dirty watcher once the sync is done, so the unsynced
+      # count is recounted at once (see start_dirty_watcher). The pid file
+      # is absent with --watch-interval 0, and the kill then fails quietly.
+      printf "rc=\$?\nkill -USR1 \"\$(cat %s 2>/dev/null)\" 2>/dev/null\nexit \"\$rc\"\n" \
+        "$(printf '%q' "$RUNDIR/dirty.pid")" >> "$RUNDIR/sync"
       chmod +x "$RUNDIR/sync"
 
       # Stable handles for anything that wants to find the live session
