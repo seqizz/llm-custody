@@ -34,14 +34,14 @@ pkgs.writeText "llm-custody-selftest.sh" ''
     echo "  git: $(git --version 2>&1)"
     hp=$(git config --get core.hooksPath 2>/dev/null || true)
     echo "  forced core.hooksPath: $hp"
-    # --git limited/none must not leak host history into the jail: 'limited'
-    # gets exactly one (baseline) commit, 'none' gets no repo at all.
-    case "$SELFTEST_GITMODE" in
+    # A copied workspace must not leak host history into the jail: 'limited'
+    # gets exactly one (baseline) commit, 'nogit' gets no repo at all.
+    case "$SELFTEST_PWDMODE" in
       limited)
         if [ -d .git ]; then
           depth=$(git rev-list --count HEAD 2>/dev/null || echo 0)
           if [ "$depth" != "1" ]; then
-            echo "FAIL: --git limited workspace has $depth commits, expected 1"
+            echo "FAIL: --pwd-limited workspace has $depth commits, expected 1"
             exit 1
           fi
           echo "OK: jail repo history is baseline-only (1 commit)"
@@ -49,14 +49,14 @@ pkgs.writeText "llm-custody-selftest.sh" ''
           echo "SKIP: host workspace is not a git repo"
         fi
         ;;
-      none)
+      nogit)
         if [ -e .git ]; then
-          echo "FAIL: --git none workspace still has a .git"
+          echo "FAIL: --pwd-nogit workspace still has a .git"
           exit 1
         fi
         echo "OK: no repo in the jail workspace"
         ;;
-      *) echo "  --git full: real host repo including history is mounted" ;;
+      *) echo "  --pwd-$SELFTEST_PWDMODE: real host repo including history is mounted" ;;
     esac
   else
     echo "SKIP: git not in jail PATH"

@@ -186,7 +186,7 @@ pub fn requests(layout: &Layout) -> Result<()> {
     for (id, attr, age, jail, reason) in &rows {
         println!("{id:<w_id$}  {attr:<w_attr$}  {age:<w_age$}  {jail:<w_jail$}  {reason}");
     }
-    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|none|overlay, default ro, --path PATH to mount another host path than the one asked for; a domain: --mode session|persist, default session), deny <id> [--reason TEXT] to refuse");
+    util::note("approve <id> to grant it (a mount: --mode ro|full|limited|nogit|overlay, default ro, --path PATH to mount another host path than the one asked for; a domain: --mode session|persist, default session), deny <id> [--reason TEXT] to refuse");
     Ok(())
 }
 
@@ -353,7 +353,7 @@ fn ask_path(ask: &str) -> Result<Option<String>> {
 fn ask_mode(path: &str) -> Result<Option<String>> {
     loop {
         let prompt = format!(
-            "  mode for {path} [{}] (ro=read-only, full=real tree rw, limited/none=synced copy, overlay=cow; q=back): ",
+            "  mode for {path} [{}] (ro=read-only, full=real tree rw, limited/nogit=synced copy, overlay=cow; q=back): ",
             proto::DEFAULT_MOUNT_MODE
         );
         let ans = match util::read_answer(&prompt)? {
@@ -638,7 +638,7 @@ domain is added to that jail's network whitelist.
                    text after a denial is the reason the agent is given:
                    `2d already mounted, see /workspace/x`, `d not today`
   approve ID       grant it and unblock the jail
-                   [--mode ro|full|limited|none|overlay] how a mount is
+                   [--mode ro|full|limited|nogit|overlay] how a mount is
                    attached (default ro), [--mode session|persist] how
                    long a domain stays allowed (default session); ignored
                    for a package

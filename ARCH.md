@@ -129,13 +129,12 @@ llm-custody launch <tool> [options] [-- tool-args...]
 | `--toolbox-dir PATH` | Operator package profile, bound read-only at `/toolbox` and prepended to the jail's PATH (see [Providing packages](#providing-packages)) | `--state-dir/toolbox` |
 | `--same-path` | Mount the workspace and every `--mount` at their host paths instead of under `/workspace` | off |
 | `--tmpdir PATH` | Directory to use for runtime data | `${TMPDIR:-/tmp}` |
-| `--mount HOSTPATH[:GUESTPATH]` | Extra read-write mount (repeatable). Isolated like the workspace: copy + sync-back under `--git limited/none`, copy-on-write with `--overlay-workspace`, real tree with `--git full`. A single file is always bound directly. Detachable while the session runs when GUESTPATH is directly under `/workspace` or `/mnt`, see [Live mounts](#live-mounts) | `/workspace/<basename HOSTPATH>` |
-| `--ro-mount HOSTPATH[:GUESTPATH]` | Extra read-only mount (repeatable) | `/workspace/<basename HOSTPATH>` |
+| `--mount-MODE HOSTPATH[:GUESTPATH]` | Extra mount (repeatable), MODE one of `ro`, `limited`, `nogit`, `overlay`, `full` (see [Tree modes](#tree-modes)). Every mount has its own mode, independent of the launch directory. A single file is always bound directly. Detachable while the session runs when GUESTPATH is directly under `/workspace` or `/mnt`, see [Live mounts](#live-mounts) | `/workspace/<basename HOSTPATH>` |
+| `--mount HOSTPATH[:GUESTPATH]` | Same as `--mount-limited` | `/workspace/<basename HOSTPATH>` |
 | `--allow-domain DOMAIN` | Add domain to network whitelist (repeatable) | tool defaults |
 | `--env KEY=VAL` | Pass environment variable into the sandbox (repeatable) | - |
 | `--x11` | Allow X11/Wayland clipboard access; without it, display vars are stripped so terminals use OSC 52 | off |
-| `--git full\|limited\|none` | How much of the repo the jail sees: `limited` = copy of the working tree as a fresh single-commit repo (no host history), `none` = same copy without a repo, `full` = the real tree including `.git` | `limited` |
-| `--overlay-workspace` | Mount the workspace and every rw `--mount` copy-on-write; edits sync back to the real trees only on explicit confirmation (needs `--git full`) | off |
+| `--pwd-MODE` | How the jail sees the launch directory, same five modes: `--pwd-ro`, `--pwd-limited`, `--pwd-nogit`, `--pwd-overlay`, `--pwd-full` (see [Tree modes](#tree-modes)) | `--pwd-limited` |
 | `--sync-exclude GLOB` | Never sync paths matching GLOB back to the host tree, in any mode that syncs (repeatable). Matched against tree-relative paths; unlike `--mask`, `*` crosses `/` here, so `*.log` covers every depth | - |
 | `--watch-interval N` | Seconds between unsynced-change checks during the session; 0 disables the watcher (see [Unsynced-change indicator](#unsynced-change-indicator)) | `15` |
 | `--selftest` | Run a sandbox self-check (full chain incl. netns, seccomp and the git wrapper) and exit; no in-jail `/login` needed | off |
@@ -148,7 +147,7 @@ llm-custody launch <tool> [options] [-- tool-args...]
 | `-r`, `--resume [ID]` | Open the tool's session picker, or target a specific session id directly | - |
 | `--dangerous` | Pass the tool's own skip-all-permission-prompts flag (claude: `--dangerously-skip-permissions`; errors out for a tool that has none) | off |
 | `--rw-skills` | Mount skills read-write instead of read-only (only for deliberate in-jail skill maintenance - an agent can edit files the host reads) | read-only |
-| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace **and in every extra mount** (deleted from a jail copy; shadowed by an empty read-only file/dir where the tree is bound directly, i.e. `--ro-mount` and `--git full`; repeatable) | - |
+| `--mask GLOB` | Hide files/dirs matching GLOB in the workspace **and in every extra mount** (deleted from a jail copy; shadowed by an empty read-only file/dir where the real tree is bound, i.e. modes `ro`, `overlay` and `full`; repeatable) | - |
 | `--max-mem SIZE` | Memory limit for the jail (`512M`, `8G`; suffix K/M/G/T), swap disabled for it too (see [Resource limits](#resource-limits)) | no limit |
 | `--max-cpu PCT` | CPU quota in percent of one core, `200` = two cores | no limit |
 | `--max-pids N` | Maximum number of tasks (processes and threads) in the jail | no limit |
@@ -290,7 +289,7 @@ $ llm-custody request approve 41207.2 --mode ro
 ```
 
 The agent names a path and a reason, nothing else; how the tree is attached
-is the operator's choice at approval (`--mode ro|full|limited|none|overlay`,
+is the operator's choice at approval (`--mode ro|full|limited|nogit|overlay`,
 default read-only, and the interactive `request answer` asks for it).
 Approval runs the session's own mount launcher, the same one a keybinding
 runs - see
@@ -666,7 +665,7 @@ git-over-SSH needs the keys where ssh looks for them, in the sandbox's own
 `$HOME`:
 
 ```bash
-nix run .#pi -- --ro-mount ~/.ssh:/home/user/.ssh -- -p "Push the changes"
+nix run .#pi -- --mount-ro ~/.ssh:/home/user/.ssh -- -p "Push the changes"
 ```
 
 Allow access to additional domains (e.g. for package installs or git cloning):
@@ -729,8 +728,8 @@ future tool with different flag names just declares its own there.
 ### Live mounts
 
 A session's extra mounts are not fixed at launch. Any tree whose guest path
-is directly under `/workspace` or `/mnt` (which is every `--mount` and
-`--ro-mount` without an explicit target) can be detached while the agent
+is directly under `/workspace` or `/mnt` (which is every `--mount-MODE`
+without an explicit target) can be detached while the agent
 runs, and more can be attached there, by the operator from a second
 terminal or by the agent asking through `custody-request --mount` and the
 operator approving. The CLI parameters are unchanged; what changed is
@@ -739,14 +738,14 @@ controller.
 
 ```bash
 llm-custody mount add /srv/datasets/2024                     # read-only, at /workspace/2024
-llm-custody mount add --mode limited /devel/other-checkout   # synced copy, like --git limited
+llm-custody mount add --mode limited /devel/other-checkout   # synced copy, like --mount-limited
 llm-custody mount add --mode full --guest /mnt/scratch /tmp/scratch
 llm-custody mount list
 llm-custody mount remove 2024                                # by name or by guest path
 ```
 
-`add` takes the same modes the workspace has (`ro`, `full`, `limited`,
-`none`, `overlay`; `copy` is an alias for `limited`), defaulting to
+`add` takes the same modes as the launch flags (`ro`, `full`, `limited`,
+`nogit`, `overlay`; `copy` is an alias for `limited`), defaulting to
 read-only. A copy or overlay mount joins the session's sync manifest the
 moment it is attached, so the dirty indicator counts it, `llm-custody sync`
 folds it back, and the exit trap reviews it like one from launch. `remove`
@@ -789,8 +788,8 @@ umount to reach. And detaching a tree something in the jail still has open
 (a shell with its cwd inside is enough) falls back to a lazy umount: the
 mount is gone from the jail's view, and that process keeps a dangling cwd.
 
-Mode `full` on a live mount is the same host-mutation surface `--git
-full` is for the workspace, minus the safety snapshot - the controller
+Mode `full` on a mount is the same host-mutation surface `--pwd-full`
+is for the workspace, minus the safety snapshot - the controller
 binds `.git/hooks` read-only on top and in-jail git keeps its forced
 `core.hooksPath`, but the tree is the real one. Prefer `limited` unless the
 agent needs to see the host's edits as they happen.
@@ -855,9 +854,29 @@ The launcher is published as the `llm_custody_domain` user var and as
 `$XDG_RUNTIME_DIR/llm-custody/<pid>.domain` / `current.domain`, all only
 when the network filter is on.
 
-### Repo history exposure (`--git`)
+### Tree modes
 
-By default (`--git limited`) the sandbox does **not** see your `.git`. The
+Every tree the jail sees has a mode: the launch directory through
+`--pwd-MODE`, each extra mount through `--mount-MODE PATH`, a live mount
+through `mount add --mode MODE`. One vocabulary, and no tree inherits the
+mode of another.
+
+| | `ro` | `limited` | `nogit` | `overlay` | `full` |
+|---|---|---|---|---|---|
+| Jail sees | real tree, read-only | copy | copy | real tree, copy-on-write | real tree, read-write |
+| Writes land | nowhere | in the copy | in the copy | in an upper layer | on the host, at once |
+| Host `.git` visible | yes | no, fresh repo with one baseline commit | no, and no repo | yes | yes (`.git/hooks` read-only) |
+| Host edits reach the jail | yes | no (snapshot) | no (snapshot) | not reliably | yes |
+| Sync-back | none | prompted on a tty, automatic without one | same as `limited` | only on explicit confirmation, never unattended | none needed |
+| `--mask` | shadowed | deleted | deleted | shadowed | shadowed |
+| Space under `--tmpdir` | none | full copy | full copy | changed files | none |
+
+`--pwd-limited` is the default for the launch directory and plain `--mount`
+is `--mount-limited`.
+
+### Repo history exposure
+
+By default (`--pwd-limited`) the sandbox does **not** see your `.git`. The
 working tree is copied into the runtime dir, masked paths are deleted from
 the copy, and the copy is re-initialized as a fresh repo with a single
 baseline commit (same branch name as the host checkout, tagged
@@ -871,9 +890,10 @@ straight out of the packfile. Partial or sparse clones do not fix this
 - the objects are still there or still fetchable).
 
 ```bash
-nix run .#pi -- --git limited --mask '**/*[Hh]iera*'   # default mode, masks really gone
-nix run .#pi -- --git none                              # copy, no repo at all
-nix run .#pi -- --git full                              # old behaviour: real tree + real .git
+nix run .#pi -- --mask '**/*[Hh]iera*'   # default --pwd-limited, masks really gone
+nix run .#pi -- --pwd-nogit              # copy, no repo at all
+nix run .#pi -- --pwd-full               # real tree + real .git
+nix run .#pi -- --pwd-ro                 # real tree + real .git, nothing writable
 ```
 
 Changes made in the copy are synced back to the real tree at exit: on a tty
@@ -881,31 +901,30 @@ you get the change list and a y/N prompt, without one (e.g. `-p "..."`) the
 sync happens automatically, which is what a direct workspace bind did
 anyway. Change detection uses a separate git dir under the runtime dir that
 is never mounted into the sandbox, so an agent cannot rewrite the baseline
-to smuggle an edit past the review. The same applies to every read-write
-`--mount` (see [Syncing changes back](#syncing-changes-back)), and it does
+to smuggle an edit past the review. The same applies to every copied
+mount (see [Syncing changes back](#syncing-changes-back)), and it does
 not have to wait for exit - see
 [Mid-session sync](#mid-session-sync).
 
 Trade-offs:
 
 - The copy costs disk and time proportional to the working tree, and every
-  read-write `--mount` adds its own. They land under `--tmpdir` (default
+  copied mount adds its own. They land under `--tmpdir` (default
   `/tmp`, which is tmpfs on NixOS - point `--tmpdir` at real disk for big
   repos). `cp --reflink=auto` makes them near free on btrfs/xfs.
 - A copy is a snapshot: edits you make on the host during the run do not
-  reach the jail. `--git full` is the mode for live two-way editing.
+  reach the jail. `full` is the mode for live two-way editing.
 - Gitignored paths are copied into the jail but not tracked, so changes to
   them never sync back.
 - No history in the jail means no `git log`, `git blame`, rebase or
-  branch-comparison work. Use `--git full` for those.
-- `--overlay-workspace` only applies to `--git full`.
+  branch-comparison work. Use `ro`, `overlay` or `full` for those.
 
 Work on a repo without letting the agent's edits touch the real tree until
 you confirm - every write goes to a copy-on-write overlay, and on exit you
 are asked whether to sync (a subset of) the changes back:
 
 ```bash
-cd ~/devel/some-project && nix run .#pi -- --git full --overlay-workspace
+cd ~/devel/some-project && nix run .#pi -- --pwd-overlay
 ```
 
 This is the safest way to work on the real tree with its history: a
@@ -932,16 +951,16 @@ direct bind goes through the same review-and-sync step, and that covers
 extra mounts, not just the workspace - an agent let loose in a second
 checkout can do exactly as much damage there as in the main one:
 
-| Mode | Workspace and every rw `--mount` | Sync-back |
-|------|----------------------------------|-----------|
-| `--git limited` (default) | copy of the working tree, fresh single-commit repo | yes: prompted on a tty, automatic without one |
-| `--git none` | copy of the working tree, no repo | yes: same as above |
-| `--git full` | the real host tree | n/a - writes are live |
-| `--git full --overlay-workspace` | copy-on-write overlay | yes, but **only** on explicit confirmation; never unattended |
+| Mode | What the jail gets | Sync-back |
+|------|--------------------|-----------|
+| `limited` (default) | copy of the working tree, fresh single-commit repo | yes: prompted on a tty, automatic without one |
+| `nogit` | copy of the working tree, no repo | yes: same as above |
+| `overlay` | copy-on-write overlay | yes, but **only** on explicit confirmation; never unattended |
+| `full` | the real host tree | n/a - writes are live |
+| `ro` | the real host tree, read-only | n/a - nothing to write |
 
-`--ro-mount` is always a plain read-only bind, and a `--mount` pointing at
-a single file is always bound directly (there is no tree to copy or diff) -
-both are reported at launch.
+A mount pointing at a single file is always bound directly, whatever its
+mode (there is no tree to copy or diff), and that is reported at launch.
 
 `--mask` globs apply to every mounted tree, not just the workspace: they are
 expanded against each tree's own root, on the assumption that a pattern
@@ -951,8 +970,8 @@ tree:
 
 | Tree | Masking |
 |------|---------|
-| copy (`--git limited\|none`) | deleted from the copy before its baseline commit, so it never reaches the jail and never syncs back |
-| direct bind (`--ro-mount`, `--git full`, overlay) | shadowed by an empty read-only file/dir |
+| copy (`limited`, `nogit`) | deleted from the copy before its baseline commit, so it never reaches the jail and never syncs back |
+| real tree (`ro`, `full`, `overlay`) | shadowed by an empty read-only file/dir |
 
 The shadow is the weaker of the two: it covers the working copy only, so a
 tree bound together with its `.git` still hands the content out as a blob
@@ -988,7 +1007,7 @@ to ask about for the parts already synced.
 
 Alongside those, every run registers `$XDG_RUNTIME_DIR/llm-custody/<pid>.state`
 describing itself (see the state record below). A run with no isolated tree
-(`--git full` without `--overlay-workspace`) has no sync-back to register, so
+(every tree `ro` or `full`) has no sync-back to register, so
 the record is all it leaves: `session list` still shows it, and syncing it
 reports that there is nothing to fold back and exits 0. "Your changes are
 already on the host" and "no jail is running" are opposite answers, and
@@ -1020,8 +1039,7 @@ var `llm_custody_state`.
 | `tool` | tool name (`pi`) |
 | `pid` | runner pid, the same one the registry filename carries |
 | `workspace` | host path of the workspace |
-| `git` | `full` / `limited` / `none` |
-| `overlay` | `1` with `--overlay-workspace`, `0` otherwise |
+| `mode` | how the launch directory is exposed: `ro` / `limited` / `nogit` / `overlay` / `full` |
 | `sync` | the mid-session sync command. Always present now that a copy mount can be attached after launch; `state=direct` means nothing was isolated *at launch* |
 | `manifest` | the sync manifest the command reads, empty for a session with nothing isolated |
 | `mount` | the session's mount launcher (`add` / `remove` / `list`), see [Live mounts](#live-mounts) |
@@ -1069,7 +1087,7 @@ config.keys = {
       end
       if not st.sync then
         win:toast_notification('llm-custody',
-          ('nothing to sync - --git %s writes to %s directly'):format(st.git, st.workspace),
+          ('nothing to sync - --pwd-%s on %s'):format(st.mode, st.workspace),
           nil, 4000)
         return
       end
@@ -1194,8 +1212,8 @@ bound paths are visible inside it:
   which is also the sandbox cwd. `/workspace` itself is just the root the
   workspace and every extra mount hang under, so the in-jail layout mirrors
   a project plus its siblings instead of scattered host paths. With the
-  default `--git limited`/`none` this is a *copy* of the working tree
-  without `.git`; with `--git full` it is the real directory, and then
+  default `--pwd-limited` (and `--pwd-nogit`) this is a *copy* of the working
+  tree without `.git`; with `--pwd-ro|overlay|full` it is the real directory, and then
   `.git/hooks` underneath is re-bound read-only. Either way `git` is
   shadowed in-jail to always force `-c core.hooksPath` at a read-only dir
   (the host hooks with `full`, an empty dir otherwise), so rewriting
@@ -1217,12 +1235,11 @@ bound paths are visible inside it:
 - `/workspace` and `/mnt` themselves are empty directories from the runtime
   dir, bound read-only: the docks a live mount propagates into (see
   [Live mounts](#live-mounts)). Read-only so the agent cannot populate them
-- Any directories added via `--mount` / `--ro-mount`, by default under
+- Any directories added via `--mount-MODE`, by default under
   `/workspace` next to the workspace itself, and anything attached later
   with `llm-custody mount add` or an approved `custody-request --mount`. A
-  read-write one is isolated the same way the workspace is (copy, overlay
-  or real tree, per `--git` / `--overlay-workspace`) and reviewed on the way
-  back out - see [Syncing changes back](#syncing-changes-back)
+  copied or overlaid one (modes `limited`, `nogit`, `overlay`) is reviewed
+  on the way back out - see [Syncing changes back](#syncing-changes-back)
 
 The sandboxed tool keeps the controlling terminal (no bwrap
 `--new-session`): a process detached from it never receives SIGWINCH, so
@@ -1256,10 +1273,10 @@ On NixOS hosts, system packages (`/run/current-system/sw`) and user packages
 `PATH`, so tools like `rg`, `git`, `jq`, etc. are available without
 hardcoding them, as long as the host has them installed.
 
-With `--git full`, the workspace is a direct read-write bind of the host
+With `--pwd-full`, the workspace is a direct read-write bind of the host
 directory, not a copy-on-write layer - a destructive command run by the
 agent (`rm -rf`, a bad rebase, force-push, ...) mutates the real working
-tree immediately. The default `--git limited` avoids that by construction
+tree immediately. The default `--pwd-limited` avoids that by construction
 (the agent works on a copy and the damage shows up in the sync-back change
 list first). In every mode two safety nets run on the host repo,
 neither a full substitute for backups: if the workspace is a git repo, a
@@ -1268,7 +1285,7 @@ doesn't touch the working tree or `git stash list` - just prints a recovery
 hash), and `core.hooksPath` is diffed before/after the run with a loud
 warning on exit if it changed (catches the case where a plain `git` run on
 the host *outside* the jail later would honor a hooks dir the agent
-planted). With `--overlay-workspace` (see above) the tree is instead
+planted). With `--pwd-overlay` (see above) the tree is instead
 copy-on-write and nothing reaches the host until you confirm a sync-back.
 
 **Processes.** bwrap unshares mount, PID, IPC, and UTS namespaces - the
@@ -1302,7 +1319,7 @@ probes `clone` and `clone3`.
 Cloud credentials (`AWS_*` and the like) are not inherited from the host
 shell, which often carries keys for unrelated accounts. Pass the one the
 session needs explicitly, e.g. `--env AWS_PROFILE=dev` (plus a
-`--ro-mount` of the matching config) or `--env AWS_ACCESS_KEY_ID=...`.
+`--mount-ro` of the matching config) or `--env AWS_ACCESS_KEY_ID=...`.
 
 `DISPLAY`, `XAUTHORITY`, and `WAYLAND_DISPLAY` are explicitly stripped by
 default. This prevents tools like `pi` from trying (and failing) to use X11

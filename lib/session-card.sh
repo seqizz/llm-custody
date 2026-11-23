@@ -1,14 +1,14 @@
 # The session card: one block, printed last before launch (and by
 # --dry-run), describing the sandbox this run is about to enter.
 # Interpolated into lib/mkBwrapRunner.nix (no Nix interpolation in here);
-# reads the runner's resolved settings at call time (workspace, git mode,
+# reads the runner's resolved settings at call time (workspace, its mode,
 # network filter, mounts, masks, limits, toolbox, flags, state dir) plus
 # the colours from lib/log.sh and JAIL_MARK from lib/session-publish.sh.
 
 # Session card: one block, printed last, describing what the sandbox
 # this run is about to enter actually looks like. It is here for the
 # settings that are dangerous when they are not the ones the operator
-# thought they were - a stray --git full or --no-net-filter is visible
+# thought they were - a stray --pwd-full or --no-net-filter is visible
 # in red on the line above the prompt instead of buried somewhere in the
 # scrollback of a command typed ten minutes ago.
 card_row() {
@@ -16,19 +16,16 @@ card_row() {
 }
 
 print_card() {
-  local ws_line net_line git_line mounts_line extras tb_entry tb_count=0
+  local ws_line net_line mode_line mounts_line extras tb_entry tb_count=0
 
   ws_line="$WORKSPACE_HOST ${C_DIM}->${C_RESET} $WORKSPACE_GUEST"
 
-  case "$GIT_MODE" in
-    full)
-      if [ "$OVERLAY" = "1" ]; then
-        git_line="${C_YELLOW}full${C_RESET}, copy-on-write overlay (review before any sync)"
-      else
-        git_line="${C_RED}full${C_RESET}, real tree bound read-write - writes hit the host immediately"
-      fi ;;
-    limited) git_line="${C_GREEN}limited${C_RESET}, baseline-only copy, syncs back on exit" ;;
-    none)    git_line="${C_GREEN}none${C_RESET}, plain copy with no repo, syncs back on exit" ;;
+  case "$PWD_MODE" in
+  full) mode_line="${C_RED}full${C_RESET}, real tree bound read-write - writes hit the host immediately" ;;
+  overlay) mode_line="${C_YELLOW}overlay${C_RESET}, copy-on-write over the real tree (review before any sync)" ;;
+  ro) mode_line="${C_GREEN}ro${C_RESET}, real tree bound read-only" ;;
+  limited) mode_line="${C_GREEN}limited${C_RESET}, baseline-only copy, syncs back on exit" ;;
+  nogit) mode_line="${C_GREEN}nogit${C_RESET}, plain copy with no repo, syncs back on exit" ;;
   esac
 
   if [ "$NET_FILTER" = "1" ]; then
@@ -37,7 +34,9 @@ print_card() {
     net_line="${C_RED}UNFILTERED${C_RESET} - the sandbox can reach anything"
   fi
 
-  mounts_line="$EXTRA_MOUNT_COUNT extra, live under ${DOCK_GUESTS[*]}"
+  mounts_line="$EXTRA_MOUNT_COUNT extra"
+  [ -n "$EXTRA_MOUNT_MODES" ] && mounts_line="$mounts_line (${EXTRA_MOUNT_MODES# })"
+  mounts_line="$mounts_line, live under ${DOCK_GUESTS[*]}"
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] && mounts_line="$mounts_line, ${#MASK_PATTERNS[@]} mask pattern(s)"
   [ "${#SYNC_EXCLUDES[@]}" -gt 0 ] && mounts_line="$mounts_line, ${#SYNC_EXCLUDES[@]} sync exclude(s)"
 
@@ -50,7 +49,7 @@ print_card() {
   printf '%s┌─ %s%s %s%s %s(%s)%s\n' \
     "$C_DIM" "$C_RESET" "$JAIL_MARK" "$C_BOLD" "$TOOL_NAME" "$C_DIM" "$PROFILE" "$C_RESET" >&2
   card_row workspace "$ws_line"
-  card_row repo "$git_line"
+  card_row mode "$mode_line"
   card_row network "$net_line"
   card_row mounts "$mounts_line"
   [ -n "$LIMITS_DESC" ] && card_row limits "$LIMITS_DESC"

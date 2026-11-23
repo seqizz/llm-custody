@@ -5,7 +5,7 @@
 # is a diagnostic and the prefix on every line only buries the content.
 # Runner-only, interpolated into lib/mkBwrapRunner.nix (no Nix
 # interpolation in here); reads the runner's resolved state at call time
-# (MASK_PATTERNS, GIT_MODE, WORKSPACE_HOST/GUEST, the DRY_MOUNT_* arrays,
+# (MASK_PATTERNS, PWD_DIRECT, WORKSPACE_HOST/GUEST, the DRY_MOUNT_* arrays,
 # BWRAP_ARGS, RUNDIR, SKILLS_GUEST_DIR) plus the colours from lib/log.sh.
 #
 # Sections print whatever the verbosity: a dry run exists to show them.
@@ -35,8 +35,10 @@ dry_mask_report() {
   local -a t_host=() t_guest=() t_kind=() notes=()
   [ "${#MASK_PATTERNS[@]}" -gt 0 ] || return 0
 
-  if [ "$GIT_MODE" = "full" ]; then kind=shadow; else kind=delete; fi
-  t_host+=("$WORKSPACE_HOST"); t_guest+=("$WORKSPACE_GUEST"); t_kind+=("$kind")
+  if [ "$PWD_DIRECT" = "1" ]; then kind=shadow; else kind=delete; fi
+  t_host+=("$WORKSPACE_HOST")
+  t_guest+=("$WORKSPACE_GUEST")
+  t_kind+=("$kind")
   for i in "${!DRY_MOUNT_HOSTS[@]}"; do
     host="${DRY_MOUNT_HOSTS[$i]}"
     mode="${DRY_MOUNT_MODES[$i]}"
@@ -45,10 +47,12 @@ dry_mask_report() {
       continue
     fi
     case "$mode" in
-      limited|none) kind=delete ;;
-      *) kind=shadow ;;
+    limited | nogit) kind=delete ;;
+    *) kind=shadow ;;
     esac
-    t_host+=("$host"); t_guest+=("${DRY_MOUNT_GUESTS[$i]}"); t_kind+=("$kind")
+    t_host+=("$host")
+    t_guest+=("${DRY_MOUNT_GUESTS[$i]}")
+    t_kind+=("$kind")
   done
 
   dry_mask_kind delete "to delete from the copies"
@@ -71,7 +75,7 @@ dry_mask_kind() {
     if [ "$kind" = "shadow" ] && [ "${#MASK_HIT_PATH[@]}" -gt 0 ] && [ -d "${t_host[$t]}/.git" ]; then
       leaky+=("${t_guest[$t]}")
     fi
-    trees=$((trees+1))
+    trees=$((trees + 1))
   done
   [ "$trees" -gt 0 ] || return 0
 
@@ -79,15 +83,16 @@ dry_mask_kind() {
   for t in "${!MASK_PATTERNS[@]}"; do
     n=0
     for j in "${!idx[@]}"; do
-      if [ "${idx[$j]}" = "$t" ]; then n=$((n+1)); fi
+      if [ "${idx[$j]}" = "$t" ]; then n=$((n + 1)); fi
     done
     counts="$counts, ${MASK_PATTERNS[$t]}: $n"
   done
   dry_section "masks: ${#paths[@]} path(s) $what (${counts#, })"
   for t in "${!MASK_PATTERNS[@]}"; do
-    n=0; shown=0
+    n=0
+    shown=0
     for j in "${!idx[@]}"; do
-      if [ "${idx[$j]}" = "$t" ]; then n=$((n+1)); fi
+      if [ "${idx[$j]}" = "$t" ]; then n=$((n + 1)); fi
     done
     if [ "$n" -eq 0 ]; then
       dry_line "${MASK_PATTERNS[$t]}  ${C_DIM}(no match)${C_RESET}"
@@ -97,7 +102,7 @@ dry_mask_kind() {
     n=0
     for j in "${!idx[@]}"; do
       [ "${idx[$j]}" = "$t" ] || continue
-      n=$((n+1))
+      n=$((n + 1))
       if [ "$cap" -eq 0 ] || [ "$n" -le "$cap" ]; then
         dry_line "  ${paths[$j]}"
         shown=$n
@@ -119,7 +124,7 @@ dry_cols() {
     cols="${size##* }"
   fi
   case "$cols" in
-    ''|*[!0-9]*) cols=100 ;;
+  '' | *[!0-9]*) cols=100 ;;
   esac
   printf '%s' "$cols"
 }
@@ -129,8 +134,8 @@ dry_cols() {
 dry_short() {
   local p="$1"
   case "$p" in
-    "$RUNDIR"|"$RUNDIR"/*) p="\$RUNDIR${p#"$RUNDIR"}" ;;
-    "$HOME"|"$HOME"/*) p="~${p#"$HOME"}" ;;
+  "$RUNDIR" | "$RUNDIR"/*) p="\$RUNDIR${p#"$RUNDIR"}" ;;
+  "$HOME" | "$HOME"/*) p="~${p#"$HOME"}" ;;
   esac
   printf '%s' "$p"
 }
@@ -141,10 +146,10 @@ dry_pack() {
   local label="$1" sep="$2" width line="" item
   shift 2
   # 3 columns of dry_line indent plus the 10-column label.
-  width=$(( DRY_COLS - 13 ))
+  width=$((DRY_COLS - 13))
   [ "$width" -ge 30 ] || width=30
   for item in "$@"; do
-    if [ -n "$line" ] && [ $(( ${#line} + ${#sep} + ${#item} )) -gt "$width" ]; then
+    if [ -n "$line" ] && [ $((${#line} + ${#sep} + ${#item})) -gt "$width" ]; then
       dry_row "$label" "$line"
       label=""
       line="$item"
@@ -173,7 +178,7 @@ dry_fold_paths() {
         if [ "$j" -gt "$i" ] && [ -z "${used[$j]:-}" ] && [ "${dirs[$j]}" = "$dir" ]; then
           names="$names,$(basename -- "${paths[$j]}")"
           used[j]=1
-          n=$((n+1))
+          n=$((n + 1))
         fi
       done
     fi
@@ -203,7 +208,7 @@ dry_fold_env() {
       prefix="${env_k[$i]%%_*}_"
       for j in "${!env_k[@]}"; do
         if [ "$j" -gt "$i" ] && [ -z "${used[$j]:-}" ] &&
-           [ "${env_v[$j]}" = "${env_v[$i]}" ] && [[ "${env_k[$j]}" == "$prefix"* ]]; then
+          [ "${env_v[$j]}" = "${env_v[$i]}" ] && [[ "${env_k[$j]}" == "$prefix"* ]]; then
           rest="$rest,${env_k[$j]#"$prefix"}"
           used[j]=1
         fi
@@ -233,45 +238,94 @@ dry_bwrap_summary() {
 
   while [ "$i" -lt "$n" ]; do
     a="${BWRAP_ARGS[$i]}"
-    b="${BWRAP_ARGS[$((i+1))]:-}"
-    c="${BWRAP_ARGS[$((i+2))]:-}"
+    b="${BWRAP_ARGS[$((i + 1))]:-}"
+    c="${BWRAP_ARGS[$((i + 2))]:-}"
     case "$a" in
-      --unshare-cgroup-try) unshare+=("cgroup(try)"); i=$((i+1)) ;;
-      --unshare-*) unshare+=("${a#--unshare-}"); i=$((i+1)) ;;
-      --disable-userns) flags+=("no nested userns"); i=$((i+1)) ;;
-      --share-net|--die-with-parent|--new-session|--as-pid-1|--clearenv|--assert-userns-disabled)
-        flags+=("${a#--}"); i=$((i+1)) ;;
-      --cap-drop|--cap-add) sec="$sec, ${a#--} $b"; i=$((i+2)) ;;
-      --seccomp|--add-seccomp-fd) sec="$sec, seccomp fd $b"; i=$((i+2)) ;;
-      --proc|--dev|--tmpfs|--mqueue|--dir) fs+=("${a#--} $(dry_short "$b")"); i=$((i+2)) ;;
-      --remount-ro) remount+=("$b"); i=$((i+2)) ;;
-      --chdir) cwd="$b"; i=$((i+2)) ;;
-      --unsetenv) unset_vars+=("$b"); i=$((i+2)) ;;
-      --setenv)
-        if [ "$b" = "PATH" ]; then path_val="$c"; else env_k+=("$b"); env_v+=("$c"); fi
-        i=$((i+3)) ;;
-      --ro-bind|--ro-bind-try|--bind|--bind-try|--dev-bind|--dev-bind-try)
-        case "$a" in
-          --ro-bind*) b_kind+=("ro") ;;
-          *) b_kind+=("rw") ;;
-        esac
-        # -try binds are skipped by bwrap when the source is missing.
-        case "$a" in
-          *-try) b_src+=("$b?") ;;
-          *) b_src+=("$b") ;;
-        esac
-        b_dst+=("$c")
-        i=$((i+3)) ;;
-      --overlay-src) overlay+=("lower $(dry_short "$b")"); i=$((i+2)) ;;
-      --overlay)
-        d="${BWRAP_ARGS[$((i+3))]:-}"
-        overlay+=("upper $(dry_short "$b") -> $d"); i=$((i+4)) ;;
-      --tmp-overlay|--ro-overlay) overlay+=("${a#--} -> $b"); i=$((i+2)) ;;
-      --symlink|--chmod|--file|--bind-data|--ro-bind-data)
-        other+=("$a $(dry_short "$b") $c"); i=$((i+3)) ;;
-      --perms|--size|--uid|--gid|--hostname|--userns|--userns2|--pidns|--info-fd|--sync-fd|--block-fd|--userns-block-fd|--json-status-fd|--lock-file|--argv0|--exec-label|--file-label)
-        other+=("$a $b"); i=$((i+2)) ;;
-      *) other+=("$a"); i=$((i+1)) ;;
+    --unshare-cgroup-try)
+      unshare+=("cgroup(try)")
+      i=$((i + 1))
+      ;;
+    --unshare-*)
+      unshare+=("${a#--unshare-}")
+      i=$((i + 1))
+      ;;
+    --disable-userns)
+      flags+=("no nested userns")
+      i=$((i + 1))
+      ;;
+    --share-net | --die-with-parent | --new-session | --as-pid-1 | --clearenv | --assert-userns-disabled)
+      flags+=("${a#--}")
+      i=$((i + 1))
+      ;;
+    --cap-drop | --cap-add)
+      sec="$sec, ${a#--} $b"
+      i=$((i + 2))
+      ;;
+    --seccomp | --add-seccomp-fd)
+      sec="$sec, seccomp fd $b"
+      i=$((i + 2))
+      ;;
+    --proc | --dev | --tmpfs | --mqueue | --dir)
+      fs+=("${a#--} $(dry_short "$b")")
+      i=$((i + 2))
+      ;;
+    --remount-ro)
+      remount+=("$b")
+      i=$((i + 2))
+      ;;
+    --chdir)
+      cwd="$b"
+      i=$((i + 2))
+      ;;
+    --unsetenv)
+      unset_vars+=("$b")
+      i=$((i + 2))
+      ;;
+    --setenv)
+      if [ "$b" = "PATH" ]; then path_val="$c"; else
+        env_k+=("$b")
+        env_v+=("$c")
+      fi
+      i=$((i + 3))
+      ;;
+    --ro-bind | --ro-bind-try | --bind | --bind-try | --dev-bind | --dev-bind-try)
+      case "$a" in
+      --ro-bind*) b_kind+=("ro") ;;
+      *) b_kind+=("rw") ;;
+      esac
+      # -try binds are skipped by bwrap when the source is missing.
+      case "$a" in
+      *-try) b_src+=("$b?") ;;
+      *) b_src+=("$b") ;;
+      esac
+      b_dst+=("$c")
+      i=$((i + 3))
+      ;;
+    --overlay-src)
+      overlay+=("lower $(dry_short "$b")")
+      i=$((i + 2))
+      ;;
+    --overlay)
+      d="${BWRAP_ARGS[$((i + 3))]:-}"
+      overlay+=("upper $(dry_short "$b") -> $d")
+      i=$((i + 4))
+      ;;
+    --tmp-overlay | --ro-overlay)
+      overlay+=("${a#--} -> $b")
+      i=$((i + 2))
+      ;;
+    --symlink | --chmod | --file | --bind-data | --ro-bind-data)
+      other+=("$a $(dry_short "$b") $c")
+      i=$((i + 3))
+      ;;
+    --perms | --size | --uid | --gid | --hostname | --userns | --userns2 | --pidns | --info-fd | --sync-fd | --block-fd | --userns-block-fd | --json-status-fd | --lock-file | --argv0 | --exec-label | --file-label)
+      other+=("$a $b")
+      i=$((i + 2))
+      ;;
+    *)
+      other+=("$a")
+      i=$((i + 1))
+      ;;
     esac
   done
 
@@ -279,13 +333,17 @@ dry_bwrap_summary() {
     a="${b_src[$k]}"
     b="${b_dst[$k]}"
     case "$b" in
-      "$SKILLS_GUEST_DIR"/*)
-        if [ "${b_kind[$k]}" = "rw" ]; then skills_rw=$((skills_rw+1)); else skills_ro=$((skills_ro+1)); fi
-        skill_dirs+=("$(dirname -- "$a")")
-        continue ;;
+    "$SKILLS_GUEST_DIR"/*)
+      if [ "${b_kind[$k]}" = "rw" ]; then skills_rw=$((skills_rw + 1)); else skills_ro=$((skills_ro + 1)); fi
+      skill_dirs+=("$(dirname -- "$a")")
+      continue
+      ;;
     esac
     case "$a" in
-      "$RUNDIR"/masks/*) masks=$((masks+1)); continue ;;
+    "$RUNDIR"/masks/*)
+      masks=$((masks + 1))
+      continue
+      ;;
     esac
     if [ "${b_kind[$k]}" = "rw" ] && [[ " ${remount[*]} " == *" $b "* ]]; then
       docks+=("$b")
@@ -311,7 +369,10 @@ dry_bwrap_summary() {
   else
     a=ro
   fi
-  for d in "${ro_lines[@]}"; do dry_row "$a" "$d"; a=""; done
+  for d in "${ro_lines[@]}"; do
+    dry_row "$a" "$d"
+    a=""
+  done
   if [ "${#rw_same[@]}" -gt 0 ]; then
     dry_fold_paths "${rw_same[@]}"
     dry_pack rw " " "${DRY_FOLDED[@]}"
@@ -319,10 +380,16 @@ dry_bwrap_summary() {
   else
     a=rw
   fi
-  for d in "${rw_lines[@]}"; do dry_row "$a" "$d"; a=""; done
+  for d in "${rw_lines[@]}"; do
+    dry_row "$a" "$d"
+    a=""
+  done
   [ "${#docks[@]}" -eq 0 ] || dry_row docks "${docks[*]} (ro, live mounts attach inside)"
   a=overlay
-  for d in "${overlay[@]}"; do dry_row "$a" "$d"; a=""; done
+  for d in "${overlay[@]}"; do
+    dry_row "$a" "$d"
+    a=""
+  done
   [ "$masks" -eq 0 ] || dry_row masks "$masks empty ro bind(s) over --mask matches"
 
   if [ $((skills_rw + skills_ro)) -gt 0 ]; then
@@ -356,17 +423,26 @@ dry_skill_sources() {
   for d in "$@"; do
     found=""
     for i in "${!groups[@]}"; do
-      if [ "${groups[$i]}" = "$d" ]; then counts[i]=$((counts[i]+1)); found=1; break; fi
+      if [ "${groups[$i]}" = "$d" ]; then
+        counts[i]=$((counts[i] + 1))
+        found=1
+        break
+      fi
     done
-    [ -n "$found" ] || { groups+=("$d"); counts+=(1); }
+    [ -n "$found" ] || {
+      groups+=("$d")
+      counts+=(1)
+    }
   done
   if [ "${#groups[@]}" -eq 1 ]; then
     dry_short "${groups[0]}"
     return 0
   fi
   for d in "${groups[@]}"; do
-    if [ -z "$parent" ]; then parent="$(dirname -- "$d")"
-    elif [ "$(dirname -- "$d")" != "$parent" ]; then same=0
+    if [ -z "$parent" ]; then
+      parent="$(dirname -- "$d")"
+    elif [ "$(dirname -- "$d")" != "$parent" ]; then
+      same=0
     fi
   done
   for i in "${!groups[@]}"; do

@@ -104,8 +104,7 @@ pkgs.writeShellApplication {
     MASK_PATTERNS=()
     ENV_PAIRS=()
     TOOL_ARGS=()
-    OVERLAY=0
-    GIT_MODE="limited"
+    PWD_MODE="limited"
     SELFTEST=0
     MERGE_CONFIG=0
     MERGE_CONFIG_SRC=""
@@ -181,16 +180,21 @@ pkgs.writeShellApplication {
                              like 'claude --resume' match sessions started
                              outside the sandbox)
       --tmpdir PATH         Directory to use for runtime data (default: ''${TMPDIR:-/tmp})
-      --mount HOSTPATH[:GUESTPATH]
-                             Extra read-write mount (repeatable). GUESTPATH
-                             defaults to /workspace/<basename HOSTPATH>; a
-                             relative GUESTPATH is resolved under /workspace.
-                             Colliding targets are an error - give one of them
-                             an explicit GUESTPATH.
-                             Isolated exactly like the workspace: --git
-                             limited/none give the jail a copy that syncs back
-                             on exit, --overlay-workspace makes it
-                             copy-on-write, --git full binds the real tree.
+      --mount-MODE HOSTPATH[:GUESTPATH]
+                             Extra mount (repeatable), MODE one of
+                               ro:      the real tree, read-only
+                               limited: a copy as a fresh repo with a single
+                                        baseline commit, synced back on exit
+                               nogit:   the same copy with no repo at all
+                               overlay: the real tree copy-on-write, synced
+                                        back only after confirmation
+                               full:    the real tree read-write - writes
+                                        hit the host immediately
+                             --mount alone is --mount-limited.
+                             GUESTPATH defaults to /workspace/<basename
+                             HOSTPATH>; a relative GUESTPATH is resolved under
+                             /workspace. Colliding targets are an error -
+                             give one of them an explicit GUESTPATH.
                              A single file is always bound directly.
                              Mounts directly under /workspace or /mnt can be
                              detached while the session runs, and more can be
@@ -198,9 +202,6 @@ pkgs.writeShellApplication {
                              'llm-custody mount add', or the agent's own
                              custody-request --mount once you approve it.
                              Any other GUESTPATH is fixed for the session.
-      --ro-mount HOSTPATH[:GUESTPATH]
-                             Extra read-only mount (repeatable). Same GUESTPATH
-                             rules as --mount.
       --allow-domain DOMAIN Add domain to network whitelist (repeatable;
                              persistent ones can live in --state-dir/domains).
                              While the session runs: RUNDIR/domain or
@@ -211,20 +212,17 @@ pkgs.writeShellApplication {
                              DISPLAY/XAUTHORITY/WAYLAND_DISPLAY and binding
                              the display sockets. Without this, those vars
                              are stripped so the terminal uses OSC 52 instead
-      --git MODE            How much of the repo the jail sees (default: limited)
-                             limited: copy of the working tree as a fresh repo
-                                      with a single baseline commit - no host
-                                      history, so masked files can't be read
-                                      back out of .git
-                             none:    same copy, no repo at all
-                             full:    bind the real tree including its .git
-                             limited/none sync changes back to the real tree on
-                             exit (prompted on a tty, automatic otherwise) -
-                             for the workspace and every rw --mount
-      --overlay-workspace   Mount the workspace and every rw --mount
-                             copy-on-write; edits are shown for review and
-                             synced back to the real trees on exit, never
-                             without confirmation (needs --git full)
+      --pwd-MODE            How the jail sees the directory it is launched
+                             from, MODE as for --mount-MODE (default:
+                             --pwd-limited). Each tree has its own mode: this
+                             one does not carry over to the extra mounts.
+                             limited and nogit leave the host history behind,
+                             so masked files cannot be read back out of .git;
+                             ro, overlay and full bind the real tree including
+                             its .git.
+                             limited/nogit sync changes back to the real tree
+                             on exit (prompted on a tty, automatic otherwise),
+                             overlay only ever after confirmation
       --sync-exclude GLOB   Never sync paths matching GLOB back to the host
                              tree, in any mode that syncs (repeatable).
                              Matched against tree-relative paths; '*' crosses
@@ -313,18 +311,21 @@ pkgs.writeShellApplication {
         --toolbox-dir)   need_arg "$@"; TOOLBOX_DIR="$2"; shift 2 ;;
         --same-path)     SAME_PATH=1; shift ;;
         --tmpdir)        need_arg "$@"; LLMCUSTODY_TMPDIR="$2"; shift 2 ;;
-        --mount)         need_arg "$@"; EXTRA_MOUNTS+=("$2:rw"); shift 2 ;;
-        --ro-mount)      need_arg "$@"; EXTRA_MOUNTS+=("$2:ro"); shift 2 ;;
+        --mount)         need_arg "$@"; EXTRA_MOUNTS+=("$2:limited"); shift 2 ;;
+        --mount-ro|--mount-limited|--mount-nogit|--mount-overlay|--mount-full)
+                         need_arg "$@"; EXTRA_MOUNTS+=("$2:''${1#--mount-}"); shift 2 ;;
+        --pwd-ro|--pwd-limited|--pwd-nogit|--pwd-overlay|--pwd-full)
+                         PWD_MODE="''${1#--pwd-}"; shift ;;
         --allow-domain)  need_arg "$@"; EXTRA_DOMAINS+=("$2"); shift 2 ;;
         --env)           need_arg "$@"; ENV_PAIRS+=("$2"); shift 2 ;;
-        --overlay-workspace) OVERLAY=1; shift ;;
-        --git)
-          need_arg "$@"
-          case "$2" in
-            full|limited|none) GIT_MODE="$2" ;;
-            *) die "--git expects full|limited|none, got: $2" ;;
-          esac
-          shift 2 ;;
+        # Refused by name, with the --pwd-MODE / --mount-MODE spelling to
+        # use: an unknown flag is forwarded to the tool, whose own error
+        # would not point back at this launcher.
+        --git|--overlay-workspace|--ro-mount)
+          err "$1 is not a flag of this launcher"
+          hint "the launch directory: --pwd-ro|--pwd-limited|--pwd-nogit|--pwd-overlay|--pwd-full"
+          hint "an extra mount:       --mount-ro|--mount-limited|--mount-nogit|--mount-overlay|--mount-full PATH"
+          exit 1 ;;
         --selftest)      SELFTEST=1; shift ;;
         --dry-run)       DRYRUN=1; shift ;;
         --list-profiles) LIST_PROFILES=1; shift ;;
@@ -417,12 +418,20 @@ pkgs.writeShellApplication {
     esac
     [ "$SAME_PATH" = "1" ] && WORKSPACE_GUEST="$WORKSPACE_HOST"
 
-    # --overlay-workspace only means something for the real tree: --git
-    # limited/none already hand the sandbox a copy, with their own
-    # review-and-sync-back step at exit.
-    if [ "$OVERLAY" = "1" ] && [ "$GIT_MODE" != "full" ]; then
-      die "--overlay-workspace needs --git full (limited/none already isolate the host tree)"
-    fi
+    # PWD_DIRECT: the jail sees the real launch directory (through a bind or
+    # as an overlay's lower layer) rather than a copy of it, so its .git is
+    # visible and a --mask match can only be shadowed.
+    case "$PWD_MODE" in
+      limited|nogit) PWD_DIRECT=0 ;;
+      *)             PWD_DIRECT=1 ;;
+    esac
+    # Whether any tree of this run is an overlay, which is what the overlayfs
+    # preflight keys on.
+    NEED_OVERLAY=0
+    if [ "$PWD_MODE" = "overlay" ]; then NEED_OVERLAY=1; fi
+    for spec in "''${EXTRA_MOUNTS[@]+"''${EXTRA_MOUNTS[@]}"}"; do
+      if [ "''${spec##*:}" = "overlay" ]; then NEED_OVERLAY=1; fi
+    done
     if [ "$DRYRUN" = "1" ] && [ "$SELFTEST" = "1" ]; then
       die "--dry-run and --selftest are mutually exclusive (--selftest really runs the sandbox)"
     fi
@@ -712,7 +721,7 @@ pkgs.writeShellApplication {
         log "--merge-config: nothing changed (jail settings already match)"
       fi
     fi
-    # Workspace exposure, filled in by the --git limited/none copy step below.
+    # Workspace exposure, filled in by the --pwd-limited|nogit copy step below.
     # Declared ahead of cleanup() so the trap can run before that step with
     # `set -u` active.
     WORKSPACE_BIND="$WORKSPACE_HOST"
@@ -720,7 +729,7 @@ pkgs.writeShellApplication {
     TRACK_GIT=""
     # Every tree the sandbox sees through a copy or an overlay instead of a
     # direct bind, as manifest lines for the sync-back helper (see
-    # lib/sync-back.sh for the format). Appended to by the --git copy step
+    # lib/sync-back.sh for the format). Appended to by the workspace copy step
     # and by the mount controller for every copy/overlay mount, at launch or
     # later; $RUNDIR/sync, the dirty watcher and the exit trap all read it
     # afresh, so a mount attached mid-session is synced like one from launch.
@@ -737,6 +746,8 @@ pkgs.writeShellApplication {
     DOCK_GUESTS=()
     DOCK_SRCS=()
     EXTRA_MOUNT_COUNT=0
+    # The mode of each extra mount, coloured, in flag order, for the card.
+    EXTRA_MOUNT_MODES=""
     # The per-session package-request broker: its pid, so cleanup() can stop
     # it, and its runtime directory, so cleanup() can remove the registration
     # even when the broker was killed hard enough to skip its own handler.
@@ -838,9 +849,9 @@ pkgs.writeShellApplication {
       # this shell's process group)
       pkill -f "$RUNDIR" 2>/dev/null || true
 
-      # Fold every isolated tree (the --git limited/none copies and the
-      # --overlay-workspace upper layers, workspace and extra rw mounts
-      # alike) back into the real host trees. Must run before the
+      # Fold every isolated tree (the limited/nogit copies and the overlay
+      # upper layers, workspace and extra mounts alike) back into the real
+      # host trees. Must run before the
       # `rm -rf $RUNDIR` below, which would otherwise take the copies and
       # upper layers - and every un-synced change - with them.
       #
@@ -963,7 +974,7 @@ pkgs.writeShellApplication {
     }
     trap cleanup EXIT
 
-    # --overlay-workspace preflight. Unprivileged overlayfs needs kernel
+    # Overlay preflight. Unprivileged overlayfs needs kernel
     # >= 5.11, and the upper layer's filesystem must support user xattrs
     # (overlay mounted inside a userns runs with `userxattr`) - tmpfs only
     # gained those in 6.6, and --tmpdir defaults to /tmp, which is tmpfs on
@@ -972,22 +983,25 @@ pkgs.writeShellApplication {
     # actually use. Done here rather than at mount-assembly time so the
     # whole netns/slirp/dnsmasq chain isn't brought up just to fail, and
     # after the trap so a failed probe still cleans $RUNDIR up.
-    if [ "$OVERLAY" = "1" ]; then
-      mkdir -p "$RUNDIR"/overlay-probe/{lower,upper,work} "$RUNDIR/workspace-upper" "$RUNDIR/workspace-work"
+    if [ "$NEED_OVERLAY" = "1" ]; then
+      mkdir -p "$RUNDIR"/overlay-probe/{lower,upper,work}
       if ! bwrap --unshare-user --unshare-pid --ro-bind /nix/store /nix/store \
              --overlay-src "$RUNDIR/overlay-probe/lower" \
              --overlay "$RUNDIR/overlay-probe/upper" "$RUNDIR/overlay-probe/work" /mnt \
              -- "${pkgs.coreutils}/bin/true" 2>"$RUNDIR/overlay-probe.log"; then
-        err "--overlay-workspace is not usable on this host:"
+        err "overlay mode is not usable on this host:"
         # Indented read loop rather than sed: everything else in this script
         # sticks to coreutils/bash builtins that runtimeInputs guarantees.
         while IFS= read -r line; do hint "$line"; done < "$RUNDIR/overlay-probe.log"
         hint "Unprivileged overlayfs needs kernel >= 5.11, and the upper layer must sit"
         hint "on a filesystem with user xattr support (tmpfs: kernel >= 6.6)."
-        hint "Point --tmpdir at a disk-backed directory, or drop --overlay-workspace."
+        hint "Point --tmpdir at a disk-backed directory, or pick another mode."
         exit 1
       fi
       rm -rf "$RUNDIR/overlay-probe" "$RUNDIR/overlay-probe.log"
+    fi
+    if [ "$PWD_MODE" = "overlay" ]; then
+      mkdir -p "$RUNDIR/workspace-upper" "$RUNDIR/workspace-work"
       printf 'overlay\t%s\t-\t%s\t%s\n' "$RUNDIR/workspace-upper" "$WORKSPACE_HOST" "overlay workspace" >> "$SYNC_MANIFEST"
     fi
 
@@ -998,8 +1012,9 @@ pkgs.writeShellApplication {
     # script's text and shellcheck sees it as such.
     ${builtins.readFile ./jail-tree.sh}
 
-    # Mask the workspace where the sandbox sees it through a direct bind
-    # (--git full): there is no copy to delete from, so each --mask match is
+    # Mask the workspace where the sandbox sees the real tree
+    # (--pwd-ro|overlay|full): there is no copy to delete from, so each
+    # --mask match is
     # shadowed by an empty read-only file/dir instead. Appends to
     # BWRAP_ARGS, so it has to be called after the bind it shadows - bwrap
     # applies its mounts in argument order. Extra mounts get the same
@@ -1029,12 +1044,12 @@ pkgs.writeShellApplication {
       done
       if [ "$DRYRUN" != "1" ] && [ -d "$hostroot/.git" ]; then
         warn "$label is bound along with its .git, so masked content is still"
-        hint "readable from history (git show HEAD:<path>). Only a copy (--git"
-        hint "limited|none) removes it outright."
+        hint "readable from history (git show HEAD:<path>). Only a copy (mode"
+        hint "limited|nogit) removes it outright."
       fi
     }
 
-    # --git limited|none: hand the sandbox a copy of the working tree instead
+    # --pwd-limited|nogit: hand the sandbox a copy of the working tree instead
     # of the real one, with .git left behind on the host. Without this, --mask
     # only shadows the working copy - every masked file is still readable as a
     # blob (`git show HEAD:secrets/hiera.yaml`) because .git itself is bound
@@ -1043,11 +1058,11 @@ pkgs.writeShellApplication {
     #   limited: the copy is re-initialized as a fresh repo with one baseline
     #            commit, so in-jail git (status/diff/commit/branch) still
     #            works, just with no history to mine.
-    #   none:    plain directory, no repo at all.
+    #   nogit:   plain directory, no repo at all.
     # Changes come back via cleanup()'s sync-back step.
-    if [ "$GIT_MODE" != "full" ]; then
+    if [ "$PWD_DIRECT" != "1" ]; then
       if ! command -v git >/dev/null 2>&1; then
-        die "--git $GIT_MODE needs git on the host (it records the baseline used for sync-back)"
+        die "--pwd-$PWD_MODE needs git on the host (it records the baseline used for sync-back)"
       fi
       WORKSPACE_COPY="$RUNDIR/workspace"
       TRACK_GIT="$RUNDIR/track.git"
@@ -1056,16 +1071,16 @@ pkgs.writeShellApplication {
         # A dry run resolves paths but copies nothing: on a large repo the
         # copy is the slowest part of a launch, and reproducing it would
         # make the one mode meant for a quick look the expensive one.
-        log "--git $(jail_mode_label "$GIT_MODE") would copy $WORKSPACE_HOST into $RUNDIR (not done for --dry-run)"
+        log "--pwd-$(jail_mode_label "$PWD_MODE") would copy $WORKSPACE_HOST into $RUNDIR (not done for --dry-run)"
       else
-        log "--git $GIT_MODE - copying the working tree into $RUNDIR (history stays on the host)"
+        log "--pwd-$PWD_MODE - copying the working tree into $RUNDIR (history stays on the host)"
         jail_copy_tree "$WORKSPACE_HOST" "$WORKSPACE_COPY"
 
         jail_apply_masks "$WORKSPACE_COPY" "the workspace copy"
 
-        if [ "$GIT_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
+        if [ "$PWD_MODE" = "limited" ] && [ -d "$WORKSPACE_HOST/.git" ]; then
           jail_init_repo "$WORKSPACE_COPY" "$WORKSPACE_HOST" "jail repo"
-        elif [ "$GIT_MODE" = "limited" ]; then
+        elif [ "$PWD_MODE" = "limited" ]; then
           log "workspace is not a git repo - jail gets a plain copy"
         fi
 
@@ -1442,19 +1457,18 @@ pkgs.writeShellApplication {
     # write lands in the upper dir and touches nothing on the host until
     # cleanup()'s sync-back. Both host paths sit under the sandbox runtime
     # dir, which the later --tmpfs /tmp hides from the sandbox's own view.
-    if [ "$OVERLAY" = "1" ]; then
+    if [ "$PWD_MODE" = "overlay" ]; then
       # Dirs and host support were both settled by the preflight right after
-      # the cleanup trap was installed.
-      # WORKSPACE_BIND is the real tree here: --overlay-workspace is rejected
-      # for --git limited/none further up, since those already hand the
-      # sandbox a copy.
+      # the cleanup trap was installed. WORKSPACE_BIND is the real tree here.
       WS_SPEC=(
         --overlay-src "$WORKSPACE_BIND"
         --overlay "$RUNDIR/workspace-upper" "$RUNDIR/workspace-work" "$WORKSPACE_GUEST"
       )
+    elif [ "$PWD_MODE" = "ro" ]; then
+      WS_SPEC=(--ro-bind "$WORKSPACE_BIND" "$WORKSPACE_GUEST")
     else
-      # WORKSPACE_BIND is the real tree with --git full, the RUNDIR copy
-      # otherwise.
+      # WORKSPACE_BIND is the real tree with --pwd-full, the RUNDIR copy
+      # with --pwd-limited|nogit.
       WS_SPEC=(--bind "$WORKSPACE_BIND" "$WORKSPACE_GUEST")
     fi
 
@@ -1471,7 +1485,7 @@ pkgs.writeShellApplication {
     # planted symlink where the operator is about to mount would redirect
     # the holder-side bind). Not via --ro-bind, though: that remounts every
     # submount it finds read-only as well, which would turn a launch-time
-    # rw --mount already attached under the dock read-only. --bind keeps
+    # writable --mount-MODE already attached under the dock read-only. --bind keeps
     # each submount's own flags and --remount-ro is non-recursive, so only
     # the dock directory itself ends up read-only. The mountpoint of the
     # workspace bind inside it is created here, since bwrap cannot create
@@ -1549,15 +1563,16 @@ pkgs.writeShellApplication {
 
     # Hooks dir the in-jail git wrapper below pins core.hooksPath to.
     #
-    # --git full: the host repo's own hooks, bound read-only even though the
-    # workspace is rw - a jailed agent shouldn't be able to plant or modify
+    # Real tree (--pwd-ro|overlay|full): the host repo's own hooks, bound
+    # read-only even where the workspace is rw - a jailed agent shouldn't
+    # be able to plant or modify
     # git hooks that run on the host later.
     #
-    # limited/none: the host .git isn't mounted at all, and the jail repo's
+    # limited/nogit: the host .git isn't mounted at all, and the jail repo's
     # hooks dir lives in the discarded copy (it never syncs back, /.git/ is
     # excluded from tracking). Pin to an empty read-only dir anyway so hooks
     # the agent writes don't even fire inside the jail.
-    if [ "$GIT_MODE" = "full" ]; then
+    if [ "$PWD_DIRECT" = "1" ]; then
       HOOKS_GUEST="$WORKSPACE_GUEST/.git/hooks"
       if [ -d "$WORKSPACE_HOST/.git/hooks" ]; then
         BWRAP_ARGS+=(--ro-bind "$WORKSPACE_HOST/.git/hooks" "$HOOKS_GUEST")
@@ -1787,10 +1802,11 @@ pkgs.writeShellApplication {
     # controller refuses two mounts on one guest path, so the second bind
     # can never silently shadow the first.
     #
-    # Read-write mounts get the same host-tree protection as the workspace,
-    # chosen by the same flags - an agent let loose in a second checkout
-    # can do exactly as much damage there as in the main one, so a direct
-    # bind only when --git full explicitly asks for the real tree.
+    # Each mount carries its own mode, the suffix its --mount-MODE flag
+    # left on the spec. Plain --mount is a limited copy: an agent let loose
+    # in a second checkout can do exactly as much damage there as in the
+    # main one, so the real tree is bound read-write only where
+    # --mount-full asks for it by name.
     #
     # --dry-run attaches nothing, so it records each mount here for the
     # mask report after the session card (dry_mask_report).
@@ -1798,7 +1814,7 @@ pkgs.writeShellApplication {
     DRY_MOUNT_GUESTS=()
     DRY_MOUNT_MODES=()
     for spec in "''${EXTRA_MOUNTS[@]+"''${EXTRA_MOUNTS[@]}"}"; do
-      access="''${spec##*:}"
+      mmode="''${spec##*:}"
       paths="''${spec%:*}"
       if [[ "$paths" == *:* ]]; then
         hostpath="''${paths%%:*}"; guestpath="''${paths#*:}"
@@ -1828,14 +1844,8 @@ pkgs.writeShellApplication {
         # relative to the sandbox cwd - bwrap would reject the latter anyway.
         guestpath="$WORKSPACE_ROOT/$guestpath"
       fi
-      if [ "$access" = "ro" ]; then
-        mmode="ro"
-      elif [ "$OVERLAY" = "1" ]; then
-        mmode="overlay"
-      else
-        mmode="$GIT_MODE"
-      fi
       EXTRA_MOUNT_COUNT=$((EXTRA_MOUNT_COUNT+1))
+      EXTRA_MOUNT_MODES="$EXTRA_MOUNT_MODES $(jail_mode_label "$mmode")"
       if [ "$DRYRUN" = "1" ]; then
         log "would mount $hostpath at $guestpath (mode $(jail_mode_label "$mmode"); nothing copied for --dry-run)"
         DRY_MOUNT_HOSTS+=("$hostpath")
@@ -1854,12 +1864,13 @@ pkgs.writeShellApplication {
       fi
     done
 
-    # --mask GLOB against the workspace. Only --git full needs the empty-bind
-    # treatment here: limited/none already deleted the matches from the
+    # --mask GLOB against the workspace. Only a directly bound tree needs the
+    # empty-bind treatment here: limited/nogit already deleted the matches
+    # from the
     # workspace copy, which is stronger (nothing underneath to unmask, and no
     # .git blobs either). Runs after the workspace and user mounts are in
     # BWRAP_ARGS so the shadows land on top of them.
-    if [ "$GIT_MODE" = "full" ]; then
+    if [ "$PWD_DIRECT" = "1" ]; then
       jail_mask_binds "$WORKSPACE_HOST" "$WORKSPACE_GUEST" "the workspace"
     fi
 
@@ -1879,7 +1890,7 @@ pkgs.writeShellApplication {
       BWRAP_ARGS+=(--setenv SELFTEST_TIOCSTI "${selftestTiocsti}")
       BWRAP_ARGS+=(--setenv SELFTEST_USERNS "${selftestUserns}")
       BWRAP_ARGS+=(--setenv SELFTEST_DOMAIN "${selftestDomain}")
-      BWRAP_ARGS+=(--setenv SELFTEST_GITMODE "$GIT_MODE")
+      BWRAP_ARGS+=(--setenv SELFTEST_PWDMODE "$PWD_MODE")
       # With limits, the probe reads the scope's own cgroup files to show
       # what the kernel enforces. The jail has no /sys and a cgroup
       # namespace of its own, so the scope directory is bound in directly.
@@ -1910,7 +1921,7 @@ pkgs.writeShellApplication {
 
     # Toolbox handle. Registered unconditionally, unlike the sync launcher -
     # every run has a toolbox, including the ones with nothing to sync back
-    # (--git full), and answering an agent's package request is exactly the
+    # (--pwd-full), and answering an agent's package request is exactly the
     # case where the operator is in another terminal with no idea which
     # --state-dir this session used.
     if [ "$DRYRUN" != "1" ]; then
@@ -2174,7 +2185,7 @@ pkgs.writeShellApplication {
 
     # SECONDS is reset here, not at script start, so the duration in the
     # exit summary measures the session rather than the setup that preceded
-    # it (a large --git limited copy can take a while, and counting it would
+    # it (a large --pwd-limited copy can take a while, and counting it would
     # misreport how long the agent actually ran).
     SECONDS=0
     LAUNCHED=1

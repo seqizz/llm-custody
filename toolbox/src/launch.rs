@@ -113,7 +113,7 @@ pub fn usage() {
 Usage: llm-custody launch [TOOL] [RUNNER OPTIONS] [-- TOOL ARGS...]
 
 Start TOOL in a sandbox. Everything after the name goes to that tool's
-runner untouched, so `llm-custody launch pi --git full -- -p hello` is the
+runner untouched, so `llm-custody launch pi --pwd-full -- -p hello` is the
 same command line `llm-custody-pi` took.
 
   (no tool)   list the tools this build can launch

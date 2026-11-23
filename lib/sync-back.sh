@@ -1,8 +1,9 @@
 # llm-custody sync-back.
 #
-# Folds jail-side workspace copies (--git limited|none) and overlay upper
-# layers (--overlay-workspace) back into the real host trees, for the
-# workspace and for every extra rw --mount that got the same treatment.
+# Folds jail-side copies (modes limited|nogit) and overlay upper layers
+# (mode overlay) back into the real host trees, for the workspace
+# (--pwd-MODE) and for every extra mount (--mount-MODE) in one of those
+# modes.
 #
 # Two callers, one implementation: the runner's exit trap, and the operator
 # running $RUNDIR/sync from a second terminal to sync mid-session while the
@@ -25,24 +26,36 @@ GIT_IDENT=(-c user.name=llm-custody -c user.email=llm-custody@localhost -c commi
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --prompt) MODE=prompt; shift ;;
-    --auto)   MODE=auto; shift ;;
-    --exclude)
-      if [ $# -lt 2 ]; then
-        printf 'ERROR: --exclude needs a glob\n' >&2
-        exit 2
-      fi
-      EXCLUDES+=("$2"); shift 2 ;;
-    -h|--help)
-      printf 'Usage: llm-custody-sync-back [--prompt|--auto] [--exclude GLOB]... MANIFEST\n'
-      printf '  --prompt       review each changed tree and confirm (default)\n'
-      printf '  --auto         sync copies without asking; overlays are never\n'
-      printf '                 synced unattended (they exist to be reviewed first);\n'
-      printf '                 a path also changed on the host keeps the host\n'
-      printf '                 version, the agent one lands beside it as PATH.llm-custody\n'
-      printf '  --exclude GLOB never sync paths matching GLOB (repeatable)\n'
-      exit 0 ;;
-    *) MANIFEST="$1"; shift ;;
+  --prompt)
+    MODE=prompt
+    shift
+    ;;
+  --auto)
+    MODE=auto
+    shift
+    ;;
+  --exclude)
+    if [ $# -lt 2 ]; then
+      printf 'ERROR: --exclude needs a glob\n' >&2
+      exit 2
+    fi
+    EXCLUDES+=("$2")
+    shift 2
+    ;;
+  -h | --help)
+    printf 'Usage: llm-custody-sync-back [--prompt|--auto] [--exclude GLOB]... MANIFEST\n'
+    printf '  --prompt       review each changed tree and confirm (default)\n'
+    printf '  --auto         sync copies without asking; overlays are never\n'
+    printf '                 synced unattended (they exist to be reviewed first);\n'
+    printf '                 a path also changed on the host keeps the host\n'
+    printf '                 version, the agent one lands beside it as PATH.llm-custody\n'
+    printf '  --exclude GLOB never sync paths matching GLOB (repeatable)\n'
+    exit 0
+    ;;
+  *)
+    MANIFEST="$1"
+    shift
+    ;;
   esac
 done
 
@@ -51,7 +64,7 @@ if [ -z "$MANIFEST" ]; then
   exit 2
 fi
 # No manifest means nothing in this run was isolated from the host tree
-# (--git full without --overlay-workspace): nothing to sync, not an error.
+# (every tree is ro or full): nothing to sync, not an error.
 [ -f "$MANIFEST" ] || exit 0
 
 # Answers come from the terminal device where there is one, not stdin: the
@@ -84,7 +97,7 @@ path_excluded() {
   for glob in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
     # shellcheck disable=SC2254 # the glob is the point - it must stay unquoted
     case "$path" in
-      $glob|$glob/*) return 0 ;;
+    $glob | $glob/*) return 0 ;;
     esac
   done
   return 1
@@ -170,24 +183,39 @@ resolve_conflict() {
   while true; do
     ans=$(read_answer "llm-custody: $path changed on both sides: [a]gent / [k]eep on-disk / [d]iff, A/K = all remaining [k] ")
     case "$ans" in
-      a) RESOLUTION=agent; return 0 ;;
-      A) RESOLUTION=agent; CONFLICT_ALL=agent; return 0 ;;
-      K) RESOLUTION=keep; CONFLICT_ALL=keep; return 0 ;;
-      d|D)
-        # /dev/null stands in for a missing side, so a deletion on either
-        # end still shows as a diff instead of a git error.
-        old="$host/$path"
-        [ -e "$old" ] || [ -L "$old" ] || old=/dev/null
-        new="$copy/$path"
-        [ -e "$new" ] || [ -L "$new" ] || new=/dev/null
-        git --no-pager diff --no-index -- "$old" "$new" 2>/dev/null | page || true
-        continue ;;
-      *) RESOLUTION=keep; return 0 ;;
+    a)
+      RESOLUTION=agent
+      return 0
+      ;;
+    A)
+      RESOLUTION=agent
+      CONFLICT_ALL=agent
+      return 0
+      ;;
+    K)
+      RESOLUTION=keep
+      CONFLICT_ALL=keep
+      return 0
+      ;;
+    d | D)
+      # /dev/null stands in for a missing side, so a deletion on either
+      # end still shows as a diff instead of a git error.
+      old="$host/$path"
+      [ -e "$old" ] || [ -L "$old" ] || old=/dev/null
+      new="$copy/$path"
+      [ -e "$new" ] || [ -L "$new" ] || new=/dev/null
+      git --no-pager diff --no-index -- "$old" "$new" 2>/dev/null | page || true
+      continue
+      ;;
+    *)
+      RESOLUTION=keep
+      return 0
+      ;;
     esac
   done
 }
 
-# --git limited|none: the sandbox worked on a copy, so the real tree is
+# Modes limited|nogit: the sandbox worked on a copy, so the real tree is
 # still untouched. Diff the copy against the baseline in its tracking git
 # dir (never mounted into the sandbox, so the agent cannot rewrite the
 # baseline to smuggle a change past this review) and copy the differences
@@ -247,18 +275,20 @@ sync_copy() {
     while true; do
       ans=$(read_answer "llm-custody: sync these back to $host? [y/N/d=diff] ")
       case "$ans" in
-        [yY]|[yY][eE][sS]) break ;;
-        [dD])
-          # Staging into the *tracking* index is what makes new files show
-          # up in the diff at all; it is also harmless to leave behind,
-          # since a real sync re-runs `add -A` before committing its own
-          # sync point anyway.
-          GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" add -A >/dev/null 2>&1 || true
-          GIT_DIR="$track" GIT_WORK_TREE="$copy" git --no-pager diff --cached 2>/dev/null | page
-          continue ;;
-        *)
-          printf 'llm-custody: NOT syncing %s\n' "$label" >&2
-          return 0 ;;
+      [yY] | [yY][eE][sS]) break ;;
+      [dD])
+        # Staging into the *tracking* index is what makes new files show
+        # up in the diff at all; it is also harmless to leave behind,
+        # since a real sync re-runs `add -A` before committing its own
+        # sync point anyway.
+        GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" add -A >/dev/null 2>&1 || true
+        GIT_DIR="$track" GIT_WORK_TREE="$copy" git --no-pager diff --cached 2>/dev/null | page
+        continue
+        ;;
+      *)
+        printf 'llm-custody: NOT syncing %s\n' "$label" >&2
+        return 0
+        ;;
       esac
     done
   fi
@@ -271,7 +301,7 @@ sync_copy() {
     path="${entry:3}"
     [ -n "$path" ] || continue
     if path_excluded "$path"; then
-      skipped=$((skipped+1))
+      skipped=$((skipped + 1))
       continue
     fi
     if [ -n "${conflict[$path]+x}" ]; then
@@ -281,30 +311,34 @@ sync_copy() {
         RESOLUTION=sidecar
       fi
       case "$RESOLUTION" in
-        keep)
-          kept=$((kept+1))
-          continue ;;
-        sidecar)
-          # Nothing to save when the agent's side of the conflict is a
-          # deletion.
-          if [ -e "$copy/$path" ] || [ -L "$copy/$path" ]; then
-            mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
-            if cp -a --reflink=auto -- "$copy/$path" "$host/$path.llm-custody" 2>/dev/null; then
-              sidecars+=("$path.llm-custody")
-            fi
+      keep)
+        kept=$((kept + 1))
+        continue
+        ;;
+      sidecar)
+        # Nothing to save when the agent's side of the conflict is a
+        # deletion.
+        if [ -e "$copy/$path" ] || [ -L "$copy/$path" ]; then
+          mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
+          if cp -a --reflink=auto -- "$copy/$path" "$host/$path.llm-custody" 2>/dev/null; then
+            sidecars+=("$path.llm-custody")
           fi
-          kept=$((kept+1))
-          continue ;;
+        fi
+        kept=$((kept + 1))
+        continue
+        ;;
       esac
     fi
     case "$code" in
-      *D*)
-        rm -rf -- "$host/${path:?sync path empty}" 2>/dev/null || true ;;
-      *)
-        mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
-        cp -a --reflink=auto -- "$copy/$path" "$host/$path" 2>/dev/null || true ;;
+    *D*)
+      rm -rf -- "$host/${path:?sync path empty}" 2>/dev/null || true
+      ;;
+    *)
+      mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
+      cp -a --reflink=auto -- "$copy/$path" "$host/$path" 2>/dev/null || true
+      ;;
     esac
-    applied=$((applied+1))
+    applied=$((applied + 1))
   done
   # Advance the baseline so a following sync (mid-session syncs are meant to
   # be repeatable) only reports what changed since this one, instead of
@@ -328,7 +362,7 @@ sync_copy() {
   printf '          gitignored paths are not tracked and never sync back.\n' >&2
 }
 
-# --overlay-workspace: fold the overlay upper layer into the real tree.
+# Mode overlay: fold the overlay upper layer into the real tree.
 # Regular files/symlinks copy over, whiteouts (overlayfs deletion markers =
 # char device 0:0) remove the corresponding host path. Best-effort - overlay
 # quirks like opaque dirs are not fully mirrored, so a git/rsync review
@@ -348,7 +382,7 @@ sync_overlay_dir() {
     base="${entry##*/}"
     rel="$prefix$base"
     if path_excluded "$rel"; then
-      OVERLAY_SKIPPED=$((OVERLAY_SKIPPED+1))
+      OVERLAY_SKIPPED=$((OVERLAY_SKIPPED + 1))
       continue
     fi
     if [ -c "$entry" ]; then
@@ -358,7 +392,7 @@ sync_overlay_dir() {
         # (rm -rf against an unguarded path) satisfied, so a deletion can
         # never target something empty by accident.
         rm -rf -- "${host:?remove target host unset}/${base:?remove target name unset}" 2>/dev/null
-        OVERLAY_APPLIED=$((OVERLAY_APPLIED+1))
+        OVERLAY_APPLIED=$((OVERLAY_APPLIED + 1))
       fi
       continue
     fi
@@ -369,10 +403,10 @@ sync_overlay_dir() {
     fi
     if [ -L "$entry" ]; then
       if [ ! -e "$host/$base" ] || [ "$(readlink "$entry")" != "$(readlink "$host/$base" 2>/dev/null || true)" ]; then
-        cp -a -- "$entry" "$host/$base" 2>/dev/null && OVERLAY_APPLIED=$((OVERLAY_APPLIED+1))
+        cp -a -- "$entry" "$host/$base" 2>/dev/null && OVERLAY_APPLIED=$((OVERLAY_APPLIED + 1))
       fi
     elif [ ! -e "$host/$base" ] || ! cmp -s "$entry" "$host/$base"; then
-      cp -a -- "$entry" "$host/$base" 2>/dev/null && OVERLAY_APPLIED=$((OVERLAY_APPLIED+1))
+      cp -a -- "$entry" "$host/$base" 2>/dev/null && OVERLAY_APPLIED=$((OVERLAY_APPLIED + 1))
     fi
   done
 }
@@ -383,7 +417,7 @@ sync_overlay() {
   # Unlike a copy, an overlay is never synced unattended. A copy replaces
   # what used to be a direct rw bind, so a headless run that silently threw
   # its work away would be worse than the host mutation it avoids;
-  # --overlay-workspace is the opposite - an explicit request to review
+  # an overlay is the opposite - an explicit request to review
   # before anything reaches the host.
   if [ "$MODE" != "prompt" ]; then
     printf 'llm-custody: %s has changes but no tty to confirm on - not syncing, they are discarded\n' "$label" >&2
@@ -401,10 +435,11 @@ sync_overlay() {
   ) 2>/dev/null | head -n 40 >&2 || true
   ans=$(read_answer "llm-custody: sync them back to $host? [y/N] ")
   case "$ans" in
-    [yY]|[yY][eE][sS]) ;;
-    *)
-      printf 'llm-custody: NOT syncing - %s changes stay in the sandbox runtime dir and are discarded\n' "$label" >&2
-      return 0 ;;
+  [yY] | [yY][eE][sS]) ;;
+  *)
+    printf 'llm-custody: NOT syncing - %s changes stay in the sandbox runtime dir and are discarded\n' "$label" >&2
+    return 0
+    ;;
   esac
   OVERLAY_APPLIED=0
   OVERLAY_SKIPPED=0
@@ -428,15 +463,17 @@ fi
 # themselves.
 while IFS=$'\t' read -r type src track host label <&3; do
   case "$type" in
-    ""|\#*) continue ;;
-    copy)
-      if [ -d "$src" ] && [ -d "$track" ]; then
-        sync_copy "$src" "$track" "$host" "$label"
-      fi ;;
-    overlay)
-      if [ -d "$src" ]; then
-        sync_overlay "$src" "$host" "$label"
-      fi ;;
-    *) printf 'llm-custody: unknown sync manifest entry type: %s\n' "$type" >&2 ;;
+  "" | \#*) continue ;;
+  copy)
+    if [ -d "$src" ] && [ -d "$track" ]; then
+      sync_copy "$src" "$track" "$host" "$label"
+    fi
+    ;;
+  overlay)
+    if [ -d "$src" ]; then
+      sync_overlay "$src" "$host" "$label"
+    fi
+    ;;
+  *) printf 'llm-custody: unknown sync manifest entry type: %s\n' "$type" >&2 ;;
   esac
-done 3< "$MANIFEST"
+done 3<"$MANIFEST"

@@ -13,7 +13,7 @@
 JAIL_GIT_IDENT=(-c user.name=llm-custody -c user.email=llm-custody@localhost -c commit.gpgsign=false)
 
 # Copy a host tree into the jail runtime dir, minus its .git - used for
-# the workspace and for every extra rw mount under --git limited|none.
+# the workspace and for every extra mount in mode limited|nogit.
 jail_copy_tree() {
   local src="$1" dest="$2" entry
   mkdir -p "$dest"
@@ -28,16 +28,16 @@ jail_copy_tree() {
   shopt -u dotglob nullglob
 }
 
-# A tree mode (--git vocabulary plus ro and overlay) coloured by how much
+# A tree mode (ro, limited, nogit, overlay, full) coloured by how much
 # of the host it exposes, the same scale the session card uses: green for
 # a copy or read-only bind, yellow for an overlay that syncs only on
 # confirmation, red for the real tree read-write.
 jail_mode_label() {
   case "$1" in
-    limited|none|copy|ro) printf '%s%s%s' "$C_GREEN" "$1" "$C_RESET" ;;
-    overlay) printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
-    full) printf '%s%s%s' "$C_RED" "$1" "$C_RESET" ;;
-    *) printf '%s' "$1" ;;
+  limited | nogit | copy | ro) printf '%s%s%s' "$C_GREEN" "$1" "$C_RESET" ;;
+  overlay) printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
+  full) printf '%s%s%s' "$C_RED" "$1" "$C_RESET" ;;
+  *) printf '%s' "$1" ;;
   esac
 }
 
@@ -108,7 +108,7 @@ jail_mask_report() {
   for i in "${!MASK_PATTERNS[@]}"; do
     n=0
     for j in "${!MASK_HIT_IDX[@]}"; do
-      if [ "${MASK_HIT_IDX[$j]}" = "$i" ]; then n=$((n+1)); fi
+      if [ "${MASK_HIT_IDX[$j]}" = "$i" ]; then n=$((n + 1)); fi
     done
     counts="$counts, ${MASK_PATTERNS[$i]}: $n"
   done
@@ -117,7 +117,7 @@ jail_mask_report() {
   for i in "${!MASK_PATTERNS[@]}"; do
     n=0
     for j in "${!MASK_HIT_IDX[@]}"; do
-      if [ "${MASK_HIT_IDX[$j]}" = "$i" ]; then n=$((n+1)); fi
+      if [ "${MASK_HIT_IDX[$j]}" = "$i" ]; then n=$((n + 1)); fi
     done
     if [ "$n" -eq 0 ]; then
       hint "${MASK_PATTERNS[$i]}  (no match)"
@@ -154,7 +154,7 @@ jail_track_init() {
   local worktree="$1" track="$2"
   GIT_DIR="$track" GIT_WORK_TREE="$worktree" git init -q
   mkdir -p "$track/info"
-  printf '/.git/\n' > "$track/info/exclude"
+  printf '/.git/\n' >"$track/info/exclude"
   GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "${JAIL_GIT_IDENT[@]}" add -A
   GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody tracking baseline" --allow-empty
 }

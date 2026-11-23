@@ -17,6 +17,32 @@
 let
   inherit (pkgs) lib;
 
+  # The modes a tree can be exposed in, one vocabulary for the launch
+  # directory (--pwd-MODE), the extra mounts (--mount-MODE), `mount add
+  # --mode` and the approval of an agent mount request.
+  treeModes = [
+    {
+      mode = "ro";
+      desc = "real tree read-only";
+    }
+    {
+      mode = "limited";
+      desc = "copy with a baseline-only repo and sync-back";
+    }
+    {
+      mode = "nogit";
+      desc = "copy without a repo and sync-back";
+    }
+    {
+      mode = "overlay";
+      desc = "real tree copy-on-write and sync on confirmation";
+    }
+    {
+      mode = "full";
+      desc = "real tree read-write";
+    }
+  ];
+
   # arg: none | string | dir | file | choice (choice carries `values`)
   flags = [
     {
@@ -47,13 +73,20 @@ let
     {
       flag = "--mount";
       arg = "file";
-      desc = "Extra read-write mount, HOSTPATH or HOSTPATH-GUESTPATH";
+      desc = "Extra mount as a synced copy, same as --mount-limited";
     }
-    {
-      flag = "--ro-mount";
-      arg = "file";
-      desc = "Extra read-only mount, HOSTPATH or HOSTPATH-GUESTPATH";
-    }
+  ]
+  ++ map (m: {
+    flag = "--mount-${m.mode}";
+    arg = "file";
+    desc = "Extra mount, ${m.desc}, HOSTPATH or HOSTPATH-GUESTPATH";
+  }) treeModes
+  ++ map (m: {
+    flag = "--pwd-${m.mode}";
+    arg = "none";
+    desc = "Launch directory, ${m.desc}";
+  }) treeModes
+  ++ [
     {
       flag = "--allow-domain";
       arg = "string";
@@ -68,21 +101,6 @@ let
       flag = "--x11";
       arg = "none";
       desc = "Pass through the X11 or Wayland display socket";
-    }
-    {
-      flag = "--git";
-      arg = "choice";
-      values = [
-        "full"
-        "limited"
-        "none"
-      ];
-      desc = "How much of the repo the jail sees";
-    }
-    {
-      flag = "--overlay-workspace";
-      arg = "none";
-      desc = "Make the workspace and rw mounts copy-on-write";
     }
     {
       flag = "--mask";
@@ -210,18 +228,10 @@ let
     }
   ];
 
-  # The mount modes are the --git vocabulary plus ro, shared by `mount add`
-  # and by the approval of an agent mount request.
   modeFlag = desc: {
     flag = "--mode";
     arg = "choice";
-    values = [
-      "ro"
-      "full"
-      "limited"
-      "none"
-      "overlay"
-    ];
+    values = map (m: m.mode) treeModes;
     inherit desc;
   };
   olderThan = {

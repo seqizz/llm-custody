@@ -74,9 +74,9 @@ Usage: llm-custody [--pid PID] [--pause] mount [COMMAND [ARG...]]
 Attach a host tree to a running jail, or detach one. The session's own mount
 controller does the work; this only finds it.
 
-  add [--mode ro|full|limited|none|overlay] [--guest PATH] [--name NAME] HOSTPATH
+  add [--mode ro|full|limited|nogit|overlay] [--guest PATH] [--name NAME] HOSTPATH
                    ro is the default. full hands the jail the real tree
-                   read-write, limited and none bind a copy that syncs back
+                   read-write, limited and nogit bind a copy that syncs back
                    on request, overlay is copy-on-write
   remove [--auto|--discard] NAME|GUESTPATH   (aliases: rm, umount)
   list             what this session has attached

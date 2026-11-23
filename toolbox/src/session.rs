@@ -58,15 +58,11 @@ impl Record {
     /// vocabulary. Derived from the record rather than hardcoded, so it stays
     /// true if another flag combination ever ends up binding trees directly.
     pub fn reason(&self) -> String {
-        let git = match self.get("git") {
+        let mode = match self.get("mode") {
             "" => "?",
-            g => g,
+            m => m,
         };
-        if self.get("overlay") == "1" {
-            format!("--git {git} with --overlay-workspace")
-        } else {
-            format!("--git {git} without --overlay-workspace")
-        }
+        format!("--pwd-{mode}, no copy or overlay mounted")
     }
 }
 
@@ -88,8 +84,8 @@ pub struct Session {
     pub has_record: bool,
     pub tool: String,
     pub workspace: String,
-    pub git: String,
-    pub overlay: bool,
+    /// How the launch directory is exposed (the runner's --pwd-MODE).
+    pub mode: String,
     /// Empty when the session isolated nothing; `reason` then says why.
     pub sync: String,
     pub reason: String,
@@ -298,8 +294,7 @@ impl Registry {
                 has_record: true,
                 tool: rec.get("tool").to_string(),
                 workspace: rec.get("workspace").to_string(),
-                git: rec.get("git").to_string(),
-                overlay: rec.get("overlay") == "1",
+                mode: rec.get("mode").to_string(),
                 reason: rec.reason(),
                 sync,
                 mount,
@@ -317,8 +312,7 @@ impl Registry {
                 has_record: false,
                 tool: String::new(),
                 workspace: String::new(),
-                git: String::new(),
-                overlay: false,
+                mode: String::new(),
                 sync: path.display().to_string(),
                 reason: String::new(),
                 mount: String::new(),
@@ -355,9 +349,8 @@ impl Registry {
                 n => format!("{n} unsynced path(s)"),
             };
             println!(
-                "    git {}, {}, {}, {} mount(s), {} request(s) pending",
-                if s.git.is_empty() { "?" } else { &s.git },
-                if s.overlay { "overlay" } else { "no overlay" },
+                "    pwd {}, {}, {} mount(s), {} request(s) pending",
+                if s.mode.is_empty() { "?" } else { &s.mode },
                 dirty,
                 s.mounts,
                 s.pending
@@ -568,7 +561,7 @@ mod tests {
     #[test]
     fn record_splits_on_the_first_equals_only() {
         let rec = Record::parse(
-            "state=sync\ntool=pi\nworkspace=/home/user/dev\ngit=limited\noverlay=0\nsync=/run/x/sync\nenv=K=V\njunk\n",
+            "state=sync\ntool=pi\nworkspace=/home/user/dev\nmode=limited\nsync=/run/x/sync\nenv=K=V\njunk\n",
         );
         assert_eq!(rec.get("tool"), "pi");
         assert_eq!(rec.get("workspace"), "/home/user/dev");
@@ -580,14 +573,14 @@ mod tests {
     #[test]
     fn reason_names_the_flags_that_bound_the_tree_directly() {
         assert_eq!(
-            Record::parse("git=full\noverlay=0\n").reason(),
-            "--git full without --overlay-workspace"
+            Record::parse("mode=full\n").reason(),
+            "--pwd-full, no copy or overlay mounted"
         );
         assert_eq!(
-            Record::parse("git=full\noverlay=1\n").reason(),
-            "--git full with --overlay-workspace"
+            Record::parse("mode=ro\n").reason(),
+            "--pwd-ro, no copy or overlay mounted"
         );
-        assert_eq!(Record::parse("").reason(), "--git ? without --overlay-workspace");
+        assert_eq!(Record::parse("").reason(), "--pwd-?, no copy or overlay mounted");
     }
 
     #[test]
@@ -624,7 +617,7 @@ mod tests {
         let dir = scratch("direct");
         fs::write(
             dir.join(format!("{}.state", me())),
-            format!("state=direct\ntool=pi\npid={}\nworkspace=/w\ngit=full\noverlay=0\nsync=\n", me()),
+            format!("state=direct\ntool=pi\npid={}\nworkspace=/w\nmode=full\nsync=\n", me()),
         )
         .unwrap();
         let reg = Registry::new(dir.clone());
@@ -632,7 +625,7 @@ mod tests {
             SyncTarget::Direct { pid, workspace, reason } => {
                 assert_eq!(pid, me().to_string());
                 assert_eq!(workspace, "/w");
-                assert_eq!(reason, "--git full without --overlay-workspace");
+                assert_eq!(reason, "--pwd-full, no copy or overlay mounted");
             }
             SyncTarget::Launcher(p) => panic!("unexpected launcher {}", p.display()),
         }
@@ -657,7 +650,7 @@ mod tests {
         fs::write(
             dir.join(format!("{}.state", me())),
             format!(
-                "state=sync\ntool=pi\npid={}\nworkspace=/w\ngit=limited\noverlay=1\nsync={}\nmount={}\n",
+                "state=sync\ntool=pi\npid={}\nworkspace=/w\nmode=overlay\nsync={}\nmount={}\n",
                 me(),
                 rundir.join("sync").display(),
                 rundir.join("mount").display()
@@ -669,8 +662,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         assert_eq!(s.tool, "pi");
-        assert_eq!(s.git, "limited");
-        assert!(s.overlay);
+        assert_eq!(s.mode, "overlay");
         assert_eq!(s.dirty, 3);
         assert_eq!(s.mounts, 2);
         assert_eq!(s.pending, 2);
@@ -706,7 +698,7 @@ mod tests {
         fs::write(
             dir.join(format!("{}.state", me())),
             format!(
-                "state=sync\ntool=pi\npid={}\nworkspace=/w\ngit=limited\noverlay=0\nsync=\nmount={}\ndomain={}\n",
+                "state=sync\ntool=pi\npid={}\nworkspace=/w\nmode=limited\nsync=\nmount={}\ndomain={}\n",
                 me(),
                 rundir.join("mount").display(),
                 launcher.display()
@@ -738,7 +730,7 @@ mod tests {
         fs::write(
             dir.join(format!("{}.state", me())),
             format!(
-                "state=direct\ntool=pi\npid={}\nworkspace=/w\ngit=full\noverlay=0\nsync=\nmount={}\n",
+                "state=direct\ntool=pi\npid={}\nworkspace=/w\nmode=full\nsync=\nmount={}\n",
                 me(),
                 rundir.join("mount").display()
             ),

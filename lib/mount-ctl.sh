@@ -2,7 +2,7 @@
 #
 # Attaches a host tree to a running jail, and detaches it again, without
 # restarting anything. One implementation for three callers: the runner at
-# launch (every --mount/--ro-mount goes through here), the operator from a
+# launch (every --mount-MODE goes through here), the operator from a
 # second terminal ($RUNDIR/mount, `llm-custody mount`, or a terminal
 # keybinding), and the request broker when the operator approves an agent's
 # `custody-request --mount`.
@@ -52,7 +52,7 @@ Usage: mount add [--mode MODE] [--guest PATH] [--name NAME] HOSTPATH
                   full     the real tree, read-write - writes hit the host
                   limited  a copy re-initialised as a baseline-only repo,
                            synced back on request and at exit (alias: copy)
-                  none     the same copy without a repo
+                  nogit    the same copy without a repo
                   overlay  copy-on-write over the real tree, synced back
                            only on explicit confirmation
            --guest PATH    where the jail sees it (default: under the first
@@ -67,7 +67,8 @@ USAGE
 }
 
 if [ $# -lt 1 ]; then usage; fi
-RUNDIR="$1"; shift
+RUNDIR="$1"
+shift
 [ -d "$RUNDIR" ] || die "no such session runtime dir: $RUNDIR"
 [ -r "$RUNDIR/mount.env" ] || die "$RUNDIR/mount.env missing - this session's runner predates live mounts, or has already ended"
 # shellcheck source=/dev/null
@@ -88,9 +89,12 @@ record_get() {
   [ -r "$file" ] || return 0
   while IFS= read -r line; do
     case "$line" in
-      "$key="*) printf '%s' "${line#"$key="}"; return 0 ;;
+    "$key="*)
+      printf '%s' "${line#"$key="}"
+      return 0
+      ;;
     esac
-  done < "$file"
+  done <"$file"
 }
 
 # The mount whose name or guest path is $1, as its record directory.
@@ -99,7 +103,7 @@ find_mount() {
   for dir in "$MOUNTS_DIR"/*/; do
     [ -r "$dir/record" ] || continue
     if [ "$(record_get "$dir/record" name)" = "$want" ] ||
-       [ "$(record_get "$dir/record" guest)" = "$want" ]; then
+      [ "$(record_get "$dir/record" guest)" = "$want" ]; then
       printf '%s' "${dir%/}"
       return 0
     fi
@@ -146,11 +150,11 @@ shadow_masks() {
   [ "${#MASK_HIT_PATH[@]}" -gt 0 ] || return 0
   mkdir -p "$mdir"
   for entry in "${MASK_HIT_PATH[@]}"; do
-    n=$((n+1))
+    n=$((n + 1))
     if [ -d "$hostroot/$entry" ] && [ ! -L "$hostroot/$entry" ]; then
       mkdir -p "$mdir/$n"
     else
-      : > "$mdir/$n"
+      : >"$mdir/$n"
     fi
     holder mount --bind -o ro "$mdir/$n" "$point/$entry" ||
       warn "could not shadow $entry in $label"
@@ -158,7 +162,7 @@ shadow_masks() {
   if [ -d "$hostroot/.git" ]; then
     warn "$label is bound along with its .git, so masked content is still"
     hint "readable from history (git show HEAD:<path>). Only a copy (mode"
-    hint "limited|none) removes it outright."
+    hint "limited|nogit) removes it outright."
   fi
 }
 
@@ -167,24 +171,49 @@ cmd_add() {
   local mdir copy track upper work label hooks
   while [ $# -gt 0 ]; do
     case "$1" in
-      --mode)  [ $# -ge 2 ] || die "--mode needs a value"; mode="$2"; shift 2 ;;
-      --guest) [ $# -ge 2 ] || die "--guest needs a value"; guest="$2"; shift 2 ;;
-      --name)  [ $# -ge 2 ] || die "--name needs a value"; name="$2"; shift 2 ;;
-      # Launch-time only: the runner can still bind a non-dock guest path
-      # through bwrap, a live caller cannot.
-      --allow-fixed) allow_fixed=1; shift ;;
-      -h|--help) usage ;;
-      --) shift; break ;;
-      -*) die "add: unknown option: $1" ;;
-      *)  [ -z "$host" ] || die "add takes exactly one host path"; host="$1"; shift ;;
+    --mode)
+      [ $# -ge 2 ] || die "--mode needs a value"
+      mode="$2"
+      shift 2
+      ;;
+    --guest)
+      [ $# -ge 2 ] || die "--guest needs a value"
+      guest="$2"
+      shift 2
+      ;;
+    --name)
+      [ $# -ge 2 ] || die "--name needs a value"
+      name="$2"
+      shift 2
+      ;;
+    # Launch-time only: the runner can still bind a non-dock guest path
+    # through bwrap, a live caller cannot.
+    --allow-fixed)
+      allow_fixed=1
+      shift
+      ;;
+    -h | --help) usage ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "add: unknown option: $1" ;;
+    *)
+      [ -z "$host" ] || die "add takes exactly one host path"
+      host="$1"
+      shift
+      ;;
     esac
   done
-  [ -n "$host" ] || [ $# -eq 0 ] || { host="$1"; shift; }
+  [ -n "$host" ] || [ $# -eq 0 ] || {
+    host="$1"
+    shift
+  }
   [ -n "$host" ] || die "add: which host path?"
   case "$mode" in
-    copy) mode="limited" ;;
-    ro|full|limited|none|overlay) ;;
-    *) die "add: --mode expects ro|full|limited|none|overlay, got: $mode" ;;
+  copy) mode="limited" ;;
+  ro | full | limited | nogit | overlay) ;;
+  *) die "add: --mode expects ro|full|limited|nogit|overlay, got: $mode" ;;
   esac
   case "$host" in /*) ;; *) host="$(pwd)/$host" ;; esac
   [ -e "$host" ] || die "mount path does not exist: $host"
@@ -192,10 +221,11 @@ cmd_add() {
   if [ -z "$name" ]; then
     name=$(basename -- "$host")
     case "$name" in
-      /|.|..)
-        err "cannot derive a mount name from '$host'"
-        hint "pass one: --name NAME"
-        exit 1 ;;
+    / | . | ..)
+      err "cannot derive a mount name from '$host'"
+      hint "pass one: --name NAME"
+      exit 1
+      ;;
     esac
     # Two trees of the same basename are an ordinary case (two checkouts of
     # one repo): the second one gets a numbered name instead of an error,
@@ -203,12 +233,12 @@ cmd_add() {
     # collision below is still an error - that one the agent would notice.
     if [ -d "$MOUNTS_DIR/$name" ]; then
       local n=2
-      while [ -d "$MOUNTS_DIR/$name-$n" ]; do n=$((n+1)); done
+      while [ -d "$MOUNTS_DIR/$name-$n" ]; do n=$((n + 1)); done
       name="$name-$n"
     fi
   fi
   case "$name" in
-    ""|.|..|*/*) die "not usable as a mount name: $name" ;;
+  "" | . | .. | */*) die "not usable as a mount name: $name" ;;
   esac
   [ ! -d "$MOUNTS_DIR/$name" ] || die "a mount named $name already exists (see: list)"
 
@@ -254,62 +284,75 @@ cmd_add() {
       warn "$host is a file - bound directly, writes hit the host immediately"
       mode="full"
     fi
-    : > "$point"
+    : >"$point"
   else
     mkdir -p "$point"
   fi
 
-  copy=""; track=""; upper=""; work=""
+  copy=""
+  track=""
+  upper=""
+  work=""
   case "$mode" in
-    ro)
-      holder mount --bind -o ro "$host" "$point" || { rm -rf "$mdir"; die "binding $host failed"; }
-      [ -d "$host" ] && shadow_masks "$host" "$point" "$mdir/masks" "$guest"
-      ;;
-    full)
-      holder mount --bind "$host" "$point" || { rm -rf "$mdir"; die "binding $host failed"; }
-      # The real tree is writable, its hooks are not: a jailed agent must not
-      # be able to plant git hooks that run on the host later. (In-jail git
-      # already pins core.hooksPath to the workspace's hooks, so these never
-      # fire inside the jail either way.)
-      hooks="$host/.git/hooks"
-      if [ -d "$hooks" ]; then
-        holder mount --bind -o ro "$hooks" "$point/.git/hooks" || warn "could not bind $hooks read-only"
-      fi
-      [ -d "$host" ] && shadow_masks "$host" "$point" "$mdir/masks" "$guest"
-      ;;
-    limited|none)
-      command -v git >/dev/null 2>&1 || die "mode $mode needs git (it records the baseline used for sync-back)"
-      copy="$mdir/copy"
-      track="$mdir/track.git"
-      log "mode $mode - copying $host into $RUNDIR (history stays on the host)"
-      jail_copy_tree "$host" "$copy"
-      jail_apply_masks "$copy" "the copy of $host"
-      if [ "$mode" = "limited" ] && [ -d "$host/.git" ]; then
-        jail_init_repo "$copy" "$host" "jail repo for $guest"
-      fi
-      jail_track_init "$copy" "$track"
-      printf 'copy\t%s\t%s\t%s\t%s\n' "$copy" "$track" "$host" "$label" >> "$SYNC_MANIFEST"
-      holder mount --bind "$copy" "$point" || { rm -rf "$mdir"; die "binding the copy of $host failed"; }
-      ;;
-    overlay)
-      # Upper and work dir must share a filesystem (overlayfs requirement);
-      # both under $RUNDIR, which the runner's --overlay-workspace preflight
-      # probed for unprivileged-overlay support. userxattr is what overlayfs
-      # requires from a mount made inside a user namespace.
-      upper="$mdir/upper"; work="$mdir/work"
-      mkdir -p "$upper" "$work"
-      printf 'overlay\t%s\t-\t%s\t%s\n' "$upper" "$host" "overlay $label" >> "$SYNC_MANIFEST"
-      if ! holder mount -t overlay overlay \
-           -o "lowerdir=$(ovl_escape "$host"),upperdir=$(ovl_escape "$upper"),workdir=$(ovl_escape "$work"),userxattr" \
-           "$point"; then
-        rm -rf "$mdir"
-        err "overlay mount of $host failed"
-        hint "unprivileged overlayfs needs kernel >= 5.11 and an upper layer on a filesystem"
-        hint "with user xattr support (tmpfs: kernel >= 6.6); try --tmpdir on disk"
-        exit 1
-      fi
-      shadow_masks "$host" "$point" "$mdir/masks" "$guest"
-      ;;
+  ro)
+    holder mount --bind -o ro "$host" "$point" || {
+      rm -rf "$mdir"
+      die "binding $host failed"
+    }
+    [ -d "$host" ] && shadow_masks "$host" "$point" "$mdir/masks" "$guest"
+    ;;
+  full)
+    holder mount --bind "$host" "$point" || {
+      rm -rf "$mdir"
+      die "binding $host failed"
+    }
+    # The real tree is writable, its hooks are not: a jailed agent must not
+    # be able to plant git hooks that run on the host later. (In-jail git
+    # already pins core.hooksPath to the workspace's hooks, so these never
+    # fire inside the jail either way.)
+    hooks="$host/.git/hooks"
+    if [ -d "$hooks" ]; then
+      holder mount --bind -o ro "$hooks" "$point/.git/hooks" || warn "could not bind $hooks read-only"
+    fi
+    [ -d "$host" ] && shadow_masks "$host" "$point" "$mdir/masks" "$guest"
+    ;;
+  limited | nogit)
+    command -v git >/dev/null 2>&1 || die "mode $mode needs git (it records the baseline used for sync-back)"
+    copy="$mdir/copy"
+    track="$mdir/track.git"
+    log "mode $mode - copying $host into $RUNDIR (history stays on the host)"
+    jail_copy_tree "$host" "$copy"
+    jail_apply_masks "$copy" "the copy of $host"
+    if [ "$mode" = "limited" ] && [ -d "$host/.git" ]; then
+      jail_init_repo "$copy" "$host" "jail repo for $guest"
+    fi
+    jail_track_init "$copy" "$track"
+    printf 'copy\t%s\t%s\t%s\t%s\n' "$copy" "$track" "$host" "$label" >>"$SYNC_MANIFEST"
+    holder mount --bind "$copy" "$point" || {
+      rm -rf "$mdir"
+      die "binding the copy of $host failed"
+    }
+    ;;
+  overlay)
+    # Upper and work dir must share a filesystem (overlayfs requirement);
+    # both under $RUNDIR, which the runner's overlay preflight
+    # probed for unprivileged-overlay support. userxattr is what overlayfs
+    # requires from a mount made inside a user namespace.
+    upper="$mdir/upper"
+    work="$mdir/work"
+    mkdir -p "$upper" "$work"
+    printf 'overlay\t%s\t-\t%s\t%s\n' "$upper" "$host" "overlay $label" >>"$SYNC_MANIFEST"
+    if ! holder mount -t overlay overlay \
+      -o "lowerdir=$(ovl_escape "$host"),upperdir=$(ovl_escape "$upper"),workdir=$(ovl_escape "$work"),userxattr" \
+      "$point"; then
+      rm -rf "$mdir"
+      err "overlay mount of $host failed"
+      hint "unprivileged overlayfs needs kernel >= 5.11 and an upper layer on a filesystem"
+      hint "with user xattr support (tmpfs: kernel >= 6.6); try --tmpdir on disk"
+      exit 1
+    fi
+    shadow_masks "$host" "$point" "$mdir/masks" "$guest"
+    ;;
   esac
 
   {
@@ -324,14 +367,14 @@ cmd_add() {
     printf 'upper=%s\n' "$upper"
     printf 'work=%s\n' "$work"
     printf 'added=%s\n' "$(date +%s)"
-  } > "$mdir/record.tmp"
+  } >"$mdir/record.tmp"
   mv -f "$mdir/record.tmp" "$mdir/record"
 
   case "$mode" in
-    full)    log "mounted $host at $guest ${C_RED}read-write, real tree${C_RESET}" ;;
-    overlay) log "mounted $host at $guest ${C_YELLOW}copy-on-write${C_RESET}" ;;
-    ro)      log "mounted $host at $guest read-only" ;;
-    *)       log "mounted a copy of $host at $guest (mode $mode, syncs back on request and at exit)" ;;
+  full) log "mounted $host at $guest ${C_RED}read-write, real tree${C_RESET}" ;;
+  overlay) log "mounted $host at $guest ${C_YELLOW}copy-on-write${C_RESET}" ;;
+  ro) log "mounted $host at $guest read-only" ;;
+  *) log "mounted a copy of $host at $guest (mode $mode, syncs back on request and at exit)" ;;
   esac
   [ "$fixed" = "0" ] || vlog "$guest is outside every dock: fixed for the whole session"
   # The one line on stdout, for callers that need the answer rather than the
@@ -346,13 +389,13 @@ manifest_drop() {
   local src="$1" tmp line
   [ -n "$SYNC_MANIFEST" ] && [ -f "$SYNC_MANIFEST" ] || return 0
   tmp="$SYNC_MANIFEST.tmp.$$"
-  : > "$tmp"
+  : >"$tmp"
   while IFS= read -r line; do
     case "$line" in
-      *$'\t'"$src"$'\t'*) continue ;;
+    *$'\t'"$src"$'\t'*) continue ;;
     esac
-    printf '%s\n' "$line" >> "$tmp"
-  done < "$SYNC_MANIFEST"
+    printf '%s\n' "$line" >>"$tmp"
+  done <"$SYNC_MANIFEST"
   mv -f "$tmp" "$SYNC_MANIFEST"
 }
 
@@ -361,21 +404,35 @@ cmd_remove() {
   local -a excl=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --auto)    sync_mode="auto"; shift ;;
-      --discard) sync_mode="discard"; shift ;;
-      -h|--help) usage ;;
-      -*) die "remove: unknown option: $1" ;;
-      *)  [ -z "$want" ] || die "remove takes exactly one mount"; want="$1"; shift ;;
+    --auto)
+      sync_mode="auto"
+      shift
+      ;;
+    --discard)
+      sync_mode="discard"
+      shift
+      ;;
+    -h | --help) usage ;;
+    -*) die "remove: unknown option: $1" ;;
+    *)
+      [ -z "$want" ] || die "remove takes exactly one mount"
+      want="$1"
+      shift
+      ;;
     esac
   done
   [ -n "$want" ] || die "remove: which mount? (see: list)"
   want="${want%/}"
   mdir=$(find_mount "$want") || die "no mount named or at $want (see: list)"
   rec="$mdir/record"
-  name=$(record_get "$rec" name); guest=$(record_get "$rec" guest)
-  mode=$(record_get "$rec" mode); point=$(record_get "$rec" point)
-  fixed=$(record_get "$rec" fixed); copy=$(record_get "$rec" copy)
-  track=$(record_get "$rec" track); upper=$(record_get "$rec" upper)
+  name=$(record_get "$rec" name)
+  guest=$(record_get "$rec" guest)
+  mode=$(record_get "$rec" mode)
+  point=$(record_get "$rec" point)
+  fixed=$(record_get "$rec" fixed)
+  copy=$(record_get "$rec" copy)
+  track=$(record_get "$rec" track)
+  upper=$(record_get "$rec" upper)
 
   if [ "$fixed" = "1" ]; then
     err "$guest is bound outside every dock (fixed at launch) and cannot be detached live"
@@ -392,9 +449,9 @@ cmd_remove() {
     else
       for g in "${SYNC_EXCLUDES[@]+"${SYNC_EXCLUDES[@]}"}"; do excl+=(--exclude "$g"); done
       if [ -n "$copy" ]; then
-        printf 'copy\t%s\t%s\t%s\t%s\n' "$copy" "$track" "$(record_get "$rec" host)" "mount $guest" > "$mdir/manifest-one"
+        printf 'copy\t%s\t%s\t%s\t%s\n' "$copy" "$track" "$(record_get "$rec" host)" "mount $guest" >"$mdir/manifest-one"
       else
-        printf 'overlay\t%s\t-\t%s\t%s\n' "$upper" "$(record_get "$rec" host)" "overlay mount $guest" > "$mdir/manifest-one"
+        printf 'overlay\t%s\t-\t%s\t%s\n' "$upper" "$(record_get "$rec" host)" "overlay mount $guest" >"$mdir/manifest-one"
       fi
       "$SYNC_BACK" "--$sync_mode" "${excl[@]+"${excl[@]}"}" "$mdir/manifest-one" || true
     fi
@@ -425,18 +482,20 @@ cmd_list() {
     rec="$dir/record"
     [ -r "$rec" ] || continue
     found=1
-    name=$(record_get "$rec" name); guest=$(record_get "$rec" guest)
-    mode=$(record_get "$rec" mode); host=$(record_get "$rec" host)
+    name=$(record_get "$rec" name)
+    guest=$(record_get "$rec" guest)
+    mode=$(record_get "$rec" mode)
+    host=$(record_get "$rec" host)
     fixed=$(record_get "$rec" fixed)
     case "$mode" in
-      full)    mode="${C_RED}full${C_RESET}" ;;
-      overlay) mode="${C_YELLOW}overlay${C_RESET}" ;;
-      *)       mode="${C_GREEN}$mode${C_RESET}" ;;
+    full) mode="${C_RED}full${C_RESET}" ;;
+    overlay) mode="${C_YELLOW}overlay${C_RESET}" ;;
+    *) mode="${C_GREEN}$mode${C_RESET}" ;;
     esac
     n=""
     if [ -n "$(record_get "$rec" copy)" ] && command -v git >/dev/null 2>&1; then
       n=$(GIT_DIR="$(record_get "$rec" track)" GIT_WORK_TREE="$(record_get "$rec" copy)" \
-            git --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null | wc -l) || n=""
+        git --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null | wc -l) || n=""
       if [ "${n:-0}" = "0" ]; then n=""; else n=", $n unsynced"; fi
     fi
     printf '%s%-18s%s %s  %s %s<- %s%s%s\n' \
@@ -453,10 +512,16 @@ cmd_docks() {
 }
 
 case "${1:-}" in
-  add|mount)        shift; cmd_add "$@" ;;
-  remove|rm|umount) shift; cmd_remove "$@" ;;
-  list|ls)          cmd_list ;;
-  docks)            cmd_docks ;;
-  ""|-h|--help)     usage ;;
-  *) die "unknown command: $1 (try --help)" ;;
+add | mount)
+  shift
+  cmd_add "$@"
+  ;;
+remove | rm | umount)
+  shift
+  cmd_remove "$@"
+  ;;
+list | ls) cmd_list ;;
+docks) cmd_docks ;;
+"" | -h | --help) usage ;;
+*) die "unknown command: $1 (try --help)" ;;
 esac

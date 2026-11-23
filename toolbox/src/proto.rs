@@ -145,7 +145,7 @@ fn numeric_label(label: &str) -> bool {
 /// How an approved mount is attached. The operator picks this at approval
 /// time; a jailed client cannot name one, because `full` hands it the real
 /// tree read-write and that choice is the operator's.
-pub const MOUNT_MODES: [&str; 6] = ["ro", "full", "limited", "none", "overlay", "copy"];
+pub const MOUNT_MODES: [&str; 6] = ["ro", "full", "limited", "nogit", "overlay", "copy"];
 pub const DEFAULT_MOUNT_MODE: &str = "ro";
 
 pub fn validate_mount_mode(mode: &str) -> Result<()> {

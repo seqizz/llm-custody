@@ -56,11 +56,12 @@ nix run .#pi -- --selftest
 ## Common options
 
 ```bash
-nix run .#pi -- --mount /srv/data                 # extra tree, at /workspace/data
-nix run .#pi -- --ro-mount ~/.ssh:/home/user/.ssh # read-only, explicit target
+nix run .#pi -- --mount /srv/data                 # extra tree as a synced copy, at /workspace/data
+nix run .#pi -- --mount-ro ~/.ssh:/home/user/.ssh # read-only, explicit target
+nix run .#pi -- --mount-full /srv/scratch         # real tree, writes hit the host
 nix run .#pi -- --allow-domain github.com         # extra whitelisted domain
 nix run .#pi -- --mask 'secrets/*'                # hide paths from the jail
-nix run .#pi -- --git full                        # real tree with .git, no copy
+nix run .#pi -- --pwd-full                        # launch directory as the real tree, no copy
 nix run .#pi -- --continue                        # resume the last session
 nix run .#pi -- --dry-run                         # print what would happen
 ```

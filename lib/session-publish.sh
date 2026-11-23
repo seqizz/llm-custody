@@ -1,7 +1,7 @@
 # What a run publishes about itself to the terminal and the session
 # registry: WezTerm user vars, the session state record and the window
 # title. Interpolated into lib/mkBwrapRunner.nix (no Nix interpolation in
-# here); reads the runner's TOOL_NAME, WORKSPACE_HOST, GIT_MODE, OVERLAY,
+# here); reads the runner's TOOL_NAME, WORKSPACE_HOST, PWD_MODE,
 # RUNDIR, SYNC_MANIFEST, DOMAIN_REG, BROKER_DIR and REG_DIR at call time,
 # and sets STATE_REG, USERVAR_SET, JAIL_MARK and USERVAR_ON.
 
@@ -31,7 +31,7 @@ emit_uservar() {
     # literal one right before the quote reads as a quote escape.
     seq=$(printf '\033Ptmux;\033%s\033\134' "$seq")
   fi
-  printf '%s' "$seq" > /dev/tty 2>/dev/null || true
+  printf '%s' "$seq" >/dev/tty 2>/dev/null || true
 }
 
 # Everything a consumer needs to *describe* this session, as a record of
@@ -55,8 +55,7 @@ session_state() {
   printf 'tool=%s\n' "$TOOL_NAME"
   printf 'pid=%s\n' "$$"
   printf 'workspace=%s\n' "$WORKSPACE_HOST"
-  printf 'git=%s\n' "$GIT_MODE"
-  printf 'overlay=%s\n' "$OVERLAY"
+  printf 'mode=%s\n' "$PWD_MODE"
   # The launchers exist in every run, whatever the state: a session that
   # bound everything straight through can still gain a copy mount later,
   # and the sync command then has something to do.
@@ -83,7 +82,7 @@ session_state() {
 publish_state() {
   mkdir -p "$REG_DIR"
   STATE_REG="$REG_DIR/$$.state"
-  session_state "$1" > "$STATE_REG"
+  session_state "$1" >"$STATE_REG"
   if [ "$USERVAR_ON" = "1" ]; then
     emit_uservar llm_custody_state "$(session_state "$1")"
     USERVAR_SET=1
@@ -101,7 +100,7 @@ publish_state() {
 # pays one cell rather than the two a fullwidth glyph costs.
 JAIL_MARK="▥"
 set_title() {
-  printf '\033]2;%s\007' "$1" > /dev/tty 2>/dev/null || true
+  printf '\033]2;%s\007' "$1" >/dev/tty 2>/dev/null || true
 }
 
 # Whether this terminal gets user vars at all. Decided once, here,
@@ -112,10 +111,11 @@ set_title() {
 # LLMCUSTODY_USERVAR=1/0 forces the decision either way.
 USERVAR_ON=0
 case "${LLMCUSTODY_USERVAR:-auto}" in
-  0|off|no) ;;
-  1|on|yes) USERVAR_ON=1 ;;
-  *)
-    if [ -n "${WEZTERM_PANE:-}" ] || [ "${TERM_PROGRAM:-}" = "WezTerm" ]; then
-      USERVAR_ON=1
-    fi ;;
+0 | off | no) ;;
+1 | on | yes) USERVAR_ON=1 ;;
+*)
+  if [ -n "${WEZTERM_PANE:-}" ] || [ "${TERM_PROGRAM:-}" = "WezTerm" ]; then
+    USERVAR_ON=1
+  fi
+  ;;
 esac
