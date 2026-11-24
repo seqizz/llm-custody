@@ -80,7 +80,7 @@ nix run . -- toolbox add ripgrep  # put a package on every jail's PATH
 nix run . -- request answer       # answer what an agent asked for
 nix run . -- mount add /srv/data  # attach a host tree to a live session
 nix run . -- domain               # edit a live session's whitelist
-nix run . -- sync                 # sync a live session's changes to the host
+nix run . -- sync                 # sync a live session's changes to the host, or discard/reset them
 ```
 
 ## More

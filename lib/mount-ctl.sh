@@ -494,8 +494,9 @@ cmd_list() {
     esac
     n=""
     if [ -n "$(record_get "$rec" copy)" ] && command -v git >/dev/null 2>&1; then
+      # --ignore-submodules=all: see the tracking-dir note in lib/sync-back.sh.
       n=$(GIT_DIR="$(record_get "$rec" track)" GIT_WORK_TREE="$(record_get "$rec" copy)" \
-        git --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null | wc -l) || n=""
+        git --no-optional-locks status --porcelain --ignore-submodules=all --untracked-files=all 2>/dev/null | wc -l) || n=""
       if [ "${n:-0}" = "0" ]; then n=""; else n=", $n unsynced"; fi
     fi
     printf '%s%-18s%s %s  %s %s<- %s%s%s\n' \

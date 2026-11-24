@@ -18,8 +18,17 @@
 # Blank lines and '#' comments are ignored.
 
 MODE=prompt
+# Set by the mid-session launcher. Only a live session offers discard and
+# reset at the copy prompt: at exit the copy is deleted right after, so
+# declining the sync already discards, and there is nothing left to reset.
+LIVE=0
 MANIFEST=""
 EXCLUDES=()
+# --mask globs of the session, re-applied when a copy is reset from the host
+# (jail_apply_masks, lib/jail-tree.sh).
+MASK_PATTERNS=()
+# Read by the log helpers and jail-tree.sh, which this script is built with.
+VERBOSITY=1
 # Identity for the tracking-baseline commits: the host .gitconfig may have
 # none, or a signing key whose agent isn't reachable from here.
 GIT_IDENT=(-c user.name=llm-custody -c user.email=llm-custody@localhost -c commit.gpgsign=false)
@@ -42,17 +51,44 @@ while [ $# -gt 0 ]; do
     EXCLUDES+=("$2")
     shift 2
     ;;
+  --mask)
+    if [ $# -lt 2 ]; then
+      printf 'ERROR: --mask needs a glob\n' >&2
+      exit 2
+    fi
+    MASK_PATTERNS+=("$2")
+    shift 2
+    ;;
+  --live)
+    LIVE=1
+    shift
+    ;;
   -h | --help)
-    printf 'Usage: llm-custody-sync-back [--prompt|--auto] [--exclude GLOB]... MANIFEST\n'
+    printf 'Usage: llm-custody-sync-back [--prompt|--auto] [--live] [--exclude GLOB]... [--mask GLOB]... MANIFEST\n'
     printf '  --prompt       review each changed tree and confirm (default)\n'
     printf '  --auto         sync copies without asking; overlays are never\n'
     printf '                 synced unattended (they exist to be reviewed first);\n'
     printf '                 a path also changed on the host keeps the host\n'
     printf '                 version, the agent one lands beside it as PATH.llm-custody\n'
+    printf '  --live         the session is still running: the copy prompt also\n'
+    printf '                 offers x (discard the jail changes) and r (reset the\n'
+    printf '                 copy to the current host tree)\n'
     printf '  --exclude GLOB never sync paths matching GLOB (repeatable)\n'
+    printf '  --mask GLOB    session --mask glob, re-applied on reset (repeatable)\n'
     exit 0
     ;;
+  -*)
+    # Refused rather than taken for the manifest path: a mistyped option
+    # would otherwise replace the real manifest, find no such file and exit
+    # 0 as if there were nothing to sync.
+    printf 'ERROR: unknown option: %s\n' "$1" >&2
+    exit 2
+    ;;
   *)
+    if [ -n "$MANIFEST" ]; then
+      printf 'ERROR: more than one manifest given: %s and %s\n' "$MANIFEST" "$1" >&2
+      exit 2
+    fi
     MANIFEST="$1"
     shift
     ;;
@@ -215,6 +251,117 @@ resolve_conflict() {
   done
 }
 
+# Second confirmation for the two answers that delete agent work for good.
+# An empty answer is a no, as everywhere else.
+confirm_drop() {
+  local ans
+  ans=$(read_answer "llm-custody: $1? [y/N] ")
+  case "$ans" in
+  [yY] | [yY][eE][sS]) return 0 ;;
+  esac
+  return 1
+}
+
+# The paths of a `git status --porcelain` listing, capped for a commit body.
+change_list() {
+  local changes="$1" count
+  count=$(printf '%s\n' "$changes" | wc -l || true)
+  printf '%s\n' "$changes" | cut -c4- | head -n 50 || true
+  if [ "$count" -gt 50 ]; then
+    printf '... and %s more\n' "$((count - 50))"
+  fi
+}
+
+# The jail repo (mode limited) is agent-writable, and a .git/config the
+# agent wrote can name hooks, an fsmonitor or filter drivers that git would
+# run here, on the host. So it is only ever replaced: a fresh repo made the
+# same way the launch made it, whose single commit tells the agent what
+# happened to its tree, since there is no other channel into the session.
+# Mode nogit has no jail repo unless the agent made one, which is replaced
+# the same way.
+reinit_jail_repo() {
+  local copy="$1" host="$2" label="$3" subject="$4" body="$5"
+  [ -e "$copy/.git" ] || [ -L "$copy/.git" ] || return 0
+  rm -rf -- "${copy:?copy dir unset}/.git"
+  jail_init_repo "$copy" "$host" "jail repo for $label" "$subject" "$body"
+}
+
+# Answer x at a live sync prompt: put the copy back to the last sync point
+# (the launch state if nothing was synced yet) and leave the host tree
+# alone. Gitignored paths are not tracked, so they stay as the agent left
+# them.
+discard_copy() {
+  local copy="$1" track="$2" host="$3" label="$4" changes="$5" count since body
+  count=$(printf '%s\n' "$changes" | wc -l || true)
+  if ! confirm_drop "throw away $count changed path(s) in the jail copy of $label for good"; then
+    printf 'llm-custody: NOT discarding %s\n' "$label" >&2
+    return 0
+  fi
+  since=$(GIT_DIR="$track" git log -1 --format=%ci 2>/dev/null || true)
+  # The tracking dir excludes /.git/, so the clean leaves the jail repo to
+  # reinit_jail_repo below.
+  if ! GIT_DIR="$track" GIT_WORK_TREE="$copy" git reset -q --hard HEAD ||
+    ! GIT_DIR="$track" GIT_WORK_TREE="$copy" git clean -fdq; then
+    printf 'llm-custody: ERROR discarding the changes in %s failed, the copy may be partly reverted\n' "$label" >&2
+    return 0
+  fi
+  body=$(
+    printf 'The operator discarded the changes made in this tree since the last\n'
+    printf 'sync point (%s). The files are back to that state, and the\n' "$since"
+    printf 'earlier history of this repo is gone. Discarded paths:\n\n'
+    change_list "$changes"
+  )
+  reinit_jail_repo "$copy" "$host" "$label" "llm-custody: operator discarded unsynced changes" "$body"
+  printf 'llm-custody: discarded %s path(s) in %s, back at the sync point of %s\n' "$count" "$label" "$since" >&2
+}
+
+# Answer r at a live sync prompt: make the copy match the host tree as it is
+# now, minus the --mask matches, and take that as the new sync point. What
+# the agent changed since the last sync is lost, gitignored files included,
+# and host-side edits made since the copy was taken reach the jail.
+reset_copy() {
+  local copy="$1" track="$2" host="$3" label="$4" changes="$5" count stage body
+  if [ ! -d "$host" ]; then
+    printf 'llm-custody: ERROR host tree %s is gone, not resetting %s\n' "$host" "$label" >&2
+    return 0
+  fi
+  if [ -n "$changes" ]; then
+    count=$(printf '%s\n' "$changes" | wc -l || true)
+    if ! confirm_drop "throw away $count changed path(s) in the jail copy of $label and reset it to $host"; then
+      printf 'llm-custody: NOT resetting %s\n' "$label" >&2
+      return 0
+    fi
+  fi
+  # Built beside the copy, which keeps it outside the jail, and masked
+  # before any of it reaches the copy: a masked file never shows up in the
+  # jail, not even for the length of the transfer.
+  stage="${copy%/}.reset"
+  rm -rf -- "$stage"
+  jail_copy_tree "$host" "$stage"
+  jail_apply_masks "$stage" "the reset copy of $host"
+  # Synced in place, so an agent process whose cwd is inside the tree keeps
+  # a valid one. /.git/ is the jail repo, replaced by reinit_jail_repo.
+  if ! rsync -a --delete --exclude=/.git/ -- "$stage/" "$copy/"; then
+    rm -rf -- "$stage"
+    printf 'llm-custody: ERROR resetting %s from %s failed, the copy may be partly updated\n' "$label" "$host" >&2
+    return 0
+  fi
+  rm -rf -- "$stage"
+  GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" add -A >/dev/null 2>&1 || true
+  GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" commit -q -m "llm-custody host reset" --allow-empty >/dev/null 2>&1 || true
+  body=$(
+    printf 'The operator reset this tree to the state of the host tree at %s.\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+    printf 'Edits made on the host meanwhile are in it now; the earlier history\n'
+    printf 'of this repo is gone.'
+    if [ -n "$changes" ]; then
+      printf ' Jail changes discarded by the reset:\n\n'
+      change_list "$changes"
+    fi
+  )
+  reinit_jail_repo "$copy" "$host" "$label" "llm-custody: operator reset the tree to the host state" "$body"
+  printf 'llm-custody: reset %s to the current state of %s\n' "$label" "$host" >&2
+}
+
 # Modes limited|nogit: the sandbox worked on a copy, so the real tree is
 # still untouched. Diff the copy against the baseline in its tracking git
 # dir (never mounted into the sandbox, so the agent cannot rewrite the
@@ -230,10 +377,26 @@ resolve_conflict() {
 sync_copy() {
   local copy="$1" track="$2" host="$3" label="$4"
   local changes count applied=0 skipped=0 kept=0 code path ans entry
-  local -a entries=() conflict_paths=() sidecars=()
+  local -a entries=() conflict_paths=() sidecars=() nested=()
   local -A conflict=()
-  changes=$(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain --untracked-files=all 2>/dev/null || true)
-  [ -n "$changes" ] || return 0
+  # --ignore-submodules=all on every status/diff against the tracking dir:
+  # a nested repo the agent creates in the copy is tracked as a gitlink, and
+  # checking a gitlink for local changes runs git inside that repo with its
+  # own config, which the agent writes (core.fsmonitor is a command line).
+  changes=$(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain --ignore-submodules=all --untracked-files=all 2>/dev/null || true)
+  if [ -z "$changes" ]; then
+    # Nothing to sync, but the host side may have moved since the copy was
+    # made, and a reset is the only way to bring that into the jail.
+    if [ "$MODE" = "prompt" ] && [ "$LIVE" = "1" ]; then
+      # Worded as an offer, not a yes/no question: a run of y answers meant
+      # for the trees that do have changes must read as a skip here.
+      ans=$(read_answer "llm-custody: $label has no unsynced changes [r=reset to host tree, anything else skips] ")
+      case "$ans" in
+      [rR]) reset_copy "$copy" "$track" "$host" "$label" "" ;;
+      esac
+    fi
+    return 0
+  fi
   count=$(printf '%s\n' "$changes" | wc -l || true)
 
   # Read into an array up front: the conflict prompts below may read their
@@ -242,7 +405,7 @@ sync_copy() {
   # rename turns into a two-field -z record the loop would misparse.
   while IFS= read -r -d "" entry; do
     entries+=("$entry")
-  done < <(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain -z --no-renames --untracked-files=all 2>/dev/null || true)
+  done < <(GIT_DIR="$track" GIT_WORK_TREE="$copy" git status --porcelain -z --no-renames --ignore-submodules=all --untracked-files=all 2>/dev/null || true)
   for entry in "${entries[@]+"${entries[@]}"}"; do
     path="${entry:3}"
     [ -n "$path" ] || continue
@@ -261,7 +424,7 @@ sync_copy() {
   # `|| true` throughout: called from an EXIT trap with errexit still
   # active, where head closing the pipe early (EPIPE) would otherwise abort
   # cleanup before the sync.
-  GIT_DIR="$track" GIT_WORK_TREE="$copy" git --no-pager diff --stat HEAD 2>/dev/null | head -n 40 >&2 || true
+  GIT_DIR="$track" GIT_WORK_TREE="$copy" git --no-pager diff --stat --ignore-submodules=all HEAD 2>/dev/null | head -n 40 >&2 || true
   printf '%s\n' "$changes" | grep '^??' | head -n 20 >&2 || true
   if [ "$count" -gt 40 ]; then
     printf '          ... (%s paths total)\n' "$count" >&2
@@ -272,17 +435,32 @@ sync_copy() {
   fi
 
   if [ "$MODE" = "prompt" ]; then
+    local choices="y/N/d=diff"
+    [ "$LIVE" = "1" ] && choices="$choices/x=discard/r=reset from host"
     while true; do
-      ans=$(read_answer "llm-custody: sync these back to $host? [y/N/d=diff] ")
+      ans=$(read_answer "llm-custody: sync these back to $host? [$choices] ")
       case "$ans" in
       [yY] | [yY][eE][sS]) break ;;
+      [xX] | [rR])
+        # Not offered outside a live session, where the copy is deleted
+        # right after this: there they mean the same as the default no.
+        if [ "$LIVE" != "1" ]; then
+          printf 'llm-custody: NOT syncing %s\n' "$label" >&2
+          return 0
+        fi
+        case "$ans" in
+        [xX]) discard_copy "$copy" "$track" "$host" "$label" "$changes" ;;
+        *) reset_copy "$copy" "$track" "$host" "$label" "$changes" ;;
+        esac
+        return 0
+        ;;
       [dD])
         # Staging into the *tracking* index is what makes new files show
         # up in the diff at all; it is also harmless to leave behind,
         # since a real sync re-runs `add -A` before committing its own
         # sync point anyway.
         GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" add -A >/dev/null 2>&1 || true
-        GIT_DIR="$track" GIT_WORK_TREE="$copy" git --no-pager diff --cached 2>/dev/null | page
+        GIT_DIR="$track" GIT_WORK_TREE="$copy" git --no-pager diff --cached --ignore-submodules=all 2>/dev/null | page
         continue
         ;;
       *)
@@ -334,6 +512,14 @@ sync_copy() {
       rm -rf -- "$host/${path:?sync path empty}" 2>/dev/null || true
       ;;
     *)
+      # A directory entry is a nested repo the agent made in the jail
+      # (the tracking repo lists those as one path instead of their files).
+      # cp -a onto an existing host directory would nest a second copy
+      # inside it, so such a path is held back and named instead.
+      if [ -d "$copy/$path" ] && [ ! -L "$copy/$path" ]; then
+        nested+=("$copy/$path")
+        continue
+      fi
       mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
       cp -a --reflink=auto -- "$copy/$path" "$host/$path" 2>/dev/null || true
       ;;
@@ -358,6 +544,10 @@ sync_copy() {
   if [ "${#sidecars[@]}" -gt 0 ]; then
     printf '          agent versions of those written beside them, review and delete:\n' >&2
     printf '            %s\n' "${sidecars[@]}" >&2
+  fi
+  if [ "${#nested[@]}" -gt 0 ]; then
+    printf '          git repos created in the jail were not synced, they are at:\n' >&2
+    printf '            %s\n' "${nested[@]}" >&2
   fi
   printf '          gitignored paths are not tracked and never sync back.\n' >&2
 }

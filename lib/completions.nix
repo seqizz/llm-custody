@@ -113,6 +113,11 @@ let
       desc = "Never sync paths matching GLOB back to the host";
     }
     {
+      flag = "--sync-discard";
+      arg = "none";
+      desc = "Drop unsynced changes at exit instead of syncing them";
+    }
+    {
       flag = "--watch-interval";
       arg = "string";
       desc = "Seconds between unsynced-change checks, 0 disables";

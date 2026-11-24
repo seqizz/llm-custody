@@ -45,6 +45,7 @@ print_card() {
   [ "$RW_SKILLS" = "1" ] && extras="$extras ${C_YELLOW}rw-skills${C_RESET}"
   [ "$X11" = "1" ] && extras="$extras ${C_YELLOW}x11${C_RESET}"
   [ "$SAME_PATH" = "1" ] && extras="$extras same-path"
+  [ "$SYNC_DISCARD" = "1" ] && extras="$extras ${C_YELLOW}sync-discard${C_RESET}"
 
   printf '%s┌─ %s%s %s%s %s(%s)%s\n' \
     "$C_DIM" "$C_RESET" "$JAIL_MARK" "$C_BOLD" "$TOOL_NAME" "$C_DIM" "$PROFILE" "$C_RESET" >&2

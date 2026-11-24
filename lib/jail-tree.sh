@@ -1,8 +1,9 @@
-# Tree helpers shared by the runner (workspace copy, workspace masks) and
-# lib/mount-ctl.sh (every extra mount, at launch and live). Plain shell with
-# no Nix interpolation, included into both wrappers via builtins.readFile so
-# a copy made at launch and a copy made mid-session are produced by the
-# same code.
+# Tree helpers shared by the runner (workspace copy, workspace masks),
+# lib/mount-ctl.sh (every extra mount, at launch and live) and
+# lib/sync-back.sh (a copy reset from the host mid-session). Plain shell with
+# no Nix interpolation, included into all three via builtins.readFile so
+# a copy made at launch, a copy made mid-session and a reset copy are
+# produced by the same code.
 #
 # Callers provide: MASK_PATTERNS (array of --mask globs), the log/vlog/hint/
 # die helpers, and git on PATH.
@@ -25,7 +26,17 @@ jail_copy_tree() {
     [ "${entry##*/}" = ".git" ] && continue
     cp -a --reflink=auto -- "$entry" "$dest/" || die "copying $entry into the jail copy at $dest failed"
   done
-  shopt -u dotglob nullglob
+  # Nested repos (vendored checkouts, plugin managers, submodules) lose
+  # their .git as well, directory or gitfile. Their history would hold
+  # masked content the same way the top-level one does, and the tracking
+  # repo would see each of them as a gitlink rather than files, so their
+  # contents could never be synced back. globstar does not descend through
+  # symlinked directories, so nothing outside the copy is reached.
+  shopt -s globstar
+  for entry in "$dest"/**/.git; do
+    rm -rf -- "${entry:?nested .git path empty}" || die "removing the nested repo metadata $entry from the jail copy failed"
+  done
+  shopt -u dotglob nullglob globstar
 }
 
 # A tree mode (ro, limited, nogit, overlay, full) coloured by how much
@@ -133,14 +144,19 @@ jail_mask_report() {
 
 # Re-init a copy as a fresh repo with a single baseline commit, so in-jail
 # git (status/diff/commit/branch) still works with no history to mine.
+# The optional subject and body replace the default commit message: the
+# sync-back re-inits the repo after a discard or reset, and the message is
+# how the agent learns what happened to its tree.
 jail_init_repo() {
-  local dir="$1" src="$2" label="$3" branch
+  local dir="$1" src="$2" label="$3" subject="${4:-llm-custody jail baseline}" body="${5:-}" branch
+  local -a msg=(-m "$subject")
+  if [ -n "$body" ]; then msg+=(-m "$body"); fi
   # Same branch name as the host checkout so prompts, status lines and
   # the agent's own assumptions about the branch still line up.
   branch=$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
   git -C "$dir" init -q -b "$branch"
   git -C "$dir" "${JAIL_GIT_IDENT[@]}" add -A
-  git -C "$dir" "${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody jail baseline" --allow-empty
+  git -C "$dir" "${JAIL_GIT_IDENT[@]}" commit -q "${msg[@]}" --allow-empty
   git -C "$dir" tag jail-baseline
   vlog "$label: branch $branch, single commit tagged jail-baseline"
 }

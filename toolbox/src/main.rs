@@ -96,8 +96,14 @@ Usage: llm-custody [--pid PID] [--pause] sync [-- ARG...]
 
 Fold the isolated trees of a live session back into the host trees they were
 copied from, without waiting for the session to end. Arguments after -- go to
-the session's own sync-back (--auto to skip the per-tree prompt, --discard to
-throw the jail's version away).
+the session's own sync-back (--auto to sync without the per-tree prompt).
+
+The prompt of a copied tree also offers x, discard the jail's changes since
+the last sync, and r, reset the copy to the current host tree (--mask globs
+re-applied). Both ask again before deleting anything, and both replace the
+jail repo with a fresh one whose commit message tells the agent what
+happened. An overlay cannot be changed while it is mounted, so its prompt
+stays yes or no.
 
 A session that works in the host trees directly has nothing to fold back,
 which is reported and is not an error.

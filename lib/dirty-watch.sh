@@ -26,8 +26,11 @@ jail_dirty_count() {
     case "$type" in
     copy)
       [ -d "$src" ] && [ -d "$track" ] || continue
+      # --ignore-submodules=all keeps git out of nested repos the agent
+      # creates in the copy: checking one runs git with that repo's own,
+      # agent-written config on the host (see lib/sync-back.sh).
       n=$(GIT_DIR="$track" GIT_WORK_TREE="$src" git --no-optional-locks \
-        status --porcelain --untracked-files=all 2>/dev/null | wc -l) || n=0
+        status --porcelain --ignore-submodules=all --untracked-files=all 2>/dev/null | wc -l) || n=0
       ;;
     overlay)
       # An overlay upper layer holds only what was written, so every

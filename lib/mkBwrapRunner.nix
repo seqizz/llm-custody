@@ -117,6 +117,9 @@ pkgs.writeShellApplication {
     LIST_PROFILES=0
     LIST_SESSIONS=0
     SYNC_EXCLUDES=()
+    # --sync-discard: the exit trap drops every unsynced change instead of
+    # offering it for sync.
+    SYNC_DISCARD=0
     # Seconds between unsynced-change checks during a session. 0 disables
     # the watcher entirely - worth it on a tree big enough for `git status`
     # to cost real time.
@@ -227,6 +230,9 @@ pkgs.writeShellApplication {
                              tree, in any mode that syncs (repeatable).
                              Matched against tree-relative paths; '*' crosses
                              '/' here, so '*.log' covers every depth
+      --sync-discard        At exit, drop every change not synced yet instead
+                             of syncing it, tty or not. Mid-session syncs
+                             are unaffected
       --watch-interval N    Seconds between unsynced-change checks during the
                              session (default 15, 0 disables). The count is
                              written to RUNDIR/dirty and published as the
@@ -345,6 +351,7 @@ pkgs.writeShellApplication {
         --x11)           X11=1; shift ;;
         --mask)          need_arg "$@"; MASK_PATTERNS+=("$2"); shift 2 ;;
         --sync-exclude)  need_arg "$@"; SYNC_EXCLUDES+=("$2"); shift 2 ;;
+        --sync-discard)  SYNC_DISCARD=1; shift ;;
         --watch-interval)
           need_arg "$@"
           case "$2" in
@@ -860,11 +867,17 @@ pkgs.writeShellApplication {
       # confirm per tree; without a tty copies sync automatically (what a
       # direct workspace bind did anyway - a headless `-p "..."` run that
       # silently threw its work away would be worse than the host mutation
-      # it avoids) while overlays never do.
+      # it avoids) while overlays never do. --sync-discard asks for the
+      # opposite up front: nothing is synced, and the count says what went.
       # -s, not -f: the manifest exists from the start of every run and is
       # empty for a session that bound everything straight through.
       if [ -n "$SYNC_MANIFEST" ] && [ -s "$SYNC_MANIFEST" ]; then
-        if [ -t 0 ]; then
+        if [ "$SYNC_DISCARD" = "1" ]; then
+          SYNC_DROPPED=$(jail_dirty_count || echo 0)
+          if [ "$SYNC_DROPPED" -gt 0 ]; then
+            warn "--sync-discard: dropping $SYNC_DROPPED unsynced path(s), nothing is synced back"
+          fi
+        elif [ -t 0 ]; then
           ${syncBack} --prompt "''${SYNC_EXCLUDE_ARGS[@]+"''${SYNC_EXCLUDE_ARGS[@]}"}" "$SYNC_MANIFEST" || true
         else
           ${syncBack} --auto "''${SYNC_EXCLUDE_ARGS[@]+"''${SYNC_EXCLUDE_ARGS[@]}"}" "$SYNC_MANIFEST" || true
@@ -2020,15 +2033,22 @@ pkgs.writeShellApplication {
     # Deliberately *not* reachable from inside the sandbox: $RUNDIR is not
     # mounted there, so the agent cannot sync its own work out unreviewed.
     if [ "$DRYRUN" != "1" ]; then
-      # %q on the manifest path and on every exclude glob: $RUNDIR inherits
+      # %q on the manifest path and on every glob: $RUNDIR inherits
       # --tmpdir, which may well contain a space or a quote, and a glob is
       # by definition full of characters a shell would otherwise act on.
-      SYNC_EXCLUDE_LITERAL=""
+      SYNC_ARGS_LITERAL=""
       for glob in "''${SYNC_EXCLUDES[@]+"''${SYNC_EXCLUDES[@]}"}"; do
-        SYNC_EXCLUDE_LITERAL="$SYNC_EXCLUDE_LITERAL --exclude $(printf '%q' "$glob")"
+        SYNC_ARGS_LITERAL="$SYNC_ARGS_LITERAL --exclude $(printf '%q' "$glob")"
       done
-      printf '#!%s\n%s --prompt%s %s "$@"\n' \
-        "${pkgs.bash}/bin/sh" "${syncBack}" "$SYNC_EXCLUDE_LITERAL" \
+      # --mask globs go along for the reset answer, which rebuilds a copy
+      # from the host tree and has to leave the same paths out.
+      for glob in "''${MASK_PATTERNS[@]+"''${MASK_PATTERNS[@]}"}"; do
+        SYNC_ARGS_LITERAL="$SYNC_ARGS_LITERAL --mask $(printf '%q' "$glob")"
+      done
+      # --live: the session is still running, so the copy prompt also
+      # offers discarding the jail changes and resetting from the host.
+      printf '#!%s\n%s --prompt --live%s %s "$@"\n' \
+        "${pkgs.bash}/bin/sh" "${syncBack}" "$SYNC_ARGS_LITERAL" \
         "$(printf '%q' "$SYNC_MANIFEST")" > "$RUNDIR/sync"
       # Wake the dirty watcher once the sync is done, so the unsynced
       # count is recounted at once (see start_dirty_watcher). The pid file
