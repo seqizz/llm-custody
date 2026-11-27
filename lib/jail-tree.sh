@@ -5,8 +5,8 @@
 # a copy made at launch, a copy made mid-session and a reset copy are
 # produced by the same code.
 #
-# Callers provide: MASK_PATTERNS (array of --mask globs), the log/vlog/hint/
-# die helpers, and git on PATH.
+# Callers provide: MASK_PATTERNS (array of --mask globs), the log/vlog/warn/
+# hint/die helpers, and git on PATH.
 
 # Identity for the commits made on the host's behalf (jail baseline, change
 # tracking). The host .gitconfig may have none, or a signing key whose agent
@@ -173,4 +173,32 @@ jail_track_init() {
   printf '/.git/\n' >"$track/info/exclude"
   GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "${JAIL_GIT_IDENT[@]}" add -A
   GIT_DIR="$track" GIT_WORK_TREE="$worktree" git "${JAIL_GIT_IDENT[@]}" commit -q -m "llm-custody tracking baseline" --allow-empty
+  jail_ignored_baseline "$worktree" "$track"
+}
+
+# Baseline for syncing gitignored files back, kept in the tracking git dir
+# (so never mounted into the sandbox) and written whenever a copy starts to
+# match the host tree: at creation and after a reset from the host.
+#   ignored.list  NUL-separated tree-relative paths of the gitignored files
+#                 and symlinks the tree holds at that moment
+#   stamp         empty file whose mtime is that moment
+# A listed path whose ctime in the copy is newer than the stamp was modified
+# in the jail; an ignored path missing from the list was created there. The
+# listing is a directory walk and the later check one lstat per path, so
+# large ignored trees (node_modules, data dirs) cost no content reads.
+#
+# The stamp is written last and removed first: a baseline that could not be
+# listed leaves no stamp behind, which turns the ignored-file sync off for
+# the tree instead of running it against a stale list.
+jail_ignored_baseline() {
+  local worktree="$1" track="$2" dir="$2/llm-custody"
+  rm -f -- "$dir/stamp"
+  if mkdir -p -- "$dir" &&
+    GIT_DIR="$track" GIT_WORK_TREE="$worktree" git -C "$worktree" ls-files -z --others --ignored --exclude-standard >"$dir/ignored.list.new" 2>/dev/null &&
+    mv -f -- "$dir/ignored.list.new" "$dir/ignored.list" &&
+    touch -- "$dir/stamp"; then
+    return 0
+  fi
+  rm -f -- "$dir/ignored.list.new" "$dir/ignored.list" "$dir/stamp"
+  warn "could not list the gitignored files of $worktree, changes to them will not sync back"
 }

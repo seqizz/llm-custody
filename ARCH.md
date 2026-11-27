@@ -266,7 +266,10 @@ An agent that needs a tool runs, in the sandbox:
 custody-request shellcheck --reason "Validate scripts"
 ```
 
-and blocks there. The request shows up on the host:
+and blocks there. Several attributes in one call (`custody-request shellcheck
+lua5_4 --reason "..."`) are all queued before the first answer is awaited, so
+they arrive as one list that `request answer` can settle in one pass. The
+request shows up on the host:
 
 ```console
 $ llm-custody request list

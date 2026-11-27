@@ -27,6 +27,14 @@ EXCLUDES=()
 # --mask globs of the session, re-applied when a copy is reset from the host
 # (jail_apply_masks, lib/jail-tree.sh).
 MASK_PATTERNS=()
+# Modified gitignored files of the tree being synced, filled by
+# ignored_scan and read by the sync, discard and reset steps of that tree,
+# and their grouping by ignore rule (ignored_group).
+IGNORED_MODS=()
+IGN_RULES=()
+IGN_WHERE=()
+IGN_COUNT=()
+IGN_OF=()
 # Read by the log helpers and jail-tree.sh, which this script is built with.
 VERBOSITY=1
 # Identity for the tracking-baseline commits: the host .gitconfig may have
@@ -286,12 +294,76 @@ reinit_jail_repo() {
   jail_init_repo "$copy" "$host" "jail repo for $label" "$subject" "$body"
 }
 
+# Gitignored files are in no tracking commit, so `git status` never reports
+# them. Fills IGNORED_MODS with the ones that were in the tree at the last
+# baseline (ignored.list, see jail_ignored_baseline), carry a ctime newer
+# than its stamp, and differ from the host file: regular files by content,
+# symlinks by target. Only those few candidates are read; the rest of the
+# list costs one lstat each.
+#
+# A path that changed type on either side is reported and left alone, since
+# copying a file over a symlink or a directory would write somewhere the
+# operator did not review. A path gone from the copy is no candidate, so a
+# deletion in the jail never reaches the host.
+ignored_scan() {
+  local copy="$1" track="$2" host="$3" label="$4" dir="$2/llm-custody"
+  local root path src dst want parent
+  IGNORED_MODS=()
+  [ -s "$dir/ignored.list" ] && [ -f "$dir/stamp" ] || return 0
+  root=$(realpath -e -- "$copy" 2>/dev/null) || return 0
+  while IFS= read -r -d "" path; do
+    path_excluded "$path" && continue
+    src="$copy/$path"
+    dst="$host/$path"
+    # The copy is agent-writable: a directory swapped for a symlink would
+    # make the read below follow it to any file on the host.
+    want="$root"
+    case "$path" in */*) want="$root/${path%/*}" ;; esac
+    parent=$(realpath -e -- "$(dirname -- "$src")" 2>/dev/null || true)
+    if [ "$parent" != "$want" ]; then
+      warn "$label: $path is reached through a symlink in the jail copy, not synced"
+      continue
+    fi
+    if [ -L "$src" ]; then
+      if [ -L "$dst" ]; then
+        [ "$(readlink -- "$src")" != "$(readlink -- "$dst")" ] || continue
+      elif [ -e "$dst" ]; then
+        warn "$label: gitignored $path is a symlink in the jail and not on the host, not synced"
+        continue
+      fi
+    elif [ -f "$src" ]; then
+      if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -f "$dst" ]; }; then
+        warn "$label: gitignored $path is a regular file in the jail and not on the host, not synced"
+        continue
+      elif [ -f "$dst" ]; then
+        ! cmp -s -- "$src" "$dst" || continue
+      fi
+    else
+      warn "$label: gitignored $path is no longer a file or symlink in the jail, not synced"
+      continue
+    fi
+    IGNORED_MODS+=("$path")
+  done < <(ignored_candidates "$copy" "$dir")
+}
+
+# The baseline paths of $1 whose ctime is newer than the stamp in $2,
+# NUL-separated. find exits non-zero for every listed path the agent
+# deleted, which is expected.
+ignored_candidates() {
+  # shellcheck disable=SC2185 # the start points are the paths in the list
+  (cd "$1" && find -files0-from "$2/ignored.list" -maxdepth 0 -cnewer "$2/stamp" -print0 2>/dev/null) || true
+}
+
 # Answer x at a live sync prompt: put the copy back to the last sync point
 # (the launch state if nothing was synced yet) and leave the host tree
 # alone. Gitignored paths are not tracked, so they stay as the agent left
 # them.
 discard_copy() {
   local copy="$1" track="$2" host="$3" label="$4" changes="$5" count since body
+  if [ -z "$changes" ]; then
+    printf 'llm-custody: nothing to discard in %s, modified gitignored files have no stored version to go back to\n' "$label" >&2
+    return 0
+  fi
   count=$(printf '%s\n' "$changes" | wc -l || true)
   if ! confirm_drop "throw away $count changed path(s) in the jail copy of $label for good"; then
     printf 'llm-custody: NOT discarding %s\n' "$label" >&2
@@ -313,21 +385,31 @@ discard_copy() {
   )
   reinit_jail_repo "$copy" "$host" "$label" "llm-custody: operator discarded unsynced changes" "$body"
   printf 'llm-custody: discarded %s path(s) in %s, back at the sync point of %s\n' "$count" "$label" "$since" >&2
+  if [ "${#IGNORED_MODS[@]}" -gt 0 ]; then
+    printf '          %s modified gitignored file(s) stay as the agent left them.\n' "${#IGNORED_MODS[@]}" >&2
+  fi
 }
 
 # Answer r at a live sync prompt: make the copy match the host tree as it is
 # now, minus the --mask matches, and take that as the new sync point. What
 # the agent changed since the last sync is lost, gitignored files included,
-# and host-side edits made since the copy was taken reach the jail.
+# and host-side edits made since the copy was taken reach the jail. Asks
+# first when that loses tracked changes or anything in IGNORED_MODS.
 reset_copy() {
-  local copy="$1" track="$2" host="$3" label="$4" changes="$5" count stage body
+  local copy="$1" track="$2" host="$3" label="$4" changes="$5" count=0 stage body what=""
   if [ ! -d "$host" ]; then
     printf 'llm-custody: ERROR host tree %s is gone, not resetting %s\n' "$host" "$label" >&2
     return 0
   fi
   if [ -n "$changes" ]; then
     count=$(printf '%s\n' "$changes" | wc -l || true)
-    if ! confirm_drop "throw away $count changed path(s) in the jail copy of $label and reset it to $host"; then
+    what="$count changed path(s)"
+  fi
+  if [ "${#IGNORED_MODS[@]}" -gt 0 ]; then
+    what="${what:+$what and }${#IGNORED_MODS[@]} modified gitignored file(s)"
+  fi
+  if [ -n "$what" ]; then
+    if ! confirm_drop "throw away $what in the jail copy of $label and reset it to $host"; then
       printf 'llm-custody: NOT resetting %s\n' "$label" >&2
       return 0
     fi
@@ -349,6 +431,11 @@ reset_copy() {
   rm -rf -- "$stage"
   GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" add -A >/dev/null 2>&1 || true
   GIT_DIR="$track" GIT_WORK_TREE="$copy" git "${GIT_IDENT[@]}" commit -q -m "llm-custody host reset" --allow-empty >/dev/null 2>&1 || true
+  # The gitignored files the host tree holds now are the ones whose jail
+  # edits sync back from here on, files that arrived with this reset
+  # included.
+  jail_ignored_baseline "$copy" "$track"
+  IGNORED_MODS=()
   body=$(
     printf 'The operator reset this tree to the state of the host tree at %s.\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
     printf 'Edits made on the host meanwhile are in it now; the earlier history\n'
@@ -374,9 +461,9 @@ reset_copy() {
 # file stays and the agent's version is written next to it as
 # <path>.llm-custody, since the copy is deleted right after an unattended
 # sync and would otherwise take that version with it.
-sync_copy() {
+sync_tracked() {
   local copy="$1" track="$2" host="$3" label="$4"
-  local changes count applied=0 skipped=0 kept=0 code path ans entry
+  local changes count applied=0 skipped=0 kept=0 code path ans entry what="unsynced"
   local -a entries=() conflict_paths=() sidecars=() nested=()
   local -A conflict=()
   # --ignore-submodules=all on every status/diff against the tracking dir:
@@ -390,7 +477,8 @@ sync_copy() {
     if [ "$MODE" = "prompt" ] && [ "$LIVE" = "1" ]; then
       # Worded as an offer, not a yes/no question: a run of y answers meant
       # for the trees that do have changes must read as a skip here.
-      ans=$(read_answer "llm-custody: $label has no unsynced changes [r=reset to host tree, anything else skips] ")
+      [ "${#IGNORED_MODS[@]}" -eq 0 ] || what="tracked"
+      ans=$(read_answer "llm-custody: $label has no $what changes [r=reset to host tree, anything else skips] ")
       case "$ans" in
       [rR]) reset_copy "$copy" "$track" "$host" "$label" "" ;;
       esac
@@ -549,7 +637,162 @@ sync_copy() {
     printf '          git repos created in the jail were not synced, they are at:\n' >&2
     printf '            %s\n' "${nested[@]}" >&2
   fi
-  printf '          gitignored paths are not tracked and never sync back.\n' >&2
+}
+
+# Sorts IGNORED_MODS into groups by the ignore rule that covers each path
+# (`git check-ignore`), so one rule with hundreds of touched files, an
+# installed dependency tree for instance, is a single line to pick or pass
+# over. Fills IGN_RULES (pattern, in order of first appearance), IGN_WHERE
+# (file:line the pattern comes from), IGN_COUNT, and IGN_OF, the group index
+# of each IGNORED_MODS entry. A path no rule covers any more was un-ignored
+# in the jail and is an untracked path of the tracked sync, so it is taken
+# out of IGNORED_MODS here.
+ignored_group() {
+  local copy="$1" track="$2" src line pat path key i
+  local -A rule=() where=() index=()
+  local -a kept=()
+  IGN_RULES=()
+  IGN_WHERE=()
+  IGN_COUNT=()
+  IGN_OF=()
+  [ "${#IGNORED_MODS[@]}" -gt 0 ] || return 0
+  while IFS= read -r -d "" src && IFS= read -r -d "" line && IFS= read -r -d "" pat && IFS= read -r -d "" path; do
+    rule["$path"]="$pat"
+    where["$path"]="$src:$line"
+  done < <(printf '%s\0' "${IGNORED_MODS[@]}" | GIT_DIR="$track" GIT_WORK_TREE="$copy" git -C "$copy" check-ignore -v -z --stdin 2>/dev/null || true)
+  for path in "${IGNORED_MODS[@]}"; do
+    [ -n "${rule[$path]+x}" ] || continue
+    key="${where[$path]}:${rule[$path]}"
+    if [ -z "${index[$key]+x}" ]; then
+      index["$key"]="${#IGN_RULES[@]}"
+      IGN_RULES+=("${rule[$path]}")
+      IGN_WHERE+=("${where[$path]}")
+      IGN_COUNT+=(0)
+    fi
+    i="${index[$key]}"
+    IGN_COUNT[i]=$((IGN_COUNT[i] + 1))
+    kept+=("$path")
+    IGN_OF+=("$i")
+  done
+  IGNORED_MODS=("${kept[@]+"${kept[@]}"}")
+}
+
+# The paths of group $1, one per line.
+ignored_group_paths() {
+  local i
+  for i in "${!IGNORED_MODS[@]}"; do
+    [ "${IGN_OF[$i]}" = "$1" ] && printf '%s\n' "${IGNORED_MODS[$i]}"
+  done
+  return 0
+}
+
+# Second part of a copy sync: the modified gitignored files IGNORED_MODS
+# holds. Asked separately from the tracked changes and by ignore rule, with
+# nothing selected by default, because no baseline content exists for these
+# files: a yes writes the jail version over whatever the host has now, so
+# it has to be a choice made per rule. The single paths and their diffs
+# against the host are one answer away.
+#
+# With nobody to choose, nothing is written: the changes are named in a
+# warning and go away with the copy.
+sync_ignored() {
+  local copy="$1" track="$2" host="$3" label="$4"
+  local i n ans tok path old applied=0 valid
+  local -a picked=()
+  ignored_group "$copy" "$track"
+  [ "${#IGNORED_MODS[@]}" -gt 0 ] || return 0
+
+  if [ "$MODE" != "prompt" ]; then
+    warn "$label: ${#IGNORED_MODS[@]} modified gitignored file(s) NOT synced, nobody to choose them:"
+    for i in "${!IGN_RULES[@]}"; do
+      hint "${IGN_RULES[$i]}  ${IGN_COUNT[$i]} file(s)"
+    done
+    return 0
+  fi
+
+  while true; do
+    printf 'llm-custody: %s: gitignored files modified in the jail, by ignore rule:\n' "$label" >&2
+    for i in "${!IGN_RULES[@]}"; do
+      printf '          %2s) %s  %s file(s)  (%s)\n' "$((i + 1))" "${IGN_RULES[$i]}" "${IGN_COUNT[$i]}" "${IGN_WHERE[$i]}" >&2
+    done
+    # One answer per line with the key set apart in colour: packed into
+    # the prompt, "l N" and "d N" were hard to tell from their separators.
+    printf '          %s%-7s%s write those rules over the files in %s\n' "$C_YELLOW" "1 2 .." "$C_RESET" "$host" >&2
+    printf '          %s%-7s%s write all of them\n' "$C_YELLOW" "a" "$C_RESET" >&2
+    printf '          %s%-7s%s list the files of rule N\n' "$C_YELLOW" "l N" "$C_RESET" >&2
+    printf '          %s%-7s%s diff rule N against the host\n' "$C_YELLOW" "d N" "$C_RESET" >&2
+    printf '          %s%-7s%s write nothing\n' "$C_YELLOW" "enter" "$C_RESET" >&2
+    ans=$(read_answer "llm-custody: which? ")
+    # Commas read as spaces, so "1,3" and "1 3" both work.
+    read -r -a picked <<<"${ans//,/ }" || true
+    case "${picked[0]:-}" in
+    "")
+      printf 'llm-custody: NOT syncing the gitignored files of %s\n' "$label" >&2
+      return 0
+      ;;
+    a | A)
+      picked=()
+      for i in "${!IGN_RULES[@]}"; do picked+=("$((i + 1))"); done
+      break
+      ;;
+    l | L | d | D)
+      n="${picked[1]:-}"
+      case "$n" in "" | *[!0-9]*) n=0 ;; esac
+      if [ "$n" -lt 1 ] || [ "$n" -gt "${#IGN_RULES[@]}" ]; then
+        printf 'llm-custody: give the number of a rule, as in "%s 1"\n' "${picked[0]}" >&2
+        continue
+      fi
+      case "${picked[0]}" in
+      l | L) ignored_group_paths "$((n - 1))" | page ;;
+      *)
+        # /dev/null stands in for a host file that is gone.
+        while IFS= read -r path; do
+          old="$host/$path"
+          [ -e "$old" ] || [ -L "$old" ] || old=/dev/null
+          git --no-pager diff --no-index -- "$old" "$copy/$path" 2>/dev/null || true
+        done < <(ignored_group_paths "$((n - 1))") | page
+        ;;
+      esac
+      continue
+      ;;
+    esac
+    valid=1
+    for tok in "${picked[@]}"; do
+      case "$tok" in *[!0-9]*) valid=0 ;; esac
+      if [ "$valid" = "1" ] && { [ "$tok" -lt 1 ] || [ "$tok" -gt "${#IGN_RULES[@]}" ]; }; then valid=0; fi
+    done
+    [ "$valid" = "1" ] && break
+    printf 'llm-custody: not understood: %s\n' "$ans" >&2
+  done
+
+  for i in "${!IGNORED_MODS[@]}"; do
+    path="${IGNORED_MODS[$i]}"
+    valid=0
+    for tok in "${picked[@]}"; do
+      [ "$((tok - 1))" = "${IGN_OF[$i]}" ] && valid=1
+    done
+    [ "$valid" = "1" ] || continue
+    mkdir -p -- "$(dirname -- "$host/$path")" 2>/dev/null || true
+    if [ -L "$copy/$path" ]; then
+      # cp refuses to write a symlink over an existing one.
+      cp -a --remove-destination -- "$copy/$path" "$host/$path" 2>/dev/null || continue
+    else
+      cp -a --reflink=auto -- "$copy/$path" "$host/$path" 2>/dev/null || continue
+    fi
+    applied=$((applied + 1))
+  done
+  printf 'llm-custody: wrote %s of %s modified gitignored file(s) to %s\n' "$applied" "${#IGNORED_MODS[@]}" "$host" >&2
+}
+
+# One copied tree: the tracked changes first, then the gitignored files.
+# The scan runs before either prompt because a reset answered at the first
+# one has to know what it would throw away; a reset empties IGNORED_MODS, so
+# the second part has nothing left to ask about.
+sync_copy() {
+  local copy="$1" track="$2" host="$3" label="$4"
+  ignored_scan "$copy" "$track" "$host" "$label"
+  sync_tracked "$copy" "$track" "$host" "$label"
+  sync_ignored "$copy" "$track" "$host" "$label"
 }
 
 # Mode overlay: fold the overlay upper layer into the real tree.

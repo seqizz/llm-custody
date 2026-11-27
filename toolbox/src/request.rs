@@ -4,8 +4,8 @@
 //! `custody-request --mount <path|name> [--reason TEXT]` or
 //! `custody-request --domain <name> [--reason TEXT]`, which is the same binary
 //! under a different name. It sends one bounded message per attribute, path
-//! or domain to the broker socket bound into the jail and waits for the
-//! operator's answer on the same connection.
+//! or domain to the broker socket bound into the jail, each on a connection
+//! of its own, and waits for the operator's answers on those connections.
 //!
 //! Nothing here is trusted by the broker: the validation in proto.rs runs on
 //! the broker side too, and this copy exists only to fail fast with a readable
@@ -33,8 +33,9 @@ Usage: custody-request <nixpkgs-attr>... [--reason TEXT]
 
 Ask the operator of this sandbox to add a package to the toolbox, which is
 the shared profile on this jail's PATH, to attach a host directory to this
-jail, or to let this jail reach a domain its network filter blocks. Blocks
-until the request is answered.
+jail, or to let this jail reach a domain its network filter blocks. Several
+asks in one call reach the operator together, each answered on its own.
+Blocks until every one is answered.
 
   --mount PATH    ask for a host path instead of a package (repeatable). PATH
                   is a best guess: the operator can mount a different path
@@ -136,24 +137,50 @@ pub fn run(args: &[String]) -> Result<()> {
     });
 
     // Each attribute or path is its own request, so the operator can approve
-    // the one that matters and refuse the rest. Sequential on purpose: a reply
-    // usually needs a human, and three prompts at once is worse than three in
-    // a row.
+    // the one that matters and refuse the rest. All of them are queued before
+    // the first answer is awaited: the operator sees the whole ask in one
+    // list and can settle it in one pass.
     let mut worst: Option<Error> = None;
+    let mut note = |e: Error| {
+        say(&e.msg);
+        // A denial is the answer to the question; an error means the
+        // question never got asked. The latter is the more useful
+        // thing to exit with.
+        let keep = match &worst {
+            None => true,
+            Some(prev) => prev.code == EXIT_DENIED && e.code != EXIT_DENIED,
+        };
+        if keep {
+            worst = Some(e);
+        }
+    };
+    let mut waiting: Vec<(&str, BufReader<UnixStream>)> = Vec::new();
     for (kind, name) in &wants {
-        match one(&socket, kind, name, &reason) {
-            Ok(()) => {}
+        // The first reply is read here, before the next request goes out, so
+        // the broker numbers the requests in command-line order.
+        let mut reader = match ask(&socket, kind, name, &reason) {
+            Ok(r) => r,
             Err(e) => {
-                say(&e.msg);
-                // A denial is the answer to the question; an error means the
-                // question never got asked. The latter is the more useful
-                // thing to exit with.
-                let keep = match &worst {
-                    None => true,
-                    Some(prev) => prev.code == EXIT_DENIED && e.code != EXIT_DENIED,
-                };
-                if keep {
-                    worst = Some(e);
+                note(e);
+                continue;
+            }
+        };
+        match step(name, &mut reader) {
+            Ok(true) => {}
+            Ok(false) => waiting.push((name.as_str(), reader)),
+            Err(e) => note(e),
+        }
+    }
+    // In command-line order. An answer to a later request waits in its socket
+    // until the earlier ones are settled.
+    for (name, mut reader) in waiting {
+        loop {
+            match step(name, &mut reader) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => {
+                    note(e);
+                    break;
                 }
             }
         }
@@ -167,7 +194,10 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 }
 
-fn one(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<()> {
+/// Connects and sends one request. The returned reader is the connection:
+/// the broker drops a request whose client hangs up, so it has to stay open
+/// until the answer was read from it.
+fn ask(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<BufReader<UnixStream>> {
     let mut stream = match UnixStream::connect(socket) {
         Ok(s) => s,
         Err(e) => {
@@ -188,73 +218,75 @@ fn one(socket: &PathBuf, kind: &str, attr: &str, reason: &str) -> Result<()> {
         .str("reason", reason)
         .finish();
     proto::write_message(&mut stream, &msg)?;
+    Ok(BufReader::new(stream))
+}
 
-    let peer = stream.try_clone()?;
-    let mut reader = BufReader::new(peer);
-
+/// Reads one broker message about `attr` and reports it. `Ok(true)` is an
+/// approval, `Ok(false)` the acknowledgement that the request is queued, and
+/// every other final answer is the error carrying its exit status.
+fn step(attr: &str, reader: &mut BufReader<UnixStream>) -> Result<bool> {
     // No read timeout: the broker owns the deadline and always answers, and a
     // client-side one would only ever fire early and leave the operator
     // approving something nobody is waiting for. A broker that dies closes the
     // socket, which surfaces as end-of-stream below.
-    loop {
-        let msg = match proto::read_message(&mut reader)? {
-            Some(m) => m,
-            None => {
-                return Err(Error {
-                    msg: format!("the broker went away before answering about {attr}"),
-                    code: EXIT_UNANSWERED,
-                })
-            }
-        };
-        match msg.str_field("status") {
-            "pending" => {
-                say(format!(
-                    "{attr}: request {} is waiting for the operator (up to {})",
-                    msg.str_field("id"),
-                    crate::util::human_duration(std::time::Duration::from_secs(
-                        msg.get("timeout").and_then(json::Json::as_u64).unwrap_or(0)
-                    ))
-                ));
-            }
-            proto::STATUS_OK => {
-                let commands = msg.str_field("commands");
-                let guest = msg.str_field("guest");
-                let host = msg.str_field("host");
-                let scope = msg.str_field("scope");
-                if !scope.is_empty() {
-                    say(format!("{attr}: approved, reachable now ({scope})"));
-                } else if !guest.is_empty() && !host.is_empty() && host != attr {
-                    // The operator answered with a path of their own, so the
-                    // one asked for is not what is behind the mount.
-                    say(format!("{attr}: approved, the operator mounted {host} at {guest}"));
-                } else if !guest.is_empty() {
-                    say(format!("{attr}: approved, mounted at {guest}"));
-                } else if commands.is_empty() {
-                    say(format!("{attr}: approved and installed"));
-                } else {
-                    say(format!("{attr}: approved, now on PATH: {commands}"));
-                }
-                return Ok(());
-            }
-            proto::STATUS_DENIED => {
-                return Err(Error {
-                    msg: format!("{attr}: refused - {}", msg.str_field("message")),
-                    code: EXIT_DENIED,
-                })
-            }
-            // Deliberately not EXIT_DENIED: the agent is told a refusal is a
-            // final answer, and "the operator was away from the terminal" is
-            // not one. Exit 4 says the question was never answered.
-            proto::STATUS_TIMEOUT => {
-                return Err(Error {
-                    msg: format!("{attr}: unanswered - {}", msg.str_field("message")),
-                    code: EXIT_UNANSWERED,
-                })
-            }
-            proto::STATUS_ERROR => {
-                return fail(format!("{attr}: {}", msg.str_field("message")))
-            }
-            other => return fail(format!("{attr}: unexpected broker status {other}")),
+    let msg = match proto::read_message(reader)? {
+        Some(m) => m,
+        None => {
+            return Err(Error {
+                msg: format!("the broker went away before answering about {attr}"),
+                code: EXIT_UNANSWERED,
+            })
         }
+    };
+    match msg.str_field("status") {
+        "pending" => {
+            say(format!(
+                "{attr}: request {} is waiting for the operator (up to {})",
+                msg.str_field("id"),
+                crate::util::human_duration(std::time::Duration::from_secs(
+                    msg.get("timeout").and_then(json::Json::as_u64).unwrap_or(0)
+                ))
+            ));
+            Ok(false)
+        }
+        proto::STATUS_OK => {
+            let commands = msg.str_field("commands");
+            let guest = msg.str_field("guest");
+            let host = msg.str_field("host");
+            let scope = msg.str_field("scope");
+            if !scope.is_empty() {
+                say(format!("{attr}: approved, reachable now ({scope})"));
+            } else if !guest.is_empty() && !host.is_empty() && host != attr {
+                // The operator answered with a path of their own, so the
+                // one asked for is not what is behind the mount.
+                say(format!("{attr}: approved, the operator mounted {host} at {guest}"));
+            } else if !guest.is_empty() {
+                say(format!("{attr}: approved, mounted at {guest}"));
+            } else if commands.is_empty() {
+                say(format!("{attr}: approved and installed"));
+            } else {
+                say(format!("{attr}: approved, now on PATH: {commands}"));
+            }
+            Ok(true)
+        }
+        proto::STATUS_DENIED => {
+            return Err(Error {
+                msg: format!("{attr}: refused - {}", msg.str_field("message")),
+                code: EXIT_DENIED,
+            })
+        }
+        // Deliberately not EXIT_DENIED: the agent is told a refusal is a
+        // final answer, and "the operator was away from the terminal" is
+        // not one. Exit 4 says the question was never answered.
+        proto::STATUS_TIMEOUT => {
+            return Err(Error {
+                msg: format!("{attr}: unanswered - {}", msg.str_field("message")),
+                code: EXIT_UNANSWERED,
+            })
+        }
+        proto::STATUS_ERROR => {
+            return fail(format!("{attr}: {}", msg.str_field("message")))
+        }
+        other => return fail(format!("{attr}: unexpected broker status {other}")),
     }
 }

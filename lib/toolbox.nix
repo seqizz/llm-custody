@@ -50,9 +50,16 @@
 
     If a task needs a tool that is not on PATH, ask for it:
 
-        custody-request <attr> --reason "<why you need it>"
+        custody-request <attr> [<attr>...] --reason "<why you need it>"
 
-    That blocks until the operator approves or refuses. On approval the
+    Name every package the task needs in that one call: they reach the
+    operator together, who answers each on its own, and the command prints
+    one result line per package. A separate call per package makes the
+    operator answer one prompt after another. With several packages the
+    exit status is 0 only when all were approved, so read the lines.
+
+    That blocks until the operator has approved or refused each one. On
+    approval the
     command is on your PATH immediately and you can carry on; exit status 3
     means refused, and refused is a final answer, not something to retry.
     Exit status 4 is different: nobody answered in time, or the broker went

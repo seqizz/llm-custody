@@ -18,6 +18,10 @@ pkgs.writeShellApplication {
     # The reset answer updates the copy in place from a masked staging copy,
     # deletions included.
     pkgs.rsync
+    # Modified gitignored files are found with find -files0-from over the
+    # baseline list and compared against the host with cmp.
+    pkgs.findutils
+    pkgs.diffutils
   ];
   text =
     builtins.readFile ./log.sh + builtins.readFile ./jail-tree.sh + builtins.readFile ./sync-back.sh;
